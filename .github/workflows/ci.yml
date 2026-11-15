@@ -1,0 +1,152 @@
+# push と pull request のたびに動く確認。
+# app：npm ci、npm test、npm run build のあと、ビルドで一つにまとめた画面のファイル（app/public）が最新かを確かめる。
+# mod：Claude Code を入れずにできる Mod の確認（plugin.json、release.ts、マーケットプレイスの一覧、zip の作り方）。
+#      Mod のテスト（mod/hooks/*.test.ts）は Claude Code の中でしか動かないので、ここでは動かさない。
+name: ci
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  app:
+    name: app (test, build)
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Install
+        working-directory: app
+        run: npm ci
+
+      - name: Test
+        working-directory: app
+        run: npm test
+
+      - name: Build
+        working-directory: app
+        run: npm run build
+
+      - name: Check that app/public is up to date
+        run: git diff --exit-code -- app/public
+
+  mod:
+    name: mod (checks without Claude Code)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Check plugin.json, release.ts and marketplace.json
+        shell: node {0}
+        run: |
+          const fs = require('node:fs')
+          const VERSION_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/
+          const problems = []
+          const warnings = []
+          const readJson = (file) => {
+            try {
+              return JSON.parse(fs.readFileSync(file, 'utf8'))
+            } catch (e) {
+              problems.push(`${file} を JSON として読めません: ${e.message}`)
+              return null
+            }
+          }
+          const plugin = readJson('mod/.claude-plugin/plugin.json')
+          if (plugin) {
+            if (plugin.name !== 'notedock') problems.push(`plugin.json の name が notedock ではありません: ${plugin.name}`)
+            if (typeof plugin.version !== 'string' || !VERSION_RE.test(plugin.version)) problems.push(`plugin.json の version の形が違います: ${plugin.version}`)
+            if (typeof plugin.types === 'string' && !fs.existsSync(`mod/${plugin.types}`)) problems.push(`plugin.json の types のファイルがありません: ${plugin.types}`)
+          }
+          readJson('mod/hooks/hooks.json')
+          const text = fs.readFileSync('mod/hooks/release.ts', 'utf8')
+          const tsVersion = text.match(/^export const VERSION = "([^"]*)"$/m)?.[1]
+          const baseUrl = text.match(/^export const BASE_URL = "([^"]*)"$/m)?.[1]
+          if (!tsVersion || !VERSION_RE.test(tsVersion)) problems.push(`release.ts の VERSION が読めません: ${tsVersion}`)
+          if (!baseUrl || !baseUrl.startsWith('https://') || !baseUrl.endsWith('/')) problems.push(`release.ts の BASE_URL の形が違います: ${baseUrl}`)
+          // サーバーと Mod は同じ番号にそろえる。出す途中のコミットでは一時的にずれることがあるので、ここでは知らせるだけ（release-mod.yml では止める）。
+          if (plugin && tsVersion && plugin.version !== tsVersion) warnings.push(`plugin.json の version（${plugin.version}）と release.ts の VERSION（${tsVersion}）が違います`)
+          const market = readJson('.claude-plugin/marketplace.json')
+          if (market) {
+            if (!Array.isArray(market.plugins)) problems.push('marketplace.json の plugins が配列ではありません')
+            for (const p of market.plugins ?? []) {
+              const name = p?.name ?? '(名前なし)'
+              if ('version' in (p ?? {})) problems.push(`marketplace.json の ${name} に version があります（plugin.json と二重にしない）`)
+              const src = p?.source
+              // 入手先は、このリポジトリの中のフォルダー（"./mod" のような相対パス）か、archive（https の zip と sha256）。
+              if (typeof src === 'string') {
+                if (!src.startsWith('./') || src.split('/').includes('..')) problems.push(`marketplace.json の ${name} の入手先が ./ で始まる相対パスではありません: ${src}`)
+                else if (!fs.existsSync(`${src}/.claude-plugin/plugin.json`)) problems.push(`marketplace.json の ${name} の入手先に .claude-plugin/plugin.json がありません: ${src}`)
+              } else if (!src || src.source !== 'archive') problems.push(`marketplace.json の ${name} の入手先が相対パスでも archive でもありません`)
+              else {
+                if (typeof src.url !== 'string' || !src.url.startsWith('https://')) problems.push(`marketplace.json の ${name} の url が https ではありません`)
+                if (typeof src.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(src.sha256)) problems.push(`marketplace.json の ${name} に sha256 がありません`)
+              }
+            }
+          }
+          for (const w of warnings) console.log(`::warning::${w}`)
+          if (problems.length) {
+            for (const p of problems) console.log(`::error::${p}`)
+            process.exit(1)
+          }
+          console.log(`OK plugin=${plugin?.version} release.ts=${tsVersion} marketplace plugins=${market?.plugins?.length}`)
+
+      # 同じ中身から同じ指紋の zip ができること、テストのファイルが入らないことを確かめる。
+      - name: Pack the Mod twice and compare
+        run: |
+          for n in 1 2; do
+            mkdir -p "$RUNNER_TEMP/pack$n"
+            NOTEDOCK_OUT_DIR="$RUNNER_TEMP/pack$n" sh app/scripts/pack-mod.sh 0.0.0-ci
+          done
+          a="$(sha256sum "$RUNNER_TEMP/pack1/notedock-mod-0.0.0-ci.zip" | awk '{print $1}')"
+          b="$(sha256sum "$RUNNER_TEMP/pack2/notedock-mod-0.0.0-ci.zip" | awk '{print $1}')"
+          echo "1: $a"
+          echo "2: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error::同じ中身から作った Mod の zip の指紋が違います"
+            exit 1
+          fi
+          unzip -Z1 "$RUNNER_TEMP/pack1/notedock-mod-0.0.0-ci.zip" | tee "$RUNNER_TEMP/zip-list.txt"
+          grep -qx '.claude-plugin/plugin.json' "$RUNNER_TEMP/zip-list.txt"
+          grep -qx 'hooks/release.ts' "$RUNNER_TEMP/zip-list.txt"
+          if grep -q '\.test\.ts$' "$RUNNER_TEMP/zip-list.txt"; then
+            echo "::error::Mod の zip にテストのファイルが入っています"
+            exit 1
+          fi

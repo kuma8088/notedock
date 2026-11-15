@@ -1,0 +1,206 @@
+# Mod のリリース。タグ v<バージョン> を push すると動く。
+# タグのバージョン、mod/.claude-plugin/plugin.json の version、mod/hooks/release.ts の VERSION が同じで、
+# release.ts の ASSETS が4つ、BASE_URL が同じバージョンのサーバーのリリースを指していることを確かめる。違えば止める。
+# そのあと pack-mod.sh で Mod の zip を作り、pre-release の印を付けた下書きの Releases に、zip と SHA256SUMS を置く。
+# 下書きを公開にするのは人の手で行う。
+name: release-mod
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: release-mod-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '24'
+  RELEASE_REPO: kuma8088/notedock
+
+jobs:
+  release:
+    name: check, pack, draft release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # main に入っていないコミット（作業中のブランチなど）に付けたタグからは、リリースを作らない。
+      # fetch-depth: 0 で全部のブランチの履歴を取ってあるので、origin/main の祖先かどうかだけを見る。
+      - name: Check that the tag is on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::タグ $TAG のコミット $GITHUB_SHA は main に入っていません。main に入れてからタグを付けてください。"
+            exit 1
+          fi
+          echo "on main: $GITHUB_SHA"
+
+      - name: Read the version from the tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          if ! printf '%s\n' "$version" | grep -Eq '^0\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then
+            echo "::error::タグ $TAG のバージョンは 0.x.y か 0.x.y-rc.n の形にしてください"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version: $version"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Check plugin.json and release.ts
+        shell: node {0}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          const fs = require('node:fs')
+          const version = process.env.VERSION
+          const repo = process.env.RELEASE_REPO
+          const problems = []
+          const plugin = JSON.parse(fs.readFileSync('mod/.claude-plugin/plugin.json', 'utf8'))
+          if (plugin.version !== version) problems.push(`plugin.json の version が ${plugin.version} です（タグは ${version}）`)
+          const text = fs.readFileSync('mod/hooks/release.ts', 'utf8')
+          const one = (re, name) => {
+            const all = [...text.matchAll(re)]
+            if (all.length !== 1) {
+              problems.push(`release.ts の ${name} が1つではありません（${all.length}）`)
+              return undefined
+            }
+            return all[0][1]
+          }
+          const tsVersion = one(/^export const VERSION = "([^"]*)"$/gm, 'VERSION')
+          const baseUrl = one(/^export const BASE_URL = "([^"]*)"$/gm, 'BASE_URL')
+          if (tsVersion !== undefined && tsVersion !== version) problems.push(`release.ts の VERSION が ${tsVersion} です（タグは ${version}）`)
+          const wantBase = `https://github.com/${repo}/releases/download/server-v${version}/`
+          if (baseUrl !== undefined && baseUrl !== wantBase) problems.push(`release.ts の BASE_URL が ${baseUrl} です（${wantBase} のはず）`)
+          // write-release.mjs が書く1行1種類の形だけを数える。
+          const targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc']
+          const rows = [...text.matchAll(/^  "([^"]+)": \{ file: "([^"]+)", size: (\d+), sha256: "([0-9a-f]{64})" \},$/gm)]
+          if (rows.length !== 4) problems.push(`release.ts の ASSETS が4つではありません（${rows.length}）`)
+          for (const t of targets) {
+            const row = rows.filter((r) => r[1] === t)
+            const file = `notedock-server-${t}${t.includes('windows') ? '.exe' : ''}`
+            if (row.length !== 1) problems.push(`release.ts の ASSETS に ${t} が1つではありません（${row.length}）`)
+            else if (row[0][2] !== file) problems.push(`release.ts の ${t} のファイル名が ${row[0][2]} です（${file} のはず）`)
+          }
+          for (const r of rows) if (!targets.includes(r[1])) problems.push(`release.ts の ASSETS に知らない種類があります: ${r[1]}`)
+          if (problems.length) {
+            for (const p of problems) console.log(`::error::${p}`)
+            process.exit(1)
+          }
+          console.log(`OK version=${version} base=${baseUrl} assets=${rows.length}`)
+
+      # release.ts の指紋が、同じバージョンのサーバーのリリースに置いたファイルと同じかを確かめる（違えば止める）。
+      - name: Check release.ts against the server release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dir="$RUNNER_TEMP/server-release"
+          mkdir -p "$dir"
+          if ! gh release download "server-v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$dir"; then
+            echo "::error::サーバーのリリース server-v$VERSION の SHA256SUMS を読めません。先にサーバーのリリースを作ってください。"
+            exit 1
+          fi
+          cat "$dir/SHA256SUMS"
+          status=0
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc; do
+            case "$t" in *windows*) e=.exe ;; *) e= ;; esac
+            f="notedock-server-$t$e"
+            want="$(awk -v f="$f" '$2 == f {print $1}' "$dir/SHA256SUMS")"
+            got="$(sed -n "s/^  \"$t\": { file: \"[^\"]*\", size: [0-9]*, sha256: \"\([0-9a-f]*\)\" },\$/\1/p" mod/hooks/release.ts)"
+            if [ -z "$want" ] || [ "$want" != "$got" ]; then
+              echo "::error::$f の指紋が、サーバーのリリースと release.ts で違います（リリース: ${want:-なし}、release.ts: ${got:-なし}）"
+              status=1
+            fi
+          done
+          # release.ts そのものの指紋も比べる。大きさ・URL・バージョンを含めて、サーバーのリリースで作ったものと1文字も違わないかを見る。
+          want="$(awk '$2 == "release.ts" {print $1}' "$dir/SHA256SUMS")"
+          got="$(sha256sum mod/hooks/release.ts | awk '{print $1}')"
+          if [ -z "$want" ] || [ "$want" != "$got" ]; then
+            echo "::error::mod/hooks/release.ts が、サーバーのリリースの release.ts と違います（リリース: ${want:-なし}、mod: ${got}）"
+            status=1
+          fi
+          if [ "$status" -ne 0 ]; then exit 1; fi
+          draft="$(gh release view "server-v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$draft" = "true" ]; then
+            echo "::warning::サーバーのリリース server-v$VERSION はまだ下書きです。Mod のリリースより先に公開してください。"
+          fi
+
+      - name: Pack the Mod
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          NOTEDOCK_OUT_DIR="$out" sh app/scripts/pack-mod.sh "$VERSION"
+          zip="$out/notedock-mod-$VERSION.zip"
+          test -f "$zip"
+          unzip -Z1 "$zip" | tee "$RUNNER_TEMP/zip-list.txt"
+          grep -qx '.claude-plugin/plugin.json' "$RUNNER_TEMP/zip-list.txt"
+          grep -qx 'hooks/release.ts' "$RUNNER_TEMP/zip-list.txt"
+          if grep -q '\.test\.ts$' "$RUNNER_TEMP/zip-list.txt"; then
+            echo "::error::Mod の zip にテストのファイルが入っています"
+            exit 1
+          fi
+          (cd "$out" && sha256sum "notedock-mod-$VERSION.zip" > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Write the release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "NoteDock の Mod $VERSION です。"
+            echo
+            echo "- 使うサーバーは、リリース server-v$VERSION のファイルです。"
+            echo "- マーケットプレイスの一覧（.claude-plugin/marketplace.json）は、このリリースを公開したあと、ここに置いた zip を読み直して指紋を確かめてから書き換えます。"
+            echo
+            echo "## SHA256SUMS"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/out/SHA256SUMS"
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      # 一度作ったリリースは置き直さない。同じタグのリリースがすでにあれば止める。
+      - name: Create the draft pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::タグ $TAG のリリースがすでにあります。置き直さず、新しいバージョンを出してください。"
+            exit 1
+          fi
+          cd "$RUNNER_TEMP/out"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --title "NoteDock Mod $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "notedock-mod-$VERSION.zip" \
+            SHA256SUMS

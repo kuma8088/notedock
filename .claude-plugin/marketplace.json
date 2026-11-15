@@ -1,0 +1,8 @@
+{
+  "name": "notedock",
+  "owner": {
+    "name": "kuma8088"
+  },
+  "description": "NoteDock: Claudeアプリのブラウザパネルで、ノートのフォルダーを開いて書けるエディター",
+  "plugins": []
+}

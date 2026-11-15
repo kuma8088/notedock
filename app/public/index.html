@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>ノート</title>
+<link rel="stylesheet" href="/assets/style.css">
+<script src="/theme.js"></script>
+</head>
+<body>
+<div id="locked">
+  <h1 id="locked-title">エディターを開けませんでした</h1>
+  <p id="locked-body">Claudeのアプリで、入力欄の上の「ノートを開く」を押してください。Chromeなどで開いた場合は、Claudeのアプリから開いてください。</p>
+</div>
+<header id="bar">
+  <button id="open-note" type="button" title="ノートを探す（Cmd+O）">探す</button>
+  <button id="new-note" type="button" title="新しいノートを作る">新しいノート</button>
+  <button id="today-note" type="button" hidden title="今日のデイリーノートを開く（なければ作る）">今日のノート</button>
+  <div id="note-path"></div>
+  <div id="status" role="status"></div>
+  <div class="spacer"></div>
+  <button id="to-chat" type="button" title="選んだ文字をチャットの入力欄へ入れる">チャットへ</button>
+  <button id="toggle-calendar" type="button" title="カレンダーを出す・隠す">カレンダー</button>
+  <button id="toggle-files" type="button" title="フォルダーからノートを開く">ファイル</button>
+  <button id="toggle-outline" type="button" title="目次">目次</button>
+  <button id="open-history" type="button" title="バックアップから戻す">履歴</button>
+  <button id="toggle-split" type="button" title="ノートを左右に並べる">右に分ける</button>
+  <div id="modes" role="group" aria-label="表示のしかた">
+    <button type="button" data-mode="reading" title="閲覧（Cmd+Eで切り替え）">閲覧</button>
+    <button type="button" data-mode="live" title="編集（Cmd+Eで切り替え）">編集</button>
+    <button type="button" data-mode="source" title="ソース">ソース</button>
+  </div>
+  <button id="pane-close" type="button" title="右の枠を閉じる" aria-label="右の枠を閉じる" hidden>×</button>
+  <button id="toggle-theme" type="button"></button>
+</header>
+<div id="toolbar" role="toolbar" aria-label="書式" hidden>
+  <div class="tool-group">
+    <button type="button" data-action="heading" title="見出しの大きさ" aria-haspopup="menu"><span id="toolbar-heading-label">見出し</span> ▾</button>
+  </div>
+  <div class="tool-group">
+    <button type="button" data-action="bold" class="tool-bold" title="太字（Cmd+B）">B</button>
+    <button type="button" data-action="italic" class="tool-italic" title="斜体（Cmd+I）">I</button>
+    <button type="button" data-action="strike" class="tool-strike" title="取り消し線">S</button>
+    <button type="button" data-action="code" title="文中のコード">コード</button>
+  </div>
+  <div class="tool-group">
+    <button type="button" data-action="bullet" title="箇条書き">箇条書き</button>
+    <button type="button" data-action="number" title="番号付きの箇条書き">番号</button>
+    <button type="button" data-action="task" title="チェック項目">チェック</button>
+    <button type="button" data-action="quote" title="引用">引用</button>
+  </div>
+  <div class="tool-group">
+    <button type="button" data-action="link" title="リンク（Cmd+K）">リンク</button>
+    <button type="button" data-action="image" title="画像を選んで入れる">画像</button>
+    <button type="button" data-action="table" title="表を入れる（Cmd+Shift+T）">表</button>
+    <button type="button" data-action="rule" title="区切り線">区切り線</button>
+    <button type="button" data-action="codeblock" title="コードのまとまり">コード枠</button>
+    <button type="button" data-action="callout" title="色付きの囲み" aria-haspopup="menu">囲み ▾</button>
+  </div>
+  <input id="toolbar-image" type="file" accept="image/*" hidden>
+</div>
+<div id="banner" hidden></div>
+<div id="port-moved-notice" hidden></div>
+<main id="layout">
+  <div id="editor">
+    <div id="paste-hint" role="status" hidden>コピーしたパスをここに貼り付けると、そのノートが開きます。<kbd>Cmd+V</kbd></div>
+  </div>
+  <div id="side-resize" role="separator" aria-orientation="vertical" aria-label="右の列の幅" title="ドラッグで幅を変える（ダブルクリックで元に戻す）"></div>
+  <aside id="outline" hidden aria-label="目次"></aside>
+  <div id="side">
+    <section id="calendar" aria-label="カレンダー"></section>
+    <p id="files-notice" role="status" hidden>ノートが多いため、一部だけを表示しています（2万件、フォルダーは32階層まで）</p>
+    <nav id="files" hidden aria-label="ファイルの一覧"></nav>
+  </div>
+</main>
+<section id="chat-panel" hidden aria-label="Claudeとのチャット（試験中）">
+  <div class="chat-resize" data-axis="x" title="ドラッグで幅を変える（ダブルクリックで元に戻す）"></div>
+  <div class="chat-resize" data-axis="y" title="ドラッグで高さを変える（ダブルクリックで元に戻す）"></div>
+  <div class="chat-resize" data-axis="xy" title="ドラッグで大きさを変える（ダブルクリックで元に戻す）"></div>
+  <header id="chat-head" title="ドラッグで場所を移せます">
+    <button id="chat-fold" type="button" title="小さくたたむ">ー</button>
+    <span id="chat-title">Claude</span>
+    <span id="chat-state" role="status"></span>
+    <span class="spacer"></span>
+    <button id="chat-expand" type="button" aria-expanded="false">会話を広げる</button>
+    <span id="chat-grip" aria-hidden="true">⋮⋮</span>
+  </header>
+  <div id="chat-log" hidden></div>
+  <div class="chat-status">
+    <span id="chat-wait" role="status"></span>
+    <button id="chat-notice" type="button" hidden></button>
+    <button id="chat-cancel" type="button" hidden>待つのをやめる</button>
+  </div>
+  <p id="chat-owner" role="status" hidden>このフォルダーのチャットで一度話しかけると使えます</p>
+  <label id="chat-share"><input id="chat-share-on" type="checkbox"> 開いているノートをClaudeに伝える</label>
+  <div id="chat-files" hidden></div>
+  <form id="chat-box">
+    <button id="chat-add" type="button" title="画像を添付する（貼り付けやドロップでも添付できます）">＋</button>
+    <textarea id="chat-input" rows="2" placeholder="Claudeに送る（Cmd+Enterで送信）"></textarea>
+    <button id="chat-send" type="submit">送る</button>
+    <input id="chat-file" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+  </form>
+</section>
+<button id="chat-open" type="button" hidden>Claude</button>
+<dialog id="switcher" aria-label="ノートを探す">
+  <input id="switcher-input" type="search" placeholder="ノートの名前で探す。ない名前なら新しく作れます。ファイルの場所を貼り付けても開けます" autocomplete="off">
+  <ul id="switcher-list"></ul>
+</dialog>
+<dialog id="history" aria-label="バックアップから戻す">
+  <div class="history-grid">
+    <ul id="history-list"></ul>
+    <pre id="history-text"></pre>
+  </div>
+  <div class="dialog-actions">
+    <button id="history-restore" type="button" disabled>この内容に戻す</button>
+    <button id="history-close" type="button">閉じる</button>
+  </div>
+</dialog>
+<dialog id="compare" aria-label="違いを見る">
+  <div class="compare-grid">
+    <section><h2>自分の内容</h2><pre id="compare-mine"></pre></section>
+    <section><h2>保存されているファイル</h2><pre id="compare-theirs"></pre></section>
+  </div>
+  <form method="dialog"><button>閉じる</button></form>
+</dialog>
+<script type="module" src="/assets/main.js"></script>
+</body>
+</html>

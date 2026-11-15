@@ -1,0 +1,9 @@
+{
+  "name": "notedock",
+  "version": "0.1.0-dev",
+  "description": "ノートのフォルダーをブラウザパネルのエディターで開く",
+  "author": {
+    "name": "kuma8088"
+  },
+  "types": "./types/index.d.ts"
+}

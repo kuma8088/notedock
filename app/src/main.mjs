@@ -1,0 +1,3074 @@
+import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, startCompletion } from '@codemirror/autocomplete'
+import { defaultKeymap, history, historyKeymap, indentWithTab, insertNewline, isolateHistory } from '@codemirror/commands'
+import { deleteMarkupBackward, insertNewlineContinueMarkup } from '@codemirror/lang-markdown'
+import {
+  HighlightStyle,
+  foldAll,
+  foldEffect,
+  foldGutter,
+  foldKeymap,
+  foldable,
+  foldedRanges,
+  indentUnit,
+  syntaxHighlighting,
+  syntaxTree,
+  unfoldAll,
+} from '@codemirror/language'
+import { languages } from '@codemirror/language-data'
+import { openSearchPanel, search, searchKeymap } from '@codemirror/search'
+import { Annotation, Compartment, EditorState, Transaction } from '@codemirror/state'
+import { EditorView, placeholder, crosshairCursor, drawSelection, dropCursor, hoverTooltip, keymap, rectangularSelection } from '@codemirror/view'
+import { tags } from '@lezer/highlight'
+
+import { chatImageUrl, fileUrl, markKeyRefused, needTicketUrl, setFileKey, takeKeyRefused, ticketFromHash, tokenFromHash } from './access.mjs'
+import { appearanceVars } from './appearance.mjs'
+import { findHeading, headingsOf, linkCompletion, wikiLinkCompletion } from './complete.mjs'
+import { calendarModel, shiftMonth } from './calendar.mjs'
+import { periodInfo, todayButtonHidden } from './periodic.mjs'
+import { PRODUCT } from './product.mjs'
+import { askChoice, askConfirm, askNewNote, askPlace, askText, showMessage } from './dialogs.mjs'
+import { keyLabel, localizeKeyHints } from './keys.mjs'
+import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
+import { ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
+import { noteMarkdown } from './markdown-ext.mjs'
+import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
+import { minimalChange } from './merge.mjs'
+import { noteContext, previewField, setComposing, setMode, togglePropsPanel } from './preview.mjs'
+import { createSaver } from './save.mjs'
+import { createSplit } from './split.mjs'
+import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
+import { createConnectionWatch, createVersionWatch } from './connection.mjs'
+import { beginTableCell, showMenu } from './widgets.mjs'
+import { setProperty } from './yaml-lite.mjs'
+
+const $ = (id) => document.getElementById(id)
+
+// 左右に並べたときの右の枠は、同じページを ?pane=right で開く。右の枠では、上のボタン列と右端の一覧を使わない。
+const PANE = new URLSearchParams(location.search).get('pane') === 'right' ? 'right' : 'left'
+document.body.dataset.pane = PANE
+// 右の枠への連絡の送り先。右の枠からは、いつも同じアドレスの左（親のページ）へ送る。
+const toLeft = (message) => parent.postMessage(message, location.origin)
+// 右の枠は全体の半分ほどの幅なので、自分の幅では決めず、いつも「狭くない」として扱う。
+function isNarrow() {
+  return PANE !== 'right' && matchMedia('(max-width: 640px)').matches
+}
+// 右の枠が開いているか（左の枠で使う）。一時保存を戻すときに見る。
+let rightOpen = false
+function setRightOpen(open) {
+  rightOpen = Boolean(open)
+}
+// 右の枠が操作中か（右の枠で使う）。左から ACTIVE で知らされる。
+let paneActive = false
+// 左の枠で使う。右の枠から OPENED と STATE で知らされた、右の枠のノートの様子。
+let rightState = { path: null, selection: '', dirty: false, headings: null }
+// 右の枠の準備ができたら開いてもらうノート。分けた直後や、分けてすぐ右で開くときに使う。
+let rightWant = null
+// 右の枠が最後に知らせてきた、開いているノート。同じノートの OPENED は見出しの更新として扱う。
+let rightShown = null
+// 画面を左右に分ける係。右の枠の中では使わない。
+const split = PANE === 'right' ? null : createSplit({ layout: $('layout'), editor: $('editor'), onMessage: receiveFromRight, onActiveChange: activeChanged })
+const rightActive = () => split?.active() === 'right'
+const activePane = () => split?.active() ?? 'left'
+const external = Annotation.define()
+const contextSlot = new Compartment()
+const editableSlot = new Compartment()
+
+const REASONS = {
+  'mixed-eol': '改行のしかたが2種類混ざっているので、編集できない状態で開いています。',
+  bom: 'BOM付きのファイルなので、編集できない状態で開いています。',
+  'not-utf8': 'UTF-8ではないファイルなので、編集できない状態で開いています。',
+  excalidraw: 'Excalidrawのノートなので、データを壊さないよう編集できない状態で開いています。',
+}
+const STATUS_TEXT = {
+  saved: '保存済み',
+  updated: '保存済み（ほかからの変更を反映）',
+  dirty: '未保存',
+  saving: '保存中…',
+  offline: 'サーバーにつながりません。入力は続けられます',
+  gone: 'サーバーにつながりません',
+  'save-failed': '保存できませんでした',
+  conflict: '保存を止めています',
+  removed: 'ファイルが見つかりません',
+  blocked: '編集できません',
+  elsewhere: '保存を止めています',
+  readonly: '編集できません',
+}
+
+const storage = {
+  get(key, fallback = null) {
+    try {
+      const value = localStorage.getItem(key)
+      return value === null ? fallback : JSON.parse(value)
+    } catch {
+      return fallback
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value))
+    } catch {
+      // 保存領域が使えなくても編集は続ける。
+    }
+  },
+  remove(key) {
+    try {
+      localStorage.removeItem(key)
+    } catch {
+      // 同上
+    }
+  },
+}
+
+// タブを閉じる途中の送信は、keepaliveを付けないと捨てられる。付けられるのは64KBまで。
+const KEEPALIVE_LIMIT = 60_000
+let unloading = false
+let rootId = ''
+const TOKEN_KEY = 'access-token'
+let accessToken = storage.get(TOKEN_KEY, '')
+let tokenRefused = false
+// 鍵付きの場所で開かれ、その鍵をサーバーに断られた（期限切れ・使用済み）。開けない画面は、これを need-ticket に付けて送る。
+// 鍵を断られたあとに読み込み直したときは、タブの中の印から引き継ぐ。
+const sessionStore = (() => {
+  try {
+    return window.sessionStorage
+  } catch {
+    return undefined
+  }
+})()
+let keyRefused = takeKeyRefused(sessionStore)
+
+// 合言葉がURLに残らないよう、受け取ったらすぐ消す。変わっていればtrueを返す。
+function takeToken() {
+  const token = tokenFromHash(location.hash)
+  if (!token) return false
+  window.history.replaceState(window.history.state, '', `${location.pathname}${location.search}`)
+  const changed = token !== accessToken
+  accessToken = token
+  storage.set(TOKEN_KEY, token)
+  return changed
+}
+
+// チャットのリンクの鍵を合言葉に引き換える。鍵は一度しか使えないので、すぐURLから消す。変わっていればtrueを返す。
+async function takeTicket() {
+  const ticket = ticketFromHash(location.hash)
+  if (!ticket) return false
+  window.history.replaceState(window.history.state, '', `${location.pathname}${location.search}`)
+  let response
+  try {
+    response = await fetch('/api/claim', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-note-editor': '1' },
+      body: JSON.stringify({ ticket }),
+    })
+  } catch {
+    return false
+  }
+  // 期限切れのリンクでも、覚えているものが合っていれば開けるので、ここでは止めない。
+  if (response.status === 401) keyRefused = true
+  if (!response.ok) return false
+  keyRefused = false // 引き換えられたので、前に断られたことは忘れる（古い「断られた」を送らない）
+  const { token } = await response.json()
+  const changed = token !== accessToken
+  accessToken = token
+  storage.set(TOKEN_KEY, token)
+  return changed
+}
+
+const tokenHeader = () => (accessToken ? { 'x-note-token': accessToken } : {})
+
+// 開けない画面を出すときに、Modへ「鍵のリンクがほしい」と知らせる。1回目と、その3秒後の2回目だけ。
+// どちらも、鍵を断られたかどうか（keyRefused）を付ける。Modは断られたときだけClaudeに頼み直す。
+// 返事の pending（Modが開き直しを頼んでいるか）で、画面の文を出し分ける。返事が来なければ、初めの文のまま。
+// 開き直しを待つのは最長150秒。それでも開かなければ、「ノートを開く」の案内に戻す。
+const LOCKED_RETRY_MS = 3000
+const LOCKED_PENDING_MAX_MS = 150 * 1000
+let ticketAsked = false
+function askForTicket() {
+  if (ticketAsked) return
+  ticketAsked = true
+  const title = $('locked-title')
+  const body = $('locked-body')
+  const defaults = [title.textContent, body.textContent]
+  const draw = (pending) => {
+    ;[title.textContent, body.textContent] = pending ? ['開き直しています…', 'Claudeの作業が終わると開きます。'] : defaults
+  }
+  let giveUp = 0
+  const url = needTicketUrl(keyRefused)
+  const ask = () => fetch(url, { method: 'POST', headers: { 'x-note-editor': '1' } })
+    .then((response) => (response.ok ? response.json() : null))
+    .then((data) => {
+      if (document.body.dataset.locked !== 'true') return
+      if (!data) return
+      draw(data.pending === true)
+      if (data.pending === true && !giveUp) giveUp = setTimeout(() => draw(false), LOCKED_PENDING_MAX_MS)
+    })
+    .catch(() => {})
+  ask().then(() => setTimeout(ask, LOCKED_RETRY_MS))
+  // 同じ場所の別のタブが開けたら、こちらも読み込み直して開く。
+  window.addEventListener('storage', (event) => {
+    if (event.key === TOKEN_KEY && event.newValue) location.reload()
+  })
+}
+
+function refuseToken() {
+  tokenRefused = true
+  if (view) otherVault()
+  else {
+    document.body.dataset.locked = 'true'
+    askForTicket()
+  }
+}
+
+function otherVault() {
+  if (saver) saver.elsewhere()
+  else if ($('status').dataset.state !== 'elsewhere') setStatus('elsewhere')
+}
+
+async function request(url, options = {}) {
+  // 開けない画面のあいだは、どうせ断られる問い合わせを送らない。
+  if (document.body.dataset.locked) return { status: 0, ok: false, data: null }
+  const response = await fetch(url, {
+    ...options,
+    keepalive: unloading && (options.body?.length ?? 0) * 3 < KEEPALIVE_LIMIT,
+    headers: {
+      ...(options.body ? { 'content-type': 'application/json' } : {}),
+      'x-note-editor': '1',
+      ...(rootId ? { 'x-note-root': rootId } : {}),
+      ...tokenHeader(),
+      ...options.headers,
+    },
+  })
+  if (response.status === 412) otherVault()
+  if (response.status === 401) refuseToken()
+  const data = response.headers.get('content-type')?.includes('json') ? await response.json() : null
+  return { status: response.status, ok: response.ok, data, version: response.headers.get(VERSION_HEADER) }
+}
+
+const noteUrl = (path) => `/api/note?path=${encodeURIComponent(path)}`
+const api = {
+  async read(path) {
+    const result = await request(noteUrl(path))
+    if (!result.ok) throw Object.assign(new Error(result.data?.error ?? 'read failed'), { status: result.status })
+    return result.data
+  },
+  async write(path, text, baseHash) {
+    const result = await request(noteUrl(path), { method: 'PUT', body: JSON.stringify({ text, baseHash }) })
+    if (result.status === 409) return result.data
+    if (!result.ok) throw Object.assign(new Error(result.data?.error ?? 'save failed'), { status: result.status })
+    return result.data
+  },
+  async backup(path, text) {
+    await request(`/api/backup?path=${encodeURIComponent(path)}`, { method: 'POST', body: JSON.stringify({ text }) })
+  },
+}
+
+// テスト用のコピーと実際のVaultで同じパスの下書きが混ざらないよう、Vaultごとの印で分ける。
+let vaultName = ''
+// 右の枠は、同じノートの左の一時保存を消さないよう、別の名前で残す。
+const drafts = {
+  set: (path, draft) => storage.set(draftKey(vaultName, path, PANE), draft),
+  remove: (path) => storage.remove(draftKey(vaultName, path, PANE)),
+  get: (path) => storage.get(draftKey(vaultName, path, PANE)),
+}
+
+const highlight = HighlightStyle.define([
+  { tag: tags.heading, fontWeight: '700' },
+  { tag: tags.strong, fontWeight: '700' },
+  { tag: tags.emphasis, fontStyle: 'italic' },
+  { tag: tags.strikethrough, textDecoration: 'line-through' },
+  { tag: tags.processingInstruction, color: 'var(--muted)' },
+  { tag: tags.contentSeparator, color: 'var(--muted)' },
+  { tag: tags.monospace, fontFamily: 'var(--mono)' },
+  { tag: tags.keyword, color: 'var(--code-keyword)' },
+  { tag: [tags.string, tags.special(tags.string)], color: 'var(--code-string)' },
+  { tag: tags.comment, color: 'var(--muted)', fontStyle: 'italic' },
+  { tag: [tags.number, tags.bool, tags.null], color: 'var(--code-number)' },
+  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: 'var(--code-function)' },
+  { tag: [tags.typeName, tags.className], color: 'var(--code-type)' },
+])
+
+let view = null
+let saver = null
+let events = null
+let notes = []
+let known = null
+let currentPath = null
+// ノートはまず閲覧で開き、「編集」か Cmd+E で編集に切り替える。
+let mode = 'reading'
+let rootPaths = []
+let platform = 'darwin'
+let vaultLabel = ''
+let allNotes = []
+// ファイル欄に出すフォルダー。中身のないフォルダーも入る。
+let folders = []
+let sourceOnly = false
+let editable = true
+let hoverWithMeta = false
+let stateTimer = null
+
+const OFFLINE_TEXT = 'サーバーにつながっていません。このフォルダーのClaudeのチャットが開いていれば、すぐにまたつながります。入力は続けられます。'
+const GONE_TEXT = 'このフォルダーでClaudeのチャットを開くと、また使えるようになります。書いた文字は、このタブの下書きに残っています。'
+const PORT_MOVED_TEXT = 'いつもと違う接続先で動いています。前の接続先で書いた下書きは、ここには出ません。'
+const CHECK_TIMEOUT_MS = 4000
+// サーバーが応答に付ける、自分のバージョン（server/config.mjs の VERSION_HEADER と同じ名前）。
+const VERSION_HEADER = `x-${PRODUCT.toLowerCase()}-version`
+const VERSION_CONFLICT_TEXT = `新しいバージョンの${PRODUCT}に入れ替わりました。保存がほかの変更とぶつかっているので、画面を読み込み直していません。どちらを残すか選ぶと、読み込み直します。`
+let connectionWatch = null
+let versionWatch = null
+let currentReason = null
+
+// 何か応答があればつながっている。401・412も、今の処理に任せてつながっている扱いにする。
+// 応答のバージョンが、画面を読み込んだときと違えば（新しいバージョンに入れ替わった）、つながった知らせのあとで確かめる。
+async function checkConnection() {
+  if (document.hidden) return 'skip'
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS)
+  try {
+    const { version } = await request('/api/health', { signal: controller.signal })
+    if (versionWatch && version) setTimeout(() => versionWatch.seen(version).catch(() => {}), 0)
+    return 'up'
+  } catch {
+    return 'down'
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function connectionChanged(next) {
+  const current = $('status').dataset.state
+  if (next === 'online') {
+    if (current !== 'offline' && current !== 'gone') return
+    restoreBanner()
+    if (currentPath) connectEvents(currentPath)
+    if (saver) saver.save()
+    else setStatus('saved')
+    return
+  }
+  // ぶつかった・消えた・編集できないなど、もっと大事な表示を上書きしない。
+  if (['conflict', 'removed', 'blocked', 'elsewhere', 'readonly'].includes(current)) return
+  setStatus(next)
+}
+
+// つながったら、つながらない表示を消し、開いているノート本来の案内に戻す。
+function restoreBanner() {
+  const banner = $('banner')
+  if (!editable) {
+    banner.hidden = false
+    banner.textContent = REASONS[currentReason] ?? '編集できません。'
+  } else if (sourceOnly) {
+    banner.hidden = false
+    banner.textContent = '大きいファイルなので、ソース表示で開いています。'
+  } else {
+    banner.hidden = true
+  }
+}
+
+// 読み込み直す前に、左と右の枠の書きかけを保存しきる。保存しきれなければ、下書きを書き直して読み込み直さない。
+async function saveBeforeReload() {
+  commitOpenField()
+  await saver?.flush()
+  const state = $('status').dataset.state
+  if (saver && state === 'conflict') return 'conflict'
+  if (saver && !CLEAN_STATES.has(state)) {
+    saver.keepDraft()
+    return 'failed'
+  }
+  if (split?.isOpen() && (await split.save()).dirty) return 'failed'
+  return 'saved'
+}
+
+// 右の枠は左のページの中にあるので、読み込み直すのは左だけ（右も一緒に読み込み直される）。
+function startVersionWatch(loaded) {
+  if (PANE === 'right' || versionWatch) return
+  versionWatch = createVersionWatch({
+    loaded,
+    save: saveBeforeReload,
+    reload: () => location.reload(),
+    notify: () => showNotice(VERSION_CONFLICT_TEXT),
+  })
+}
+
+function startConnectionWatch() {
+  if (connectionWatch) return
+  connectionWatch = createConnectionWatch({ check: checkConnection, onChange: connectionChanged })
+  connectionWatch.start()
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) connectionWatch.poke()
+  })
+}
+
+// タブを開いている間に1回だけ出すための印。中身は今までどおり notedock.portMovedShown。
+const PORT_MOVED_KEY = `${PRODUCT.toLowerCase()}.portMovedShown`
+
+function showPortMovedOnce(health) {
+  if (!health.portMoved) return
+  try {
+    if (sessionStorage.getItem(PORT_MOVED_KEY)) return
+  } catch {
+    // 覚えられなくても、出すだけは出す。
+  }
+  showNotice(PORT_MOVED_TEXT)
+  try {
+    sessionStorage.setItem(PORT_MOVED_KEY, '1')
+  } catch {
+    // 同上。
+  }
+}
+
+// 閉じるボタン付きのお知らせを、画面の上に出す。
+function showNotice(text) {
+  const notice = $('port-moved-notice')
+  notice.replaceChildren(document.createTextNode(text), bannerButton('閉じる', () => { notice.hidden = true }))
+  notice.hidden = false
+}
+
+function setStatus(state, detail = {}) {
+  // つながらない間は、保存側の「未保存」「保存中」などでつながらない表示を消さない。
+  const watched = connectionWatch?.state()
+  if (watched && watched !== 'online' && ['saved', 'updated', 'dirty', 'saving', 'offline'].includes(state)) state = watched
+  $('status').textContent = STATUS_TEXT[state] ?? ''
+  $('status').dataset.state = state
+  delete $('status').dataset.hint
+  scheduleState()
+  const banner = $('banner')
+  if (state === 'conflict') {
+    banner.hidden = false
+    banner.replaceChildren(
+      document.createTextNode('同じ行がほかから変更されたので、自動保存を止めました。どちらを残しますか。選ばなかった方はバックアップに残ります。'),
+      bannerButton('違いを見る', () => compare(detail.theirs)),
+      bannerButton('保存されているファイルの内容を使う', () => saver.resolve('theirs')),
+      bannerButton('自分の内容を使う', () => saver.resolve('mine')),
+    )
+  } else if (state === 'removed') {
+    banner.hidden = false
+    banner.textContent = 'このノートは消えたか、名前が変わりました。自動保存を止めました。画面の内容はバックアップに残しています。'
+  } else if (state === 'blocked') {
+    banner.hidden = false
+    banner.textContent = 'このファイルは編集できない形式に変わりました。自動保存を止めました。画面の内容は下書きに残しています。'
+  } else if (state === 'elsewhere') {
+    banner.hidden = false
+    banner.replaceChildren(
+      document.createTextNode(tokenRefused
+        ? 'サーバーが変わったか、開き直しが必要になったので、保存を止めました。画面の内容はこのタブの下書きに残しています。Claudeのアプリで、入力欄の上の「ノートを開く」を押すと、続きから保存できます。'
+        : 'このタブを開いたあとで、サーバーが別のフォルダーのものに変わりました。ここの内容を向こうへ書かないよう、保存を止めました。画面の内容はこのタブの下書きに残しています。'),
+      bannerButton('開き直す', () => location.reload()),
+    )
+  } else if (state === 'save-failed') {
+    banner.hidden = false
+    banner.textContent = '保存できませんでした。書いた文字は、このタブの下書きに残っています。'
+  } else if (state === 'offline') {
+    banner.hidden = false
+    banner.textContent = OFFLINE_TEXT
+  } else if (state === 'gone') {
+    banner.hidden = false
+    banner.textContent = GONE_TEXT
+  } else if (state !== 'readonly') {
+    banner.hidden = true
+  }
+}
+
+function bannerButton(label, run) {
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.textContent = label
+  button.addEventListener('click', run)
+  return button
+}
+
+function compare(theirs) {
+  $('compare-mine').textContent = view.state.doc.toString()
+  $('compare-theirs').textContent = theirs ?? ''
+  $('compare').showModal()
+}
+
+function softBreak(target) {
+  const { state } = target
+  const line = state.doc.lineAt(state.selection.main.head)
+  const match = line.text.match(/^(\s*)(?:(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)/)
+  if (!match) return insertNewline(target)
+  const indent = ' '.repeat(match[0].length)
+  target.dispatch(state.replaceSelection(`\n${indent}`), { scrollIntoView: true })
+  return true
+}
+
+function runSpec(make) {
+  return (target) => {
+    if (target.state.readOnly) return false
+    // ボタン1回を、Cmd+Zの1回にする。
+    target.dispatch(make(target.state), { annotations: isolateHistory.of('full') })
+    target.focus()
+    return true
+  }
+}
+
+function insertTable(target) {
+  if (target.state.readOnly) return false
+  const { from, spec } = tableSpec(target.state)
+  target.dispatch(spec, { annotations: isolateHistory.of('full') })
+  target.focus()
+  beginTableCell(target, from, 0, 0)
+  return true
+}
+
+async function insertLink(target) {
+  if (target.state.readOnly) return false
+  const { from, to } = target.state.selection.main
+  const label = from === to ? await askText('リンクに表示する文字') : target.state.sliceDoc(from, to)
+  if (!label?.trim()) {
+    target.focus()
+    return true
+  }
+  target.dispatch(linkSpec(target.state, label.trim()))
+  target.focus()
+  startCompletion(target)
+  return true
+}
+
+const HEADING_MENU = [['本文', 0], ['見出し1', 1], ['見出し2', 2], ['見出し3', 3]]
+const CALLOUT_MENU = [
+  ['ℹ Note（補足）', 'NOTE'],
+  ['💡 Tip（ヒント）', 'TIP'],
+  ['❗ Important（重要）', 'IMPORTANT'],
+  ['⚠ Warning（警告）', 'WARNING'],
+  ['🛑 Caution（注意）', 'CAUTION'],
+]
+
+function menuBelow(button, items) {
+  const rect = button.getBoundingClientRect()
+  showMenu({ clientX: rect.left, clientY: rect.bottom + 2 }, items)
+}
+
+const TOOLBAR_ACTIONS = {
+  heading: (button) => menuBelow(button, HEADING_MENU.map(([label, level]) => ({ label, run: () => runSpec((state) => headingSpec(state, level))(view) }))),
+  bold: () => runSpec((state) => inlineSpec(state, 'bold'))(view),
+  italic: () => runSpec((state) => inlineSpec(state, 'italic'))(view),
+  strike: () => runSpec((state) => inlineSpec(state, 'strike'))(view),
+  code: () => runSpec((state) => inlineSpec(state, 'code'))(view),
+  bullet: () => runSpec((state) => lineKindSpec(state, 'bullet'))(view),
+  number: () => runSpec((state) => lineKindSpec(state, 'number'))(view),
+  task: () => runSpec((state) => lineKindSpec(state, 'task'))(view),
+  quote: () => runSpec((state) => lineKindSpec(state, 'quote'))(view),
+  link: () => insertLink(view),
+  image: () => $('toolbar-image').click(),
+  table: () => insertTable(view),
+  rule: () => runSpec(horizontalRuleSpec)(view),
+  codeblock: () => runSpec(codeBlockSpec)(view),
+  callout: (button) => menuBelow(button, CALLOUT_MENU.map(([label, kind]) => ({ label, run: () => runSpec((state) => calloutSpec(state, kind))(view) }))),
+}
+
+// 変換中と、表のマスやノートの情報の欄を編集している間は、押しても何もしない。
+function toolbarBusy() {
+  return Boolean(view?.composing || view?.compositionStarted || document.activeElement?.closest?.('.cm-cell-editing, .cm-props'))
+}
+
+function syncToolbar() {
+  const bar = $('toolbar')
+  bar.hidden = !currentPath || !editable || mode === 'reading'
+  if (bar.hidden || !view) return
+  const busy = toolbarBusy()
+  const format = currentFormat(view.state)
+  const pressed = {
+    heading: format.heading > 0,
+    bold: format.inline.has('bold'),
+    italic: format.inline.has('italic'),
+    strike: format.inline.has('strike'),
+    code: format.inline.has('code'),
+    bullet: format.line === 'bullet',
+    number: format.line === 'number',
+    task: format.line === 'task',
+    quote: format.quote,
+  }
+  for (const button of bar.querySelectorAll('button')) {
+    button.setAttribute('aria-disabled', String(busy))
+    if (button.dataset.action in pressed) button.setAttribute('aria-pressed', String(pressed[button.dataset.action]))
+  }
+  $('toolbar-heading-label').textContent = format.heading > 0 ? `見出し${format.heading}` : '見出し'
+}
+
+function bindToolbar() {
+  const bar = $('toolbar')
+  // 押してもエディターのカーソルと選択を保つ。
+  bar.addEventListener('mousedown', (event) => event.preventDefault())
+  bar.addEventListener('click', (event) => {
+    const button = event.target.closest('button')
+    if (!button || !view || toolbarBusy()) return
+    TOOLBAR_ACTIONS[button.dataset.action]?.(button)
+  })
+  $('toolbar-image').addEventListener('change', (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (file && view && !view.state.readOnly) uploadImage(file, view)
+  })
+  $('editor').addEventListener('focusin', syncToolbar)
+  $('editor').addEventListener('focusout', () => setTimeout(syncToolbar, 0))
+}
+
+function cycleMode() {
+  applyMode(mode === 'reading' ? 'live' : 'reading')
+  return true
+}
+
+function addProperty(target) {
+  askText('追加する項目の名前').then((name) => applyNewProperty(target, name))
+  return true
+}
+
+function applyNewProperty(target, name) {
+  if (!name?.trim()) return
+  const doc = target.state.doc.toString()
+  const front = doc.match(/^---\n[\s\S]*?\n---(?=\n|$)/)
+  if (front) {
+    target.dispatch({ changes: { from: 0, to: front[0].length, insert: setProperty(front[0], name.trim(), '') } })
+  } else {
+    target.dispatch({ changes: { from: 0, insert: `---\n${name.trim()}:\n---\n` } })
+  }
+  target.dispatch({ effects: togglePropsPanel.of(true) })
+}
+
+function saveNow() {
+  saver?.save()
+  return true
+}
+
+const editorKeys = keymap.of([
+  ...completionKeymap,
+  { key: 'Enter', run: insertNewlineContinueMarkup },
+  { key: 'Backspace', run: deleteMarkupBackward },
+  { key: 'Shift-Enter', run: softBreak },
+  { key: 'Mod-b', run: runSpec((state) => inlineSpec(state, 'bold')), preventDefault: true },
+  { key: 'Mod-i', run: runSpec((state) => inlineSpec(state, 'italic')), preventDefault: true },
+  { key: 'Mod-k', run: (target) => { insertLink(target); return true }, preventDefault: true },
+  { key: 'Mod-s', run: saveNow, preventDefault: true },
+  { key: 'Mod-e', run: cycleMode, preventDefault: true },
+  { key: 'Mod-Alt-f', run: openSearchPanel, preventDefault: true },
+  { key: 'Mod-;', run: addProperty, preventDefault: true },
+  { key: 'Mod-Shift-t', run: insertTable, preventDefault: true },
+  { key: 'Mod-Alt-[', run: (target) => foldAll(target), preventDefault: true },
+  { key: 'Mod-Alt-]', run: (target) => unfoldAll(target), preventDefault: true },
+  ...closeBracketsKeymap,
+  ...searchKeymap,
+  ...foldKeymap,
+  ...historyKeymap,
+  ...defaultKeymap,
+  indentWithTab,
+])
+
+const JA = {
+  Find: '検索',
+  Replace: '置換',
+  next: '次へ',
+  previous: '前へ',
+  all: 'すべて選択',
+  'match case': '大文字と小文字を区別',
+  'by word': '単語で探す',
+  regexp: '正規表現',
+  replace: '置換',
+  'replace all': 'すべて置換',
+  close: '閉じる',
+  'current match': '現在の位置',
+  'on line': '行',
+  'Folded lines': '折りたたんだ行',
+  'Unfolded lines': '開いた行',
+  'Fold line': '折りたたむ',
+  'Unfold line': '開く',
+  'folded code': '折りたたみ',
+  unfold: '開く',
+}
+
+// 「**」と打つと閉じる側も入れる。閉じる側を自分で打ったときは重ねずに先へ進む。
+const boldAutoPair = EditorView.inputHandler.of((target, from, to, text) => {
+  if (text !== '*' || from !== to) return false
+  const doc = target.state.doc
+  const after = doc.sliceString(to, to + 1)
+  if (after === '*') {
+    target.dispatch({ selection: { anchor: from + 1 } })
+    return true
+  }
+  const before = doc.sliceString(Math.max(0, from - 2), from)
+  if (!before.endsWith('*') || before === '**') return false
+  target.dispatch({ changes: { from, insert: '***' }, selection: { anchor: from + 1 } })
+  return true
+})
+
+const editorEvents = EditorView.domEventHandlers({
+  compositionstart(_, target) {
+    target.dispatch({ effects: setComposing.of(true) })
+    syncToolbar()
+    return false
+  },
+  compositionend(_, target) {
+    setTimeout(() => {
+      // 確定と同時に次の変換が始まっていたら、その変換が終わるまで待つ。
+      if (target.compositionStarted) return
+      target.dispatch({ effects: setComposing.of(false) })
+      saver?.compositionEnded()
+      syncToolbar()
+    }, 0)
+    return false
+  },
+  blur(_, target) {
+    if (target.state.field(previewField).composing) target.dispatch({ effects: setComposing.of(false) })
+    return false
+  },
+  paste(event, target) {
+    const file = [...(event.clipboardData?.files ?? [])].find((item) => item.type.startsWith('image/'))
+    if (!file || target.state.readOnly) return false
+    event.preventDefault()
+    uploadImage(file, target)
+    return true
+  },
+})
+
+async function uploadImage(file, target) {
+  const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg').replace('svg+xml', 'svg') ?? 'png'
+  const name = file.name && file.name.includes('.') ? file.name : `image.${ext}`
+  const response = await fetch(`/api/attachment?name=${encodeURIComponent(name)}`, {
+    method: 'POST',
+    headers: { 'x-note-editor': '1', 'x-note-root': rootId, ...tokenHeader() },
+    body: file,
+  })
+  if (response.status === 412) otherVault()
+  if (response.status === 401) refuseToken()
+  if (!response.ok) {
+    showMessage('画像を保存できませんでした。')
+    return
+  }
+  const { path } = await response.json()
+  target.dispatch(target.state.replaceSelection(`![](${relativeHref(currentPath, path)})`))
+}
+
+function linkAt(state, pos, side) {
+  // [[ ]]は1つの部品として表示するので、位置は端に来る。マウスのある側を見る。
+  let node = syntaxTree(state).resolveInner(pos, side)
+  while (node && node.name !== 'Link' && node.name !== 'WikiLink' && node.name !== 'Document') node = node.parent
+  if (node?.name === 'WikiLink') {
+    const link = wikiLinkOf(state.doc.sliceString(node.from + 2, node.to - 2), state.facet(noteContext))
+    return link?.href ? { href: link.href, from: node.from, to: node.to } : null
+  }
+  if (!node || node.name !== 'Link') return null
+  const url = node.getChild('URL')
+  return url ? { href: state.doc.sliceString(url.from, url.to), from: node.from, to: node.to } : null
+}
+
+const hoverPreview = hoverTooltip(
+  async (target, pos, side) => {
+    if (!hoverWithMeta) return null
+    const link = linkAt(target.state, pos, side)
+    if (!link || isExternal(link.href)) return null
+    const resolved = resolveHref(currentPath, link.href)
+    if (!resolved?.path.endsWith('.md')) return null
+    let note
+    try {
+      note = await api.read(resolved.path)
+    } catch {
+      return null
+    }
+    return {
+      pos: link.from,
+      end: link.to,
+      above: true,
+      create() {
+        const dom = document.createElement('div')
+        dom.className = 'note-hover'
+        const inner = new EditorView({
+          parent: dom,
+          state: EditorState.create({
+            doc: note.text.slice(0, 20000),
+            extensions: [
+              noteMarkdown(languages),
+              noteContext.of({ path: resolved.path, known, isTooltip: true }),
+              previewField,
+              EditorView.editable.of(false),
+              EditorState.readOnly.of(true),
+              EditorView.lineWrapping,
+              syntaxHighlighting(highlight),
+            ],
+          }),
+        })
+        inner.dispatch({ effects: setMode.of('reading') })
+        return { dom, destroy: () => inner.destroy() }
+      },
+    }
+  },
+  { hoverTime: 250 },
+)
+
+function extensionsFor(path, canEdit) {
+  return [
+    history(),
+    drawSelection(),
+    dropCursor(),
+    rectangularSelection(),
+    crosshairCursor({ key: 'Alt' }),
+    EditorState.allowMultipleSelections.of(true),
+    EditorView.clickAddsSelectionRange.of((event) => event.altKey),
+    EditorState.tabSize.of(4),
+    indentUnit.of('\t'),
+    EditorView.lineWrapping,
+    EditorState.phrases.of(JA),
+    closeBrackets(),
+    boldAutoPair,
+    search({ top: true }),
+    foldGutter({ openText: '▾', closedText: '▸' }),
+    autocompletion({
+      override: [
+        linkCompletion({ notes: () => notes, currentPath: () => currentPath }),
+        wikiLinkCompletion({ notes: () => notes, known: () => known, currentPath: () => currentPath }),
+      ],
+      icons: false,
+      defaultKeymap: false,
+    }),
+    syntaxHighlighting(highlight),
+    noteMarkdown(languages),
+    contextSlot.of(noteContext.of({ path, known, newNoteDir: defaultNoteDir(path, noteFolders(notes)), api, editable: canEdit })),
+    previewField,
+    editableSlot.of(editableExtensions(canEdit)),
+    editorKeys,
+    editorEvents,
+    hoverPreview,
+    EditorView.updateListener.of(onUpdate),
+    EditorView.contentAttributes.of({ spellcheck: 'false', autocapitalize: 'off', autocorrect: 'off' }),
+  ]
+}
+
+function editableExtensions(canEdit) {
+  const allow = canEdit && mode !== 'reading'
+  return [EditorView.editable.of(allow), EditorState.readOnly.of(!allow)]
+}
+
+function onUpdate(update) {
+  if (update.docChanged) {
+    const fromOutside = update.transactions.some((tr) => tr.annotation(external))
+    if (!fromOutside) saver?.changed()
+    scheduleOutline()
+    if (PANE === 'right' && paneActive) schedulePaneOutline()
+  }
+  if (update.docChanged || update.selectionSet) {
+    scheduleState()
+    syncToolbar()
+  }
+  if (update.transactions.some((tr) => tr.effects.some((e) => e.is(foldEffect)))) rememberFolds()
+}
+
+function rememberFolds() {
+  if (!view || !currentPath) return
+  const lines = []
+  foldedRanges(view.state).between(0, view.state.doc.length, (from) => {
+    lines.push(view.state.doc.lineAt(from).number)
+  })
+  storage.set(`folds:${vaultName}:${currentPath}`, lines)
+}
+
+function restoreFolds(path) {
+  const effects = []
+  for (const number of storage.get(`folds:${vaultName}:${path}`, [])) {
+    if (number > view.state.doc.lines) continue
+    const line = view.state.doc.line(number)
+    const range = foldable(view.state, line.from, line.to)
+    if (range) effects.push(foldEffect.of(range))
+  }
+  if (effects.length) view.dispatch({ effects })
+}
+
+function applyMode(next) {
+  if (sourceOnly && next !== 'source') return
+  mode = next
+  showPasteHint(false)
+  for (const button of $('modes').querySelectorAll('button')) {
+    button.setAttribute('aria-pressed', String(button.dataset.mode === mode))
+  }
+  document.body.dataset.mode = mode
+  if (view) {
+    view.dispatch({ effects: [setMode.of(mode), editableSlot.reconfigure(editableExtensions(editable))] })
+  }
+  syncToolbar()
+}
+
+const CLEAN_STATES = new Set(['saved', 'updated', 'readonly'])
+
+const CHAT_POLL_MS = 1500
+const CHAT_WAIT_MS = 30 * 60 * 1000
+// 見出しをつかんでから、これだけ動かしたら移動を始める（px）。
+const CHAT_DRAG_START = 5
+const CHAT_DOCKS = ['top-left', 'top-right', 'bottom-left', 'bottom-center', 'bottom-right']
+const CHAT_MAX_IMAGES = 5
+const CHAT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+const CHAT_IMAGE_MAX = 10 * 1024 * 1024
+// 作業中の印がこれより長く書き直されていなければ、Claudeが止まったとみなして出さない。
+const CHAT_STALE_MS = 20 * 1000
+// Modの持ち主の印がこれより古ければ、受け取るセッションがないと知らせる。
+const CHAT_NO_OWNER_MS = 40 * 1000
+
+// ドロップした場所に近い置き場所を選ぶ。上は左右の2か所、下は左・中央・右の3か所。
+function chatDockAt(x, y, width, height) {
+  if (y < height / 2) return x < width / 2 ? 'top-left' : 'top-right'
+  if (x < width / 3) return 'bottom-left'
+  return x < (width * 2) / 3 ? 'bottom-center' : 'bottom-right'
+}
+
+const CHAT_IMAGE_NOTE = '添付した画像（Readで開いて見てください）:'
+
+// 送った文の最後に付けた画像の場所を外し、本文と画像のファイル名に分ける。
+export function splitChatImages(text) {
+  const at = text.indexOf(CHAT_IMAGE_NOTE)
+  if (at < 0) return { body: text, images: [] }
+  const images = text
+    .slice(at + CHAT_IMAGE_NOTE.length)
+    .split('\n')
+    .map((line) => line.replace(/^- /, '').trim())
+    .filter(Boolean)
+    .map((path) => path.split('/').pop())
+  return { body: text.slice(0, at).trim(), images }
+}
+
+function elapsedText(since) {
+  const seconds = Math.max(0, Math.floor((Date.now() - since) / 1000))
+  const minutes = Math.floor(seconds / 60)
+  return minutes ? `作業中 ${minutes}分${seconds % 60}秒` : `作業中 ${seconds}秒`
+}
+
+function readerView(parent, text) {
+  const reader = new EditorView({
+    parent,
+    state: EditorState.create({
+      doc: text,
+      extensions: [
+        noteMarkdown(languages),
+        noteContext.of({ path: currentPath ?? '', known, isTooltip: true, localImagesOnly: true }),
+        previewField,
+        EditorView.editable.of(false),
+        EditorState.readOnly.of(true),
+        EditorView.lineWrapping,
+        syntaxHighlighting(highlight),
+      ],
+    }),
+  })
+  reader.dispatch({ effects: setMode.of('reading') })
+  return reader
+}
+
+// チャット枠はいつも出す。前は ?chat=1 のときだけ出していたが、開き方によっては付かず、枠が消えていた（2026-11-08）。
+function setupChatBox() {
+  const panel = $('chat-panel')
+  const opener = $('chat-open')
+  const box = $('chat-box')
+  const input = $('chat-input')
+  const wait = $('chat-wait')
+  const notice = $('chat-notice')
+  const log = $('chat-log')
+  const expand = $('chat-expand')
+  const files = $('chat-files')
+  let waiting = 0
+  let timer = 0
+  let lastFor = 0
+  let logStamp = -1
+  let working = 0
+  let shown = []
+  let logSeq = 0
+  let images = []
+  const say = (text) => {
+    wait.textContent = text
+  }
+  // 話し相手（Modが印を書き直しているチャット）がいないあいだは、送れない。0も「いない」。
+  let noPartner = false
+  let sending = false
+  const syncSend = () => {
+    $('chat-send').disabled = Boolean(waiting) || sending || noPartner
+  }
+  const readOwner = (got) => {
+    noPartner = !got || Date.now() - (got.ownerAt ?? 0) > CHAT_NO_OWNER_MS
+    $('chat-owner').hidden = !noPartner
+    syncSend()
+  }
+  const refreshOwner = () => document.body.dataset.locked || panel.hidden ? Promise.resolve() : request('/api/chat-reply').then(({ data }) => readOwner(data)).catch(() => {})
+  refreshOwner()
+  setInterval(() => {
+    if (!document.hidden) refreshOwner()
+  }, CHAT_POLL_MS)
+
+  // 開いているノートをClaudeに伝えるかどうか。最初はオフ。サーバーに覚えてもらう。
+  const share = $('chat-share-on')
+  request('/api/share').then(({ data }) => { share.checked = data?.on === true }).catch(() => {})
+  share.addEventListener('change', async () => {
+    const want = share.checked
+    const saved = await request('/api/share', { method: 'PUT', body: JSON.stringify({ on: want }) }).catch(() => null)
+    if (!saved?.ok) share.checked = !want
+  })
+
+  // 置き場所・広げたか・たたんだかは、次に開いたときも同じにする。
+  const dockOf = () => (CHAT_DOCKS.includes(storage.get('chat-dock')) ? storage.get('chat-dock') : 'bottom-right')
+  const place = (dock) => {
+    panel.dataset.dock = dock
+    opener.dataset.dock = dock
+    storage.set('chat-dock', dock)
+    document.body.classList.toggle('chat-on', !panel.hidden && dock.startsWith('bottom'))
+  }
+  const setExpanded = (open) => {
+    log.hidden = !open
+    expand.setAttribute('aria-expanded', String(open))
+    expand.textContent = open ? '会話をたたむ' : '会話を広げる'
+    storage.set('chat-expanded', open)
+    if (open) {
+      markSeen()
+      logStamp = -1
+      refreshLog()
+    }
+  }
+  const setFolded = (folded, focus = false) => {
+    panel.hidden = folded
+    opener.hidden = !folded
+    storage.set('chat-folded', folded)
+    document.body.classList.toggle('chat-on', !folded && panel.dataset.dock.startsWith('bottom'))
+    if (!folded) refreshOwner()
+    if (!folded && focus) input.focus()
+  }
+  $('chat-fold').addEventListener('click', () => setFolded(true))
+  opener.addEventListener('click', () => {
+    setFolded(false, true)
+    if (opener.classList.contains('unread')) setExpanded(true)
+    opener.classList.remove('unread')
+  })
+  expand.addEventListener('click', () => setExpanded(log.hidden))
+
+  // 見出しの部分をつかんで動かし、離した場所に近い置き場所へ収める。
+  // 押しただけで動かさなければ何もしない。押した瞬間に枠が画面の上へ跳ねたり、置き場所が変わったりしないようにする（11/08）。
+  const head = $('chat-head')
+  head.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || event.target.closest('button')) return
+    event.preventDefault()
+    const box = panel.getBoundingClientRect()
+    const dx = event.clientX - box.left
+    const dy = event.clientY - box.top
+    head.setPointerCapture(event.pointerId)
+    let started = false
+    const move = (moved) => {
+      if (!started) {
+        if (Math.hypot(moved.clientX - event.clientX, moved.clientY - event.clientY) < CHAT_DRAG_START) return
+        started = true
+        panel.dataset.dragging = 'true'
+      }
+      panel.style.left = `${Math.min(Math.max(0, moved.clientX - dx), innerWidth - box.width)}px`
+      panel.style.top = `${Math.min(Math.max(0, moved.clientY - dy), innerHeight - 40)}px`
+    }
+    const drop = (ended) => {
+      head.removeEventListener('pointermove', move)
+      head.removeEventListener('pointerup', drop)
+      head.removeEventListener('pointercancel', drop)
+      head.removeEventListener('lostpointercapture', drop)
+      if (!started || !panel.dataset.dragging) return
+      delete panel.dataset.dragging
+      panel.style.left = ''
+      panel.style.top = ''
+      if (ended.type === 'pointerup') place(chatDockAt(ended.clientX, ended.clientY, innerWidth, innerHeight))
+    }
+    head.addEventListener('pointermove', move)
+    head.addEventListener('pointerup', drop)
+    head.addEventListener('pointercancel', drop)
+    head.addEventListener('lostpointercapture', drop, { once: true })
+  })
+
+  // 枠の大きさを、端や角をドラッグして変える。置き場所の反対側の端をつかむ。
+  const applySize = () => {
+    const size = storage.get('chat-size', null)
+    panel.style.setProperty('--chat-width', size?.width ? `${size.width}px` : '')
+    panel.style.setProperty('--chat-log-height', size?.height ? `${size.height}px` : '')
+  }
+  applySize()
+  for (const grip of panel.querySelectorAll('.chat-resize')) {
+    grip.addEventListener('dblclick', () => {
+      storage.remove('chat-size')
+      applySize()
+    })
+    grip.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return
+      event.preventDefault()
+      event.stopPropagation()
+      const axis = grip.dataset.axis
+      const dock = panel.dataset.dock
+      const startX = event.clientX
+      const startY = event.clientY
+      const width0 = panel.getBoundingClientRect().width
+      const height0 = log.getBoundingClientRect().height || 0
+      // 右に置いた枠は左の端を、左に置いた枠は右の端を引く。真ん中の枠は左右に同じだけ広がる。
+      const xSign = dock.endsWith('right') ? -1 : dock === 'bottom-center' ? 2 : 1
+      const ySign = dock.startsWith('top') ? 1 : -1
+      grip.setPointerCapture(event.pointerId)
+      panel.dataset.resizing = 'true'
+      const move = (moved) => {
+        const size = { ...storage.get('chat-size', {}) }
+        if (axis.includes('x')) {
+          size.width = Math.round(Math.min(Math.max(320, width0 + xSign * (moved.clientX - startX)), innerWidth - 32))
+        }
+        if (axis.includes('y') && !log.hidden) {
+          size.height = Math.round(Math.min(Math.max(120, height0 + ySign * (moved.clientY - startY)), innerHeight - 220))
+        }
+        storage.set('chat-size', size)
+        applySize()
+      }
+      const done = () => {
+        grip.removeEventListener('pointermove', move)
+        grip.removeEventListener('pointerup', done)
+        grip.removeEventListener('lostpointercapture', done)
+        delete panel.dataset.resizing
+      }
+      grip.addEventListener('pointermove', move)
+      grip.addEventListener('pointerup', done)
+      grip.addEventListener('lostpointercapture', done)
+    })
+  }
+
+  // 会話の表示。Modが書き出した最近の会話を並べ、作業中は経過時間を出す。
+  const showWorking = () => {
+    $('chat-state').textContent = working ? elapsedText(working) : ''
+  }
+  setInterval(showWorking, 1000)
+  // 前と同じ項目は残し、変わったところから後ろだけ作り直す。読んでいる場所や選んだ文字が消えないようにする。
+  const renderLog = (items) => {
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40
+    // 古い項目が押し出されて先頭がずれた分は、先に外して並びを合わせる。
+    const key = (item) => `${item.kind}\n${item.text}`
+    if (items.length && shown.length && key(shown[0]) !== key(items[0])) {
+      const at = shown.findIndex((old) => key(old) === key(items[0]))
+      const drop = at > 0 ? at : shown.length
+      for (const old of shown.slice(0, drop)) {
+        old.reader?.destroy()
+        old.row.remove()
+      }
+      shown = shown.slice(drop)
+    }
+    let same = 0
+    while (same < items.length && same < shown.length && shown[same].kind === items[same].kind && shown[same].text === items[same].text) same += 1
+    if (same === items.length && same === shown.length) return
+    for (const old of shown.slice(same)) {
+      old.reader?.destroy()
+      old.row.remove()
+    }
+    log.querySelector('.chat-empty')?.remove()
+    shown = shown.slice(0, same)
+    for (const item of items.slice(same)) {
+      const row = document.createElement('div')
+      row.className = `chat-item chat-${item.kind}`
+      const reader = item.kind === 'assistant' ? readerView(row, item.text) : null
+      if (item.kind === 'user') {
+        // 添付した画像は、場所の文字ではなく小さな見本で見せる。
+        const { body, images: names } = splitChatImages(item.text)
+        if (body && body !== '添付した画像を見てください。') row.append(body)
+        if (names.length) {
+          const strip = document.createElement('div')
+          strip.className = 'chat-bubble-images'
+          for (const name of names) {
+            const image = document.createElement('img')
+            image.src = chatImageUrl(name)
+            image.alt = '添付した画像'
+            image.addEventListener('error', () => image.replaceWith('（画像）'))
+            strip.append(image)
+          }
+          row.append(strip)
+        }
+      } else if (!reader) row.textContent = item.text
+      log.append(row)
+      shown.push({ ...item, row, reader })
+    }
+    if (!shown.length) {
+      const empty = document.createElement('p')
+      empty.className = 'chat-empty'
+      empty.textContent = 'まだ会話がありません。'
+      log.append(empty)
+    }
+    if (nearBottom || logStamp <= 0) log.scrollTop = log.scrollHeight
+  }
+  const selectingInLog = () => {
+    const selection = getSelection()
+    return selection && !selection.isCollapsed && log.contains(selection.anchorNode)
+  }
+  const refreshLog = async () => {
+    const seq = ++logSeq
+    try {
+      const { data } = await request('/api/chat-log')
+      // 遅れて届いた古い応答で、新しい表示を上書きしない。
+      if (!data || seq !== logSeq) return
+      working = data.working && Date.now() - (data.at ?? 0) < CHAT_STALE_MS ? data.working : 0
+      showWorking()
+      // チャットのタイトルを出す。まだ読めていなければ、プロジェクトの名前を出す。
+      const name = data.title || (data.project ? `Claude · ${data.project}` : 'Claude')
+      $('chat-title').textContent = name
+      $('chat-title').title = name
+      if (log.hidden || (data.at ?? 0) === logStamp || selectingInLog()) return
+      renderLog(data.items ?? [])
+      logStamp = data.at ?? 0
+    } catch {
+      // 次に読むときにもう一度試す。
+    }
+  }
+  refreshLog()
+  setInterval(() => {
+    if (!document.hidden) refreshLog()
+  }, CHAT_POLL_MS)
+
+  // 返事が届いたことを知らせる。会話を広げていれば、そこに出るので知らせない。
+  const markSeen = () => {
+    if (lastFor) storage.set('chat-reply-seen', lastFor)
+    notice.hidden = true
+    opener.classList.remove('unread')
+  }
+  notice.addEventListener('click', () => setExpanded(true))
+  const arrived = (got, unread = true) => {
+    lastFor = got.for
+    stopWaiting()
+    // 送れなかった知らせは、返事としては扱わず、その場の一言だけにする。
+    if (got.failed) {
+      if (unread) say(got.text)
+      markSeen()
+      return
+    }
+    const visible = !panel.hidden && !log.hidden
+    if (!unread || visible) {
+      if (visible) markSeen()
+      return
+    }
+    notice.hidden = false
+    notice.textContent = '返事が届きました。クリックで開きます'
+    opener.classList.add('unread')
+  }
+  const stopWaiting = () => {
+    waiting = 0
+    clearTimeout(timer)
+    say('')
+    syncSend()
+    $('chat-cancel').hidden = true
+  }
+  $('chat-cancel').addEventListener('click', () => {
+    stopWaiting()
+    say('待つのをやめました。返事は、会話を広げるかチャットのほうで見られます。')
+  })
+  const poll = async () => {
+    if (!waiting) return
+    if (Date.now() - waiting > CHAT_WAIT_MS) {
+      stopWaiting()
+      say('返事が届きませんでした。チャットのほうを見てください。')
+      return
+    }
+    try {
+      const { data: got } = await request('/api/chat-reply')
+      if (got?.for === waiting) {
+        arrived(got)
+        return
+      }
+      if (got && Date.now() - (got.ownerAt ?? 0) > CHAT_NO_OWNER_MS) {
+        say('受け取るClaudeのセッションが見つかりません。Claudeのチャットを開いてください。')
+      } else if (wait.textContent.startsWith('受け取る')) {
+        say('送りました。返事を待っています…')
+      }
+    } catch {
+      // 次に読むときにもう一度試す。
+    }
+    timer = setTimeout(poll, CHAT_POLL_MS)
+  }
+  const startWaiting = (at) => {
+    waiting = at
+    syncSend()
+    notice.hidden = true
+    $('chat-cancel').hidden = false
+    say('送りました。返事を待っています…')
+    clearTimeout(timer)
+    timer = setTimeout(poll, CHAT_POLL_MS)
+  }
+
+  // 画像の添付。Vaultには入れず、エディターの作業フォルダーに置いて、その場所を文に添える。
+  const showImages = () => {
+    files.hidden = images.length === 0
+    files.replaceChildren(
+      ...images.map((image) => {
+        const chip = document.createElement('span')
+        chip.className = 'chat-file'
+        const thumb = document.createElement('img')
+        thumb.src = image.preview
+        thumb.alt = image.name
+        const remove = document.createElement('button')
+        remove.type = 'button'
+        remove.textContent = '×'
+        remove.title = 'この画像を外す'
+        remove.addEventListener('click', () => {
+          images = images.filter((other) => other !== image)
+          showImages()
+        })
+        chip.append(thumb, remove)
+        return chip
+      }),
+    )
+  }
+  const addImages = async (list) => {
+    for (const file of list) {
+      if (!CHAT_IMAGE_TYPES.has(file.type)) continue
+      if (file.size > CHAT_IMAGE_MAX) {
+        say('10MBより大きい画像は添付できません。')
+        continue
+      }
+      if (images.length >= CHAT_MAX_IMAGES) {
+        say(`画像は${CHAT_MAX_IMAGES}枚までです。`)
+        break
+      }
+      const ext = file.type.split('/')[1].replace('jpeg', 'jpg')
+      try {
+        const { ok, data } = await request(`/api/chat-image?name=image.${ext}`, {
+          method: 'POST',
+          body: file,
+          headers: { 'content-type': file.type },
+        })
+        if (!ok || !data?.path) throw new Error('upload')
+        const preview = await new Promise((resolve) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(reader.result)
+          reader.onerror = () => resolve('')
+          reader.readAsDataURL(file)
+        })
+        images.push({ path: data.path, name: file.name || `image.${ext}`, preview })
+      } catch {
+        say('画像を添付できませんでした。')
+      }
+    }
+    showImages()
+  }
+  $('chat-add').addEventListener('click', () => $('chat-file').click())
+  $('chat-file').addEventListener('change', (event) => {
+    addImages([...event.target.files])
+    event.target.value = ''
+  })
+  input.addEventListener('paste', (event) => {
+    const pasted = [...(event.clipboardData?.files ?? [])].filter((file) => file.type.startsWith('image/'))
+    if (!pasted.length) return
+    event.preventDefault()
+    addImages(pasted)
+  })
+  panel.addEventListener('dragover', (event) => {
+    if ([...(event.dataTransfer?.types ?? [])].includes('Files')) event.preventDefault()
+  })
+  panel.addEventListener('drop', (event) => {
+    const dropped = [...(event.dataTransfer?.files ?? [])]
+    if (!dropped.length) return
+    event.preventDefault()
+    addImages(dropped)
+  })
+
+  box.addEventListener('submit', async (event) => {
+    event.preventDefault()
+    let text = input.value.trim()
+    if ((!text && !images.length) || waiting || sending || noPartner) return
+    if (images.length) {
+      text = `${text || '添付した画像を見てください。'}\n\n添付した画像（Readで開いて見てください）:\n${images.map((image) => `- ${image.path}`).join('\n')}`
+    }
+    const at = Date.now()
+    sending = true
+    syncSend()
+    // 送れたことを確かめてから入力欄を空にする。送れなければ、書いた文も画像もそのまま残す。
+    const sent = await sendState({ sendChat: { text: text.slice(0, 4000), at } })
+    sending = false
+    syncSend()
+    if (!sent?.ok) {
+      say('送れませんでした。エディターを読み込み直して確かめてください。')
+      return
+    }
+    // このブラウザから送ったことを覚えておく。ほかのブラウザで送った文の返事は、読み込み直しても知らせない。
+    storage.set('chat-last-sent', at)
+    input.value = ''
+    images = []
+    showImages()
+    startWaiting(at)
+  })
+  input.addEventListener('keydown', (event) => {
+    event.stopPropagation()
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.isComposing) {
+      event.preventDefault()
+      box.requestSubmit()
+    }
+  })
+  place(dockOf())
+  setFolded(storage.get('chat-folded', false))
+  setExpanded(storage.get('chat-expanded', false))
+  // 読み込み直したときは、送ったまま返事がまだの文を待ち続け、届いていて見ていない返事は知らせる。
+  request('/api/chat-reply')
+    .then(({ data }) => {
+      if (waiting || !data) return
+      if (data.sent && data.for !== data.sent && Date.now() - data.sent < CHAT_WAIT_MS) startWaiting(data.sent)
+      else if (data.for && data.text) arrived(data, data.for > storage.get('chat-reply-seen', 0) && data.for === storage.get('chat-last-sent', 0))
+    })
+    .catch(() => {})
+}
+
+// 送れたかどうかを返す。チャット枠は結果を見て、送れなかったら入力を残す。
+function sendState(extra = {}) {
+  if ($('status').dataset.state === 'elsewhere') return Promise.resolve(null)
+  // Claudeに知らせるのは左の枠だけ。右の枠は同じ中身を左へ渡す。
+  if (PANE === 'right') {
+    const open = Boolean(currentPath && view)
+    const selection = open ? view.state.selection.main : null
+    toLeft({
+      type: MSG.STATE,
+      path: open ? currentPath : null,
+      selection: open ? view.state.sliceDoc(selection.from, selection.to).slice(0, 4000) : '',
+      dirty: open && !CLEAN_STATES.has($('status').dataset.state),
+      ...(extra.askChat ? { askChat: extra.askChat } : {}),
+    })
+    return Promise.resolve(null)
+  }
+  // 右の枠が操作中なら、右の枠から知らされた中身を知らせる。左にノートがなく右だけ開いているときも、これで送れる。
+  if (rightActive()) return putRightState(extra)
+  // ノートを開いていなくても、チャット枠からは送れるようにする（帯やDev serversから開くと、ノートを開く前の画面になるため）。
+  if (!currentPath || !view) {
+    if (!extra.sendChat) return Promise.resolve(null)
+    return request('/api/state', {
+      method: 'PUT',
+      body: JSON.stringify({ path: null, selection: '', dirty: false, ...extra }),
+    }).catch(() => null)
+  }
+  const selection = view.state.selection.main
+  const text = view.state.sliceDoc(selection.from, selection.to).slice(0, 4000)
+  return request('/api/state', {
+    method: 'PUT',
+    body: JSON.stringify({ path: currentPath, selection: text, dirty: !CLEAN_STATES.has($('status').dataset.state), ...extra }),
+  }).catch(() => null)
+}
+
+// 右の枠が操作中のときに、右の枠から知らされた中身でClaudeに知らせる。/api/state を呼ぶのは左だけ。
+function putRightState(extra = {}) {
+  if ($('status').dataset.state === 'elsewhere') return Promise.resolve(null)
+  return request('/api/state', {
+    method: 'PUT',
+    body: JSON.stringify({ path: rightState.path, selection: rightState.selection, dirty: rightState.dirty, ...extra }),
+  }).catch(() => null)
+}
+
+function scheduleState() {
+  clearTimeout(stateTimer)
+  stateTimer = setTimeout(sendState, 400)
+}
+
+// 右の枠が操作中の間は、書いている見出しの一覧を、目次と同じく少し間を置いて左へ送る。
+let paneOutlineTimer = null
+function schedulePaneOutline() {
+  clearTimeout(paneOutlineTimer)
+  paneOutlineTimer = setTimeout(postOpened, 300)
+}
+
+function headingsForPane() {
+  return headingsOf(view.state).map(({ level, text, from }) => ({ level, text, from }))
+}
+
+function postOpened() {
+  toLeft({ type: MSG.OPENED, path: currentPath, headings: paneActive && view ? headingsForPane() : null })
+}
+
+let outlineTimer = null
+function scheduleOutline() {
+  if ($('outline').hidden) return
+  clearTimeout(outlineTimer)
+  outlineTimer = setTimeout(renderOutline, 300)
+}
+
+function renderOutline() {
+  const box = $('outline')
+  // 右の枠が操作中なら、右の枠から知らされた見出しを出し、押したら右の枠をその見出しへ動かす。
+  const right = rightActive()
+  if (box.hidden || (!right && !view)) return
+  box.replaceChildren()
+  const headings = right ? (rightState.headings ?? []) : headingsOf(view.state)
+  const path = right ? rightState.path : currentPath
+  if (!headings.length) {
+    const empty = document.createElement('p')
+    empty.className = 'outline-empty'
+    empty.textContent = path ? 'このノートには見出しがありません。' : 'ノートを開くと、見出しがここに出ます。'
+    box.append(empty)
+    return
+  }
+  for (const heading of headings) {
+    const item = document.createElement('button')
+    item.type = 'button'
+    item.className = `outline-item outline-${heading.level}`
+    item.textContent = heading.text || '（無題）'
+    item.addEventListener('click', () => {
+      if (right) split.post({ type: MSG.JUMP, from: heading.from })
+      else jumpTo(heading.from)
+      // 狭い幅では目次が本文に重なるので、閉じて移動先を見せる。
+      if (isNarrow()) box.hidden = true
+    })
+    box.append(item)
+  }
+}
+
+// 目次と一覧は同じ場所に出る。目次を閉じたら、開く前に一覧が出ていれば一覧に戻す。
+// 開く前の状態に戻すためなので、次回の表示の設定は変えない。
+let filesUnderOutline = false
+let calendarUnderOutline = false
+function closeOutline() {
+  const box = $('outline')
+  if (box.hidden) return
+  box.hidden = true
+  if (calendarUnderOutline) {
+    $('calendar').hidden = false
+    drawCalendar()
+  }
+  if (filesUnderOutline) {
+    $('files').hidden = false
+    drawFiles()
+  }
+  calendarUnderOutline = false
+  filesUnderOutline = false
+}
+
+function toggleOutline() {
+  const box = $('outline')
+  if (box.hidden) {
+    filesUnderOutline = !$('files').hidden
+    calendarUnderOutline = !$('calendar').hidden
+    $('files').hidden = true
+    $('calendar').hidden = true
+    box.hidden = false
+    renderOutline()
+  } else {
+    closeOutline()
+  }
+}
+
+// 狭い幅では右の列が本文に重なる。ノートを開いたら、一覧もカレンダーも閉じる（次回の表示の設定は変えない）。
+// 右の列（カレンダーとファイルの一覧、目次）の幅を、左の端をドラッグして変える。幅はブラウザが覚える。
+const SIDE_MIN = 200
+const SIDE_MAX = 640
+const EDITOR_MIN = 320
+
+function clampSideWidth(width) {
+  const room = $('layout').getBoundingClientRect().width - EDITOR_MIN
+  return Math.round(Math.max(SIDE_MIN, Math.min(SIDE_MAX, room, width)))
+}
+
+function applySideWidth() {
+  const saved = storage.get('side-width', null)
+  if (typeof saved === 'number') $('layout').style.setProperty('--side-width', `${clampSideWidth(saved)}px`)
+  else $('layout').style.removeProperty('--side-width')
+}
+
+function setupSideResize() {
+  const grip = $('side-resize')
+  applySideWidth()
+  window.addEventListener('resize', applySideWidth)
+  grip.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    grip.setPointerCapture(event.pointerId)
+    document.body.classList.add('side-resizing')
+    const right = $('layout').getBoundingClientRect().right
+    let width = null
+    const move = (e) => {
+      width = clampSideWidth(right - e.clientX)
+      $('layout').style.setProperty('--side-width', `${width}px`)
+    }
+    const end = () => {
+      grip.removeEventListener('pointermove', move)
+      grip.removeEventListener('pointerup', end)
+      grip.removeEventListener('pointercancel', end)
+      document.body.classList.remove('side-resizing')
+      if (width !== null) storage.set('side-width', width)
+    }
+    grip.addEventListener('pointermove', move)
+    grip.addEventListener('pointerup', end)
+    grip.addEventListener('pointercancel', end)
+  })
+  grip.addEventListener('dblclick', () => {
+    storage.remove('side-width')
+    applySideWidth()
+  })
+}
+
+function closeSideIfNarrow() {
+  if (!isNarrow()) return
+  $('calendar').hidden = true
+  $('files').hidden = true
+}
+
+// 一覧もカレンダーも隠れたら、右の列ごと隠す。
+function syncSide() {
+  $('side').hidden = $('calendar').hidden && $('files').hidden
+}
+new MutationObserver(syncSide).observe($('calendar'), { attributes: true, attributeFilter: ['hidden'] })
+new MutationObserver(syncSide).observe($('files'), { attributes: true, attributeFilter: ['hidden'] })
+
+function jumpTo(pos) {
+  view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
+}
+
+function jumpToAnchor(anchor) {
+  if (!anchor) return
+  const heading = findHeading(headingsOf(view.state), anchor)
+  if (heading) jumpTo(heading.from)
+}
+
+const RECONNECT_MS = 3000
+
+function connectEvents(path) {
+  events?.close()
+  events = new EventSource(`/api/events?path=${encodeURIComponent(path)}&root=${rootId}${accessToken ? `&t=${accessToken}` : ''}`)
+  // 別のVaultのサーバーに断られると再接続されないので、断られたのかを確かめる。
+  events.onerror = async () => {
+    connectionWatch?.poke()
+    try {
+      const { ok } = await request('/api/health')
+      // ファイルが消えている間につながり直すと断られ、自動では再接続されない。
+      if (ok && events?.readyState === EventSource.CLOSED) {
+        setTimeout(() => {
+          if (path === currentPath && events?.readyState === EventSource.CLOSED) connectEvents(path)
+        }, RECONNECT_MS)
+      }
+    } catch {
+      // サーバーが止まっている間は、ブラウザが自動でつなぎ直す。
+    }
+  }
+  const receive = (note) => {
+    if (saver && note.editable) saver.applyExternal(note.text, note.hash)
+    else if (saver) saver.blocked()
+    else docAdapter.set(note.text)
+  }
+  events.addEventListener('changed', (event) => receive(JSON.parse(event.data)))
+  events.addEventListener('removed', () => saver?.removed())
+  // つながるまでの間やつながり直すまでの間の変更は知らせが来ないので、読み直して確かめる。
+  events.onopen = async () => {
+    if (path !== currentPath) return
+    try {
+      const note = await api.read(path)
+      if (path === currentPath) receive(note)
+    } catch (error) {
+      if (error.status === 404) saver?.removed()
+    }
+    if (['offline', 'save-failed'].includes($('status').dataset.state)) saver?.save()
+  }
+}
+
+const docAdapter = {
+  get: () => view.state.doc.toString(),
+  set(text) {
+    const change = minimalChange(view.state.doc.toString(), text)
+    if (!change) return
+    view.dispatch({ changes: change, annotations: [external.of(true), Transaction.addToHistory.of(false)] })
+  },
+  // 表のマスやノートの情報の欄を編集している間も、外からの変更で入力中の内容が消えないよう待つ。
+  composing: () => view.composing || view.compositionStarted || Boolean(document.activeElement?.closest?.('.cm-cell-editing, .cm-props')),
+  // 変換の途中の文字は保存しない。マスの編集中でも、本文に書き戻した分は保存してよい。
+  holdSave: () => view.composing || view.compositionStarted,
+}
+
+// 編集中のマスや入力欄は、外へ出たときに本文へ書き戻される。
+function commitOpenField() {
+  const field = document.activeElement
+  if (field?.closest?.('.cm-cell-editing, .cm-props')) field.blur()
+}
+
+let openRequest = 0
+
+async function openNote(path, { push = true, anchor = '', startMode = 'reading' } = {}) {
+  openRequest += 1
+  const thisRequest = openRequest
+  let note
+  try {
+    note = await api.read(path)
+  } catch (error) {
+    if (error.status === 404 && (await askConfirm(`「${path}」はまだありません。新しく作りますか。`, '作る'))) {
+      const created = await request(noteUrl(path), { method: 'POST', body: JSON.stringify({ text: '' }) })
+      if (created.ok) {
+        await refreshNotes()
+        return openNote(path, { push, anchor, startMode: 'live' })
+      }
+      showMessage('このノートは作れません。')
+      return
+    }
+    if (error.status === 400) showMessage('このファイルは開けません。')
+    return
+  }
+  // 続けて開いたときは、最後に頼まれたノートを開く。
+  if (thisRequest !== openRequest) return
+  commitOpenField()
+  await saver?.flush()
+  if (thisRequest !== openRequest) return
+  saver?.close()
+  saver = null
+  currentPath = path
+  // 右の枠では、カレンダーとファイルの一覧を使わない（左の一覧の開閉の記録も書き換えない）。
+  if (PANE !== 'right') renderCalendar()
+  sourceOnly = note.sourceOnly
+  editable = note.editable
+  const nextMode = sourceOnly ? 'source' : startMode
+  mode = nextMode
+  // YAMLの中にカーソルを置くと文字で見えてしまうので、本文の先頭から始める。
+  const front = note.text.match(/^---\n[\s\S]*?\n---(?:\n|$)/)
+  const state = EditorState.create({
+    doc: note.text,
+    selection: { anchor: front ? Math.min(front[0].length, note.text.length) : 0 },
+    extensions: extensionsFor(path, editable),
+  })
+  if (view) view.setState(state)
+  else view = new EditorView({ state, parent: $('editor') })
+  applyMode(nextMode)
+  renderCrumbs(path)
+  document.title = path.split('/').at(-1).replace(/\.md$/i, '')
+  if (push) pushNoteUrl(path, anchor)
+  rememberRecent(path)
+  const banner = $('banner')
+  banner.hidden = true
+  currentReason = editable ? null : note.reason
+  let restored = false
+  if (editable) {
+    saver = createSaver({ doc: docAdapter, api, path, baseText: note.text, baseHash: note.hash, onStatus: ({ state: s, ...d }) => setStatus(s, d), drafts })
+    setStatus('saved')
+    // 右の枠が閉じていて左の一時保存がなければ、右の枠に残った一時保存を左で戻す。
+    const picked = pickDraft({
+      pane: PANE,
+      left: storage.get(draftKey(vaultName, path, 'left')),
+      right: storage.get(draftKey(vaultName, path, 'right')),
+      rightOpen,
+    })
+    // 右の一時保存を左へ移すときは、先に左に書いてから右を消す。どちらにも残っていない間を作らない。
+    if (picked.removeRight) {
+      drafts.set(path, picked.draft)
+      storage.remove(draftKey(vaultName, path, 'right'))
+    }
+    restored = saver.restoreDraft(picked.draft)
+  } else {
+    setStatus('readonly')
+    banner.hidden = false
+    banner.textContent = REASONS[note.reason] ?? '編集できません。'
+  }
+  if (sourceOnly && editable) {
+    banner.hidden = false
+    banner.textContent = '大きいファイルなので、ソース表示で開いています。'
+  }
+  connectEvents(path)
+  restoreFolds(path)
+  renderOutline()
+  if (PANE !== 'right') revealInFiles(path)
+  jumpToAnchor(anchor)
+  sendState()
+  if (PANE === 'right') postOpened()
+  view.focus()
+  if (restored && saver.isStopped() !== 'conflict') {
+    showMessage('前回保存できなかった入力を戻して保存します。いらないときは、右上の「履歴」から前の内容に戻せます。')
+  }
+  return undefined
+}
+
+function pushNoteUrl(path, anchor) {
+  const url = `/?note=${encodeURIComponent(path)}${anchor ? `#${encodeURIComponent(anchor)}` : ''}`
+  // 右の枠で開いたノートを、ブラウザの「戻る」の履歴に積まない。
+  // アドレスは /?pane=right のままにする。?note= に変えると、右の枠を読み込み直したときに左として開いてしまう。
+  if (PANE === 'right') window.history.replaceState({ path }, '', '/?pane=right')
+  else window.history.pushState({ path }, '', url)
+}
+
+function rememberRecent(path) {
+  const recent = storage.get(`recent:${vaultName}`, []).filter((item) => item !== path)
+  recent.unshift(path)
+  storage.set(`recent:${vaultName}`, recent.slice(0, 20))
+}
+
+function openHref(href, newTab) {
+  if (isExternal(href)) {
+    if (/^https?:|^mailto:/i.test(href)) window.open(href, '_blank', 'noopener')
+    return
+  }
+  const target = resolveHref(currentPath, href)
+  if (!target) {
+    showMessage('Vaultの外へのリンクは開けません。')
+    return
+  }
+  if (target.path === currentPath) {
+    jumpToAnchor(target.anchor)
+    return
+  }
+  if (!target.path.toLowerCase().endsWith('.md')) {
+    if (/\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i.test(target.path)) {
+      window.open(fileUrl(target.path), '_blank', 'noopener')
+    } else {
+      showMessage(`「${target.path}」はエディターで開けません。`)
+    }
+    return
+  }
+  if (newTab && PANE === 'right') {
+    toLeft({ type: MSG.OPEN, path: target.path, anchor: target.anchor })
+    return
+  }
+  // Cmd+クリックは、ブラウザの別のタブではなく、反対側（右）の枠で開く。
+  if (newTab) {
+    openIn(targetPane({ meta: true, from: 'left', active: activePane() }), target.path, { anchor: target.anchor })
+    return
+  }
+  openNote(target.path, { anchor: target.anchor })
+}
+
+// 左右どちらかの枠でノートを開く。右に開くときは、分けていなければ先に分ける。
+async function openIn(pane, path, { anchor = '', startMode = 'reading' } = {}) {
+  // 狭い画面では分けないので、左で開く。
+  if (pane !== 'right' || !split || isNarrow()) return openNote(path, { anchor, startMode })
+  if (!split.isOpen()) {
+    // 右の枠の準備ができたら開いてもらう（READY のところで送る）。
+    rightWant = { path, anchor, startMode }
+    await openSplit()
+    return undefined
+  }
+  split.post({ type: MSG.OPEN, path, anchor, startMode })
+  return undefined
+}
+
+async function refreshNotes() {
+  const result = await request('/api/notes')
+  if (!result.ok) return
+  notes = result.data.notes
+  allNotes = result.data.known
+  folders = result.data.folders ?? []
+  $('files-notice').hidden = !result.data.truncated
+  const changed = JSON.stringify([result.data.notes, folders]) !== filesRendered
+  known = new Set(result.data.known.map(normalizeKey))
+  // 変わっていなければ描き直さない。キーボードの位置が外れないようにする。
+  if (changed && PANE !== 'right') renderFiles()
+}
+
+const NARROW_WIDTH = 860
+let filesOpen = new Set()
+let filesRendered = ''
+
+function saveFilesOpen() {
+  storage.set(`files-open:${vaultName}`, [...filesOpen])
+}
+
+function renderFiles() {
+  const box = $('files')
+  if (box.hidden) return
+  const scroll = box.scrollTop
+  const rows = []
+  const more = (row) => {
+    // ボタンの中に置くので、押したときに行のほうの動き（開く）が起きないようにする。
+    const dots = document.createElement('span')
+    dots.className = 'files-more'
+    dots.textContent = '…'
+    dots.title = 'メニュー'
+    dots.addEventListener('click', (event) => {
+      event.stopPropagation()
+      const rect = dots.getBoundingClientRect()
+      openFilesMenu(row, rect.left, rect.bottom)
+    })
+    return dots
+  }
+  const walk = (folder, depth) => {
+    for (const child of folder.folders) {
+      const open = filesOpen.has(child.path)
+      const row = document.createElement('button')
+      row.type = 'button'
+      row.className = 'files-row files-folder'
+      row.style.setProperty('--depth', String(depth))
+      row.setAttribute('aria-expanded', String(open))
+      row.title = child.path
+      row.dataset.path = child.path
+      row.dataset.kind = 'folder'
+      row.draggable = true
+      const arrow = document.createElement('span')
+      arrow.className = 'files-arrow'
+      arrow.textContent = open ? '▾' : '▸'
+      const name = document.createElement('span')
+      name.className = 'files-name'
+      name.textContent = child.name
+      row.append(arrow, name, more(row))
+      row.addEventListener('click', () => {
+        if (filesOpen.has(child.path)) filesOpen.delete(child.path)
+        else filesOpen.add(child.path)
+        saveFilesOpen()
+        renderFiles()
+      })
+      rows.push(row)
+      if (open) walk(child, depth + 1)
+    }
+    for (const file of folder.files) {
+      const row = document.createElement('button')
+      row.type = 'button'
+      row.className = 'files-row files-note'
+      row.style.setProperty('--depth', String(depth))
+      row.title = file.path
+      row.dataset.path = file.path
+      row.dataset.kind = 'note'
+      row.draggable = true
+      if (file.path === currentPath) row.setAttribute('aria-current', 'true')
+      const name = document.createElement('span')
+      name.className = 'files-name'
+      name.textContent = file.name
+      row.append(name, more(row))
+      row.addEventListener('click', (event) => {
+        openIn(targetPane({ meta: event.metaKey || event.ctrlKey, from: 'sidebar', active: activePane() }), file.path)
+        // 狭い幅で自動で閉じるだけなので、次回の表示の設定は変えない。
+        if (PANE !== 'right' && innerWidth < NARROW_WIDTH) $('files').hidden = true
+        closeSideIfNarrow()
+      })
+      rows.push(row)
+    }
+  }
+  walk(buildTree(notes, folders), 0)
+  filesRendered = JSON.stringify([notes, folders])
+  box.replaceChildren(...rows)
+  box.scrollTop = scroll
+}
+
+// ---- ファイル欄の操作（右クリックと「…」のメニュー、ドラッグで動かす） ----
+
+const baseOf = (path) => path.slice(path.lastIndexOf('/') + 1)
+const dirOf = (path) => path.split('/').slice(0, -1).join('/')
+const joinDir = (dir, name) => (dir ? `${dir}/${name}` : name)
+const inside = (path, folder) => path === folder || path.startsWith(`${folder}/`)
+
+// 置き場所を選ぶ画面に出すフォルダー。ファイル欄と同じく、中身のないフォルダーも入れる。
+function placeFolders() {
+  return [...new Set([...folders, ...noteFolders(notes)])].filter(Boolean).sort((a, b) => a.localeCompare(b, 'ja', { numeric: true }))
+}
+
+const recentPlacesKey = () => `recent-places:${vaultName}`
+
+function closeFilesMenu() {
+  document.querySelector('.files-menu')?.remove()
+}
+
+function openFilesMenu(row, x, y) {
+  closeFilesMenu()
+  const path = row?.dataset.path ?? ''
+  const kind = row?.dataset.kind ?? 'top'
+  const items = []
+  if (kind !== 'note') {
+    items.push(['この中に新しいノート', () => newNoteIn(path)], ['この中に新しいフォルダー', () => newFolderIn(path)])
+  }
+  if (kind !== 'top') {
+    items.push(['名前を変える', () => renameItem(path, kind)], ['移動…', () => moveItemTo(path, kind)], ['ゴミ箱に入れる', () => trashItem(path, kind)])
+  }
+  const menu = document.createElement('div')
+  menu.className = 'files-menu'
+  menu.setAttribute('role', 'menu')
+  for (const [label, run] of items) {
+    const item = document.createElement('button')
+    item.type = 'button'
+    item.setAttribute('role', 'menuitem')
+    item.textContent = label
+    item.addEventListener('click', () => {
+      closeFilesMenu()
+      run()
+    })
+    menu.append(item)
+  }
+  document.body.append(menu)
+  const width = menu.offsetWidth
+  const height = menu.offsetHeight
+  menu.style.left = `${Math.max(4, Math.min(x, innerWidth - width - 4))}px`
+  menu.style.top = `${Math.max(4, Math.min(y, innerHeight - height - 4))}px`
+  menu.querySelector('button')?.focus()
+}
+
+function newNoteIn(dir) {
+  newNoteFromButton(dir)
+}
+
+async function newFolderIn(dir) {
+  const name = (await askText(`「${dir || vaultLabel || '一番上'}」の中に作るフォルダーの名前`))?.trim()
+  if (!name) return
+  if (name.includes('/') || name.startsWith('.')) {
+    showMessage('フォルダーの名前に「/」は使えません。点で始まる名前も使えません。')
+    return
+  }
+  const path = joinDir(dir, name)
+  const made = await request('/api/folder', { method: 'POST', body: JSON.stringify({ path }) })
+  if (!made.ok) {
+    showMessage(made.status === 409 ? '同じ名前のフォルダーかファイルが、もうあります。' : 'フォルダーを作れませんでした。')
+    return
+  }
+  for (const folder of [...ancestorsOf(`${path}/x`)]) filesOpen.add(folder)
+  saveFilesOpen()
+  await refreshNotes()
+  showFiles(true)
+}
+
+async function renameItem(path, kind) {
+  const old = kind === 'note' ? baseOf(path).replace(/\.md$/i, '') : baseOf(path)
+  const name = (await askText('新しい名前', old))?.trim()
+  if (!name || name === old) return
+  if (name.includes('/') || name.startsWith('.')) {
+    showMessage('名前に「/」は使えません。点で始まる名前も使えません。')
+    return
+  }
+  // 新しいノートを作るときと同じく、「\」と「:」は「-」に置き換える。
+  const clean = name.replace(/[\\:]/g, '-')
+  const to = joinDir(dirOf(path), kind === 'note' ? `${clean.replace(/\.md$/i, '')}.md` : clean)
+  doMove(path, to, true)
+}
+
+async function moveItemTo(path, kind) {
+  const dir = await askPlace({
+    title: `「${baseOf(path)}」を動かす先`,
+    folders: placeFolders(),
+    start: dirOf(path),
+    topLabel: vaultLabel || 'フォルダー',
+    recent: storage.get(recentPlacesKey(), []),
+    childFolders,
+    searchFolders,
+    exclude: (folder) => kind === 'folder' && inside(folder, path),
+  })
+  if (dir === null || dir === dirOf(path)) return
+  doMove(path, joinDir(dir, baseOf(path)))
+}
+
+// 動かす前に、ほかのノートのリンクを数えて、書き換えるかを聞く。開いているノートは先に保存する。
+// confirm を付けると、リンクがなくても動かしてよいかを聞く（フォルダーをドラッグしたときなど）。
+async function doMove(from, to, rename = false, confirm = false) {
+  if (to === from) return
+  commitOpenField()
+  await saver?.flush()
+  const plan = await request('/api/move/plan', { method: 'POST', body: JSON.stringify({ from, to }) })
+  let relink = false
+  let skipPlan = false
+  if (!plan.ok) {
+    const reason = planFailure(plan.status, plan.data)
+    if (reason !== 'truncated') {
+      showMessage(reason === 'exists' ? '動かす先に、同じ名前のノートかフォルダーがもうあります。' : '動かせませんでした。')
+      return
+    }
+    // 一覧が途中までなので、リンクは確かめられない。書き換えずに動かすかだけを聞く。
+    const choice = await askChoice('ノートが多いため、リンクを全部は確かめられません。リンクは書き換えずに動かしますか？', [{ label: 'リンクは書き換えずに動かす', value: 'move', primary: true }])
+    if (!choice) return
+    skipPlan = true
+  }
+  const changes = skipPlan ? [] : plan.data.changes ?? []
+  const blocked = skipPlan ? [] : plan.data.blocked ?? []
+  const unreadable = skipPlan ? [] : plan.data.unreadable ?? []
+  const what = rename ? `「${baseOf(from)}」を「${baseOf(to)}」に変えます。` : `「${from}」を「${dirOf(to) || vaultLabel || '一番上'}」へ動かします。`
+  if (changes.length || blocked.length || unreadable.length) {
+    const links = changes.reduce((sum, change) => sum + change.count, 0)
+    const list = changes.slice(0, 5).map((change) => `・${change.path}`).join('\n')
+    const lines = [what]
+    if (changes.length) lines.push(`${changes.length}件のノートにある、${links}か所のリンクも書き換えます。`, `${list}${changes.length > 5 ? '\n…' : ''}`)
+    // 改行の形などが違って、このエディターでは書き換えられないノートも知らせる。
+    if (unreadable.length) lines.push(`読めないノートが${unreadable.length}件あり、その中のリンクは確かめていません（${unreadable.slice(0, 3).join('、')}${unreadable.length > 3 ? ' など' : ''}）。`)
+    if (blocked.length) lines.push(`このほか${blocked.length}件のノートは書き換えられないので、リンクがそのまま残ります（${blocked.slice(0, 3).map((change) => change.path).join('、')}${blocked.length > 3 ? ' など' : ''}）。`)
+    const choice = await askChoice(lines.join('\n'), [
+      { label: rename ? '名前だけ変える' : '動かすだけ', value: 'move' },
+      ...(changes.length ? [{ label: rename ? 'リンクも書き換えて名前を変える' : 'リンクも書き換えて動かす', value: 'relink', primary: true }] : []),
+    ])
+    if (!choice) return
+    relink = choice === 'relink'
+  } else if (confirm && !skipPlan && !(await askConfirm(what, '動かす'))) {
+    return
+  }
+  // 確かめている間の入力も、動かす直前にもう一度保存する。動かし終わるまでは入力できないようにする。
+  commitOpenField()
+  const holdsCurrent = currentPath && inside(currentPath, from)
+  // 右の枠で開いているノート（またはそれを含むフォルダー）を動かすときは、右の書きかけも動かす直前に保存する。
+  const rightPath = split?.isOpen() && rightState.path && inside(rightState.path, from) ? rightState.path : null
+  const lock = (locked) => view?.dispatch({ effects: editableSlot.reconfigure(editableExtensions(locked ? false : editable)) })
+  if (holdsCurrent) lock(true)
+  let moved
+  try {
+    await saver?.flush()
+    // 保存しきれていない変更があるときは、古い場所に取り残さないよう、動かさずに止める。
+    if (holdsCurrent && saver && !CLEAN_STATES.has($('status').dataset.state)) {
+      showMessage('開いているノートに、まだ保存できていない変更があります。保存できてから、もう一度動かしてください。')
+      return
+    }
+    // 確かめる画面を出している間にも、右の枠では書けるので、ここで保存してもらう。
+    // 右の枠も保存しきれなければ、左と同じく、古い場所に取り残さないよう動かさずに止める。
+    if (rightPath && (await split.save()).dirty) {
+      showMessage('開いているノートに、まだ保存できていない変更があります。保存できてから、もう一度動かしてください。')
+      return
+    }
+    moved = await request('/api/move', { method: 'POST', body: JSON.stringify({ from, to, relink }) })
+  } catch {
+    moved = { ok: false }
+  } finally {
+    // うまく動いたときは開き直すので、ここで入力を戻すのはそれ以外のときだけ。
+    if (holdsCurrent && !moved?.ok) lock(false)
+  }
+  if (!moved?.ok) {
+    await refreshNotes()
+    if (moved) showMessage('動かせませんでした。')
+    return
+  }
+  if (filesOpen.has(from)) {
+    filesOpen.delete(from)
+    filesOpen.add(to)
+    saveFilesOpen()
+  }
+  await refreshNotes()
+  if (holdsCurrent) {
+    // 古い場所へ保存しに行かないよう、開き直す前に保存の仕組みを閉じる。
+    saver?.close()
+    saver = null
+    openNote(`${to}${currentPath.slice(from.length)}`)
+  } else {
+    renderFiles()
+  }
+  // 右の枠は、古い場所へ保存しに行かないよう、新しい場所で開き直してもらう。
+  if (rightPath && split.isOpen()) split.post({ type: MSG.OPEN, path: `${to}${rightPath.slice(from.length)}`, reopen: true })
+  const missed = [...(moved.data.skipped ?? []), ...(moved.data.failed ?? [])]
+  if (missed.length) showMessage(`${rename ? '名前を変えました' : '動かしました'}。ただし、${missed.length}件のノートはリンクを書き換えられませんでした。\n${missed.slice(0, 5).map((path) => `・${path}`).join('\n')}`)
+}
+
+async function trashItem(path, kind) {
+  const count = kind === 'folder' ? allNotes.filter((note) => note.startsWith(`${path}/`)).length : 0
+  const what = kind === 'folder' ? `フォルダー「${path}」を、中のファイルごと（ノートは${count}件）` : `「${path}」`
+  if (!(await askConfirm(`${what}をゴミ箱に入れます。Finderのゴミ箱から戻せます。`, 'ゴミ箱に入れる'))) return
+  const holdsCurrent = currentPath && inside(currentPath, path)
+  if (holdsCurrent) {
+    commitOpenField()
+    await saver?.flush()
+  }
+  // 右の枠で開いているノートがなくなるときは、右の書きかけを保存してから右の枠を閉じる。
+  if (split?.isOpen() && rightState.path && inside(rightState.path, path)) await closeSplit()
+  const done = await request('/api/trash', { method: 'POST', body: JSON.stringify({ path }) })
+  if (!done.ok) {
+    showMessage('ゴミ箱に入れられませんでした。')
+    return
+  }
+  if (holdsCurrent) {
+    // 開いていたノートがなくなったので、何も開いていない画面に戻す。
+    saver?.close()
+    saver = null
+    location.href = '/'
+    return
+  }
+  await refreshNotes()
+}
+
+function bindFilesPanel() {
+  const box = $('files')
+  box.addEventListener('contextmenu', (event) => {
+    event.preventDefault()
+    openFilesMenu(event.target.closest('.files-row'), event.clientX, event.clientY)
+  })
+  // ドラッグで動かす。フォルダーの上に落とすとその中へ、空いている所に落とすと一番上へ。
+  let dragging = null
+  box.addEventListener('dragstart', (event) => {
+    const row = event.target.closest?.('.files-row')
+    if (!row) return
+    dragging = { path: row.dataset.path, kind: row.dataset.kind }
+    event.dataTransfer.effectAllowed = 'move'
+    // 本文に落としたときにパスが文字として入らないよう、エディター専用の種類だけで渡す。
+    event.dataTransfer.setData('application/x-note-editor-path', row.dataset.path)
+  })
+  const targetOf = (event) => {
+    const row = event.target.closest?.('.files-row')
+    if (!row) return ''
+    return row.dataset.kind === 'folder' ? row.dataset.path : dirOf(row.dataset.path)
+  }
+  const allowed = (item, dir) => item && dir !== dirOf(item.path) && !(item.kind === 'folder' && inside(dir, item.path))
+  box.addEventListener('dragover', (event) => {
+    if (!dragging) return
+    const dir = targetOf(event)
+    box.querySelectorAll('.files-drop').forEach((row) => row.classList.remove('files-drop'))
+    if (!allowed(dragging, dir)) return
+    event.preventDefault()
+    const row = event.target.closest?.('.files-folder')
+    if (row) row.classList.add('files-drop')
+  })
+  box.addEventListener('dragleave', () => box.querySelectorAll('.files-drop').forEach((row) => row.classList.remove('files-drop')))
+  box.addEventListener('drop', (event) => {
+    box.querySelectorAll('.files-drop').forEach((row) => row.classList.remove('files-drop'))
+    if (!dragging) return
+    const dir = targetOf(event)
+    const item = dragging
+    dragging = null
+    if (!allowed(item, dir)) return
+    event.preventDefault()
+    // フォルダーは中身ごと動くので、落としたときは必ず確かめる。
+    doMove(item.path, joinDir(dir, baseOf(item.path)), false, item.kind === 'folder')
+  })
+  box.addEventListener('dragend', () => {
+    dragging = null
+  })
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest?.('.files-menu')) closeFilesMenu()
+  })
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeFilesMenu()
+  })
+}
+
+// ---- パンくずリスト ----
+
+// 開いているノートの場所を、押せるパンくずにする。フォルダーを押すと、ファイル欄がそこへ動く。
+function renderCrumbs(path) {
+  const box = $('note-path')
+  const parts = path.split('/')
+  const nodes = []
+  const sep = () => {
+    const node = document.createElement('span')
+    node.className = 'crumb-sep'
+    node.textContent = '›'
+    return node
+  }
+  const folderButton = (label, target) => {
+    const node = document.createElement('button')
+    node.type = 'button'
+    node.className = 'crumb'
+    node.textContent = label
+    // 右の枠にはファイル欄がないので、押しても何もしない。
+    if (PANE !== 'right') {
+      node.title = target ? `${target} をファイル欄で開く` : '一番上をファイル欄で開く'
+      node.addEventListener('click', () => revealFolder(target))
+    }
+    return node
+  }
+  nodes.push(folderButton(vaultLabel || 'Vault', ''))
+  parts.slice(0, -1).forEach((part, index) => {
+    nodes.push(sep(), folderButton(part, parts.slice(0, index + 1).join('/')))
+  })
+  const name = document.createElement('span')
+  name.className = 'crumb-note'
+  name.textContent = parts.at(-1)
+  nodes.push(sep(), name)
+  box.replaceChildren(...nodes)
+  box.title = path
+}
+
+function revealFolder(folder) {
+  if (folder) {
+    for (const item of [...ancestorsOf(`${folder}/x`)]) filesOpen.add(item)
+    saveFilesOpen()
+  }
+  showFiles(true)
+  renderFiles()
+  const box = $('files')
+  const row = folder ? [...box.querySelectorAll('.files-folder')].find((item) => item.dataset.path === folder) : null
+  if (row) {
+    row.scrollIntoView({ block: 'start' })
+    row.classList.add('files-flash')
+    setTimeout(() => row.classList.remove('files-flash'), 1500)
+  } else {
+    box.scrollTop = 0
+  }
+}
+
+// 開いたノートの場所が見えるように、上のフォルダーを開いてそこまで動かす。
+function revealInFiles(path) {
+  let changed = false
+  for (const folder of ancestorsOf(path)) {
+    if (!filesOpen.has(folder)) {
+      filesOpen.add(folder)
+      changed = true
+    }
+  }
+  if (changed) saveFilesOpen()
+  renderFiles()
+  for (const row of $('files').querySelectorAll('.files-note')) {
+    if (row.dataset.path === path) {
+      row.scrollIntoView({ block: 'nearest' })
+      break
+    }
+  }
+}
+
+// 今日のノートとカレンダー。日付はこのブラウザの現地時刻で決める。
+const pad2 = (n) => String(n).padStart(2, '0')
+function todayText() {
+  const d = new Date()
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+}
+function nowText() {
+  const d = new Date()
+  return `${todayText()}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+}
+
+let calMonth = todayText().slice(0, 7)
+let periodicState = null
+let periodicStateMonth = null
+let calendarRequest = 0
+
+async function openPeriodicNote(period, date, { ask = false, from = 'sidebar', meta = false } = {}) {
+  if (periodicState?.disabled) return
+  try {
+    const name = periodInfo(period, date).name
+    const post = (extra) => request('/api/periodic/open', { method: 'POST', body: JSON.stringify({ period, date, now: nowText(), ...extra }) })
+    const refuse = (result) => {
+      if (result.status === 409 && result.data?.error === 'no-periodic-root') {
+        periodicState = { disabled: true }
+        $('today-note').hidden = true
+        renderCalendar()
+        return
+      }
+      showMessage(result.status === 409 ? (result.data?.message ?? '日付のノートの設定を読めません。') : 'このノートは作れません。')
+    }
+    if (ask) {
+      // 先に、決まった場所にあるかを調べる。ないときだけ聞く。
+      const probe = await post({ dryRun: true })
+      if (!probe.ok) return refuse(probe)
+      if (!probe.data.exists && !(await askConfirm(`${name}のノートはまだありません。作りますか？`, '作る'))) return
+    }
+    const result = await post()
+    if (!result.ok) return refuse(result)
+    const { path, created } = result.data
+    if (created) await refreshNotes()
+    await openIn(targetPane({ meta, from, active: activePane() }), path, { startMode: created ? 'live' : 'reading' })
+    drawCalendar()
+  } catch {
+    showMessage('このノートは作れません。')
+  }
+}
+
+// 開いているノートが <periodicRoot>/<年>/Daily/YYYY-MM-DD.md の形なら、その日付。
+function openDateOf(path = currentPath) {
+  const root = periodicState?.periodicRoot
+  if (!root || !path) return null
+  const match = path.match(/^(.*)\/(\d{4})\/Daily\/(\d{4}-\d{2}-\d{2})\.md$/)
+  return match && match[1] === root && match[3].startsWith(match[2]) ? match[3] : null
+}
+
+async function drawCalendar() {
+  const mine = ++calendarRequest
+  const month = calMonth
+  let result
+  try {
+    result = await request(`/api/periodic?month=${month}`)
+  } catch {
+    return
+  }
+  if (mine !== calendarRequest) return
+  periodicState = result.ok ? result.data : null
+  periodicStateMonth = month
+  // 今日のノートの置き場が決まっていないVaultでは、ボタンも出さない（カレンダーの場所に案内を出す）。
+  $('today-note').hidden = todayButtonHidden(periodicState)
+  renderCalendar()
+}
+
+function renderCalendar() {
+  const box = $('calendar')
+  if (box.hidden) return
+  if (periodicState?.disabled) {
+    const notice = document.createElement('p')
+    notice.id = 'calendar-notice'
+    notice.textContent = '今日のノートの置き場は、チャットでClaudeに頼むと決められます'
+    box.replaceChildren(notice)
+    return
+  }
+  // 今開いている日の印は、操作中の枠のノートに付ける。
+  const model = calendarModel(calMonth, todayText(), openDateOf(rightActive() ? rightState.path : currentPath), periodicStateMonth === calMonth ? (periodicState ?? {}) : {})
+  const part = (tag, className, text, extra = {}) => {
+    const el = document.createElement(tag)
+    if (className) el.className = className
+    if (text !== undefined) el.textContent = text
+    if (tag === 'button') el.type = 'button'
+    Object.assign(el, extra)
+    return el
+  }
+  const act = (el, handler) => {
+    el.addEventListener('click', handler)
+    return el
+  }
+  const open = (period, date) => async (event) => {
+    await openPeriodicNote(period, date, { ask: !(period === 'daily' && date === todayText()), from: 'sidebar', meta: event.metaKey || event.ctrlKey })
+    closeSideIfNarrow()
+  }
+  const go = (month) => () => {
+    calMonth = month
+    drawCalendar()
+  }
+  const mark = (el, has) => {
+    if (has) el.classList.add('cal-has')
+    return el
+  }
+  const head = part('div', 'cal-head')
+  // 左に「2026年11月」、右に前後の月への矢印と「今日」を並べる（Obsidianのカレンダーと同じ並び）。
+  head.append(
+    act(mark(part('button', 'cal-title', model.title, { title: `${model.title}のノートを開く` }), model.hasMonth), open('monthly', model.monthDate)),
+    act(part('button', '', '‹', { title: '前の月' }), go(shiftMonth(calMonth, -1))),
+    act(part('button', '', '今日', { title: '今月に戻る' }), go(todayText().slice(0, 7))),
+    act(part('button', '', '›', { title: '次の月' }), go(shiftMonth(calMonth, 1))),
+  )
+  const grid = part('div', 'cal-grid')
+  grid.append(part('span', 'cal-dow', 'W'))
+  for (const dow of ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']) grid.append(part('span', 'cal-dow', dow))
+  for (const week of model.weeks) {
+    grid.append(act(mark(part('button', 'cal-week', week.label, { title: `${week.name}のノートを開く` }), week.hasNote), open('weekly', week.date)))
+    for (const day of week.days) {
+      const button = part('button', '', String(day.day))
+      if (!day.inMonth) button.classList.add('cal-out')
+      if (day.isToday) button.classList.add('cal-today')
+      if (day.isOpen) button.classList.add('cal-open')
+      mark(button, day.hasNote)
+      if (day.isOpen) button.setAttribute('aria-current', 'date')
+      button.title = day.date
+      grid.append(act(button, open('daily', day.date)))
+    }
+  }
+  box.replaceChildren(head, grid)
+}
+
+function showCalendar(show, { remember = true } = {}) {
+  $('calendar').hidden = !show
+  if (remember) storage.set('calendar-shown', show)
+  if (show) {
+    closeOutline()
+    $('calendar').hidden = false
+    drawCalendar()
+  }
+}
+
+function showFiles(show) {
+  $('files').hidden = !show
+  storage.set('files-shown', show)
+  if (show) {
+    closeOutline()
+    $('files').hidden = false
+    drawFiles()
+    if (!$('calendar').hidden) drawCalendar()
+  }
+}
+
+function drawFiles() {
+  if (currentPath) revealInFiles(currentPath)
+  else renderFiles()
+}
+
+function openSwitcher() {
+  const dialog = $('switcher')
+  const input = $('switcher-input')
+  input.value = ''
+  renderSwitcher('')
+  if (!dialog.open) dialog.showModal()
+  input.focus()
+  refreshNotes().then(() => renderSwitcher(input.value))
+}
+
+function renderSwitcher(query) {
+  const list = $('switcher-list')
+  const pasted = resolvePasted(query, rootPaths, allNotes, platform)
+  const needle = pasted ? pasted.toLowerCase().normalize('NFC') : query.trim().toLowerCase().normalize('NFC')
+  const source = needle ? notes.filter((note) => note.toLowerCase().normalize('NFC').includes(needle)) : storage.get(`recent:${vaultName}`, []).filter((note) => notes.includes(note)).concat(notes.slice(0, 30))
+  // 名前に入っているものを先に並べてから、上限で切る。
+  const nameHit = (note) => (note.split('/').at(-1).toLowerCase().includes(needle) ? 0 : 1)
+  const ordered = needle ? [...source].sort((a, b) => nameHit(a) - nameHit(b)) : source
+  const seen = new Set()
+  const shown = []
+  for (const note of ordered) {
+    if (seen.has(note)) continue
+    seen.add(note)
+    shown.push(note)
+    if (shown.length >= 50) break
+  }
+  const fresh = query.trim()
+  // 新しいノートは、いま開いているノートと同じフォルダーに作る。パスのように見える文字からは作らない。
+  const newPath = pasted ? null : newNotePath(query, defaultNoteDir(currentPath, noteFolders(notes)), allNotes)
+  const rows = pasted ? [pasted] : [...shown]
+  // パスを貼っても開けないときは、黙って空にせず理由を出す。
+  if (!pasted && fresh.includes('/') && rows.length === 0) {
+    const item = document.createElement('li')
+    item.className = 'switcher-missing'
+    item.textContent = `このパスのノートは「${vaultLabel}」の中に見つかりません。`
+    list.replaceChildren(item)
+    return
+  }
+  const createRow = Boolean(newPath)
+  if (createRow) rows.push(newPath)
+  list.replaceChildren(
+    ...rows.map((note, index) => {
+      const item = document.createElement('li')
+      if (createRow && index === rows.length - 1) {
+        const label = document.createElement('span')
+        label.className = 'switcher-name'
+        label.textContent = `「${fresh}」を新しく作る`
+        const place = document.createElement('span')
+        place.className = 'switcher-folder'
+        place.textContent = newPath
+        item.append(label, place)
+        item.dataset.path = newPath
+        item.dataset.create = 'true'
+        item.setAttribute('aria-selected', String(index === 0))
+        item.addEventListener('click', () => createFromSwitcher(newPath))
+        return item
+      }
+      const parts = note.split('/')
+      const name = document.createElement('span')
+      name.className = 'switcher-name'
+      name.textContent = parts.at(-1).replace(/\.md$/i, '')
+      const folder = document.createElement('span')
+      folder.className = 'switcher-folder'
+      folder.textContent = parts.slice(0, -1).join('/')
+      item.append(name, folder)
+      item.dataset.path = note
+      item.setAttribute('aria-selected', String(index === 0))
+      item.addEventListener('click', () => chooseSwitcher(note))
+      return item
+    }),
+  )
+}
+
+function chooseSwitcher(path) {
+  if (!path) return
+  $('switcher').close()
+  if (path) openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), path)
+}
+
+const KIND_LABEL = { previous: '保存の直前', snapshot: '定期', conflict: 'ぶつかったとき・上書きされたとき', daily: 'その日最初の保存の前' }
+let historyChoice = null
+
+async function openHistory() {
+  if (!currentPath) return
+  const result = await request(`/api/backups?path=${encodeURIComponent(currentPath)}`)
+  const list = $('history-list')
+  historyChoice = null
+  $('history-text').textContent = ''
+  $('history-restore').disabled = true
+  const items = result.data?.backups ?? []
+  if (items.length === 0) {
+    const empty = document.createElement('li')
+    empty.textContent = 'このノートのバックアップはまだありません'
+    list.replaceChildren(empty)
+  } else {
+    list.replaceChildren(
+      ...items.map((backup) => {
+        const item = document.createElement('li')
+        item.tabIndex = 0
+        const time = new Date(backup.time).toLocaleString('ja-JP')
+        item.textContent = `${time}（${KIND_LABEL[backup.kind] ?? backup.kind}）`
+        item.addEventListener('click', () => {
+          for (const other of list.children) other.removeAttribute('aria-selected')
+          item.setAttribute('aria-selected', 'true')
+          historyChoice = null
+          $('history-text').textContent = ''
+          $('history-restore').disabled = true
+          const chosen = `/api/backup?path=${encodeURIComponent(currentPath)}&id=${encodeURIComponent(backup.id)}`
+          request(chosen).then(({ ok, data }) => {
+            if (!ok || item.getAttribute('aria-selected') !== 'true') return
+            historyChoice = data.text
+            $('history-text').textContent = data.text
+            $('history-restore').disabled = !editable
+          }).catch(() => {})
+        })
+        return item
+      }),
+    )
+  }
+  $('history').showModal()
+}
+
+// 「新しいノート」のボタン。最初は今のノートと同じフォルダーを選んでおく。
+async function newNoteFromButton(start = null) {
+  const list = placeFolders()
+  const path = await askNewNote({
+    folders: list,
+    selected: typeof start === 'string' ? start : defaultNoteDir(currentPath, list),
+    topLabel: vaultLabel || 'フォルダー',
+    recent: storage.get(recentPlacesKey(), []),
+    childFolders,
+    searchFolders,
+    check: (name, dir) => checkNewNote(name, dir, allNotes),
+  })
+  if (path) createFromSwitcher(path)
+}
+
+async function createFromSwitcher(path) {
+  $('switcher').close()
+  const created = await request(noteUrl(path), { method: 'POST', body: JSON.stringify({ text: '' }) })
+  if (!created.ok && created.status !== 409) {
+    showMessage('ノートを作れませんでした。')
+    return
+  }
+  storage.set(recentPlacesKey(), rememberPlace(storage.get(recentPlacesKey(), []), dirOf(path)))
+  await refreshNotes()
+  openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), path, { startMode: 'live' })
+}
+
+function moveSwitcher(delta) {
+  const items = [...$('switcher-list').children]
+  if (!items.length) return
+  const index = items.findIndex((item) => item.getAttribute('aria-selected') === 'true')
+  const next = Math.max(0, Math.min(items.length - 1, index + delta))
+  items[index]?.setAttribute('aria-selected', 'false')
+  items[next].setAttribute('aria-selected', 'true')
+  items[next].scrollIntoView({ block: 'nearest' })
+}
+
+// 文字を貼れる画面では、Cmd+Vは普通の貼り付けにする。
+function pasteOpensNote() {
+  return !currentPath || mode === 'reading' || !editable
+}
+
+// 本文をクリックしても見た目が変わらないと分からないので、貼り付けを待っていることを見せる。
+function showPasteHint(show) {
+  $('paste-hint').hidden = !show
+  document.body.classList.toggle('paste-ready', show)
+}
+
+// 閲覧表示では文字を貼る場所がないので、Cmd+Vをコピーしたパスのノートを開く操作に使う。
+function openFromPaste(event) {
+  if (document.querySelector('dialog[open]')) return
+  if (!pasteOpensNote()) return
+  if (event.target?.closest?.('input, textarea, .cm-cell-editing, .cm-props')) return
+  const text = event.clipboardData?.getData('text/plain') ?? ''
+  const pasted = resolvePasted(text, rootPaths, allNotes, platform)
+  if (pasted) {
+    event.preventDefault()
+    openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), pasted)
+  } else if (/\.md\b/i.test(text) && text.includes('/')) {
+    setStatusHint('コピーしたパスのノートが見つかりません')
+  }
+}
+
+function bindChrome() {
+  bindToolbar()
+  // 右の枠では、上のボタン列、ファイルの一覧、「探す」、貼り付けでノートを開く処理を使わない。
+  if (PANE !== 'right') bindLeftChrome()
+  else bindRightChrome()
+  $('history-close').addEventListener('click', () => $('history').close())
+  $('history-restore').addEventListener('click', async () => {
+    if (historyChoice === null || !saver) return
+    await saver.restore(historyChoice)
+    $('history').close()
+  })
+  for (const button of $('modes').querySelectorAll('button')) {
+    button.addEventListener('click', () => applyMode(button.dataset.mode))
+  }
+  // 書式の付いたリンクは、マウスを押した時点で開く。離す前にカーソルが入ると表示が変わるため。
+  $('editor').addEventListener(
+    'mousedown',
+    (event) => {
+      if (event.button !== 0 || event.altKey || mode === 'source') return
+      const link = event.target.closest?.('[data-href]')
+      if (!link) return
+      event.preventDefault()
+      event.stopPropagation()
+      openHref(link.dataset.href, event.metaKey || event.ctrlKey)
+    },
+    true,
+  )
+  $('editor').addEventListener('note-toggle-props', () => view.dispatch({ effects: togglePropsPanel.of(null) }))
+  // 表のマスなどの編集が終わったら、待たせていた外からの変更を反映する。
+  $('editor').addEventListener('focusout', () => setTimeout(() => saver?.compositionEnded(), 0))
+  window.addEventListener('keydown', (event) => {
+    hoverWithMeta = event.metaKey || event.ctrlKey
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'o') {
+      event.preventDefault()
+      // 右の枠では、左に「探す」を画面いっぱいに出してもらう。
+      if (PANE === 'right') {
+        toLeft({ type: MSG.CLICKED })
+        toLeft({ type: MSG.SEARCH })
+      } else {
+        openSwitcher()
+      }
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e' && !view?.hasFocus) {
+      event.preventDefault()
+      // 表のマスや欄で打っている文字を、表示を切り替える前に本文へ書き戻す。
+      commitOpenField()
+      cycleMode()
+    }
+  })
+  window.addEventListener('keyup', (event) => {
+    hoverWithMeta = event.metaKey || event.ctrlKey
+  })
+  window.addEventListener('popstate', () => {
+    const path = new URLSearchParams(location.search).get('note')
+    if (path) openNote(path, { push: false })
+  })
+  window.addEventListener('pagehide', () => {
+    unloading = true
+    saver?.close()
+    // 右の枠はClaudeに知らせない。右の枠を閉じたあとは、左が知らせ直す。
+    if (PANE !== 'right') request('/api/state', { method: 'PUT', body: JSON.stringify({ path: null }) }).catch(() => {})
+  })
+  window.addEventListener('beforeunload', () => {
+    unloading = true
+    commitOpenField()
+    if ($('status').dataset.state === 'dirty') saver?.save()
+  })
+  // 戻るボタンなどでページが保存されていた状態から戻ると、保存の係はもう閉じている。下書きから開き直す。
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) location.reload()
+  })
+}
+
+function bindLeftChrome() {
+  document.addEventListener('paste', openFromPaste)
+  document.addEventListener('click', (event) => {
+    // チェックやリンクを押したときは、その操作のためなので案内を出さない。
+    const onBody = event.target.closest?.('#editor') && !event.target.closest('.cm-task-box, [data-href], a')
+    showPasteHint(Boolean(onBody) && pasteOpensNote())
+  })
+  // 案内が最後の行に重なるので、読み進めるときは消す。
+  $('editor').addEventListener('scroll', () => showPasteHint(false), { capture: true, passive: true })
+  window.addEventListener('blur', () => showPasteHint(false))
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') showPasteHint(false)
+  })
+  $('open-note').addEventListener('click', openSwitcher)
+  $('new-note').addEventListener('click', () => newNoteFromButton())
+  bindFilesPanel()
+  // 右の枠が操作中なら、履歴は右の枠の中に出してもらう（前の版に戻すのは、そのノートを開いている枠でしかできない）。
+  $('open-history').addEventListener('click', () => (rightActive() ? split.post({ type: MSG.HISTORY }) : openHistory()))
+  bindSplit()
+  $('switcher-input').addEventListener('input', (event) => renderSwitcher(event.target.value))
+  $('switcher-input').addEventListener('keydown', (event) => {
+    if (event.isComposing) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      moveSwitcher(1)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      moveSwitcher(-1)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      const selected = $('switcher-list').querySelector('[aria-selected="true"]')
+      if (selected?.dataset.create) createFromSwitcher(selected.dataset.path)
+      else if (selected) chooseSwitcher(selected.dataset.path)
+    }
+  })
+  $('toggle-outline').addEventListener('click', toggleOutline)
+  $('toggle-calendar').addEventListener('click', () => showCalendar($('calendar').hidden))
+  $('today-note').addEventListener('click', () => openPeriodicNote('daily', todayText(), { ask: false }))
+  $('toggle-files').addEventListener('click', () => showFiles($('files').hidden))
+  $('to-chat').addEventListener('click', () => (rightActive() ? split.post({ type: MSG.CHAT }) : sendSelectionToChat()))
+  setupChatBox()
+  setupSideResize()
+}
+
+// ---- 左右に分ける（左の枠で使う） ----
+
+function syncSplitButton() {
+  const button = $('toggle-split')
+  const open = split.isOpen()
+  button.hidden = isNarrow()
+  button.textContent = open ? '分割を閉じる' : '右に分ける'
+  button.title = open ? '右の枠を閉じる' : 'ノートを左右に並べる'
+}
+
+async function openSplit() {
+  if (split.isOpen() || isNarrow()) return
+  setRightOpen(true)
+  const opened = split.open()
+  syncSplitButton()
+  await opened
+}
+
+async function closeSplit() {
+  if (!split.isOpen()) return
+  // 右の書きかけを保存してから外す。閉じると左の枠が操作中になり、Claudeへ知らせ直す。
+  await split.close()
+  setRightOpen(false)
+  rightWant = null
+  rightShown = null
+  rightState = { path: null, selection: '', dirty: false, headings: null }
+  syncSplitButton()
+}
+
+function bindSplit() {
+  $('toggle-split').addEventListener('click', () => {
+    if (split.isOpen()) {
+      closeSplit()
+      return
+    }
+    // 左にノートが開いていれば、右にも同じノートを出す。開いていなければ、右は空のまま。
+    rightWant = currentPath ? { path: currentPath } : null
+    openSplit()
+  })
+  // 左の枠のノートを押したり打ったりしたら、左を操作中にする（枠が変わったときだけ動く）。
+  $('editor').addEventListener('pointerdown', () => split.setActive('left'), true)
+  $('editor').addEventListener('keydown', () => split.setActive('left'), true)
+  window.addEventListener('resize', () => {
+    syncSplitButton()
+    if (isNarrow()) closeSplit()
+  })
+  syncSplitButton()
+}
+
+// 操作中の枠が変わったら、Claudeへの知らせ、カレンダーの印、目次を、その枠のノートに合わせる。
+function activeChanged() {
+  // 左が操作中になったのに左でノートを開いていなければ、閉じた右の枠のノートを開いたままだとClaudeに思われないよう、空で知らせる。
+  if (!rightActive() && !(currentPath && view)) {
+    if ($('status').dataset.state !== 'elsewhere') {
+      request('/api/state', { method: 'PUT', body: JSON.stringify({ path: null, selection: '', dirty: false }) }).catch(() => {})
+    }
+  } else {
+    sendState()
+  }
+  drawCalendar()
+  renderOutline()
+}
+
+function receiveFromRight(data) {
+  if (data.type === MSG.READY) {
+    // 分けた直後は頼んでおいたノート、右の枠だけ読み込み直したときは、そこで開いていたノートを送り直す。
+    const want = rightWant ?? (rightState.path ? { path: rightState.path } : null)
+    rightWant = null
+    if (want) split.post({ type: MSG.OPEN, ...want })
+    split.post({ type: MSG.ACTIVE, active: rightActive() })
+    split.post({ type: MSG.THEME, theme: chosenTheme() })
+  } else if (data.type === MSG.OPEN) {
+    // 右の枠でCmd+クリックしたリンクは、左で開く。
+    if (typeof data.path === 'string') openIn('left', data.path, { anchor: typeof data.anchor === 'string' ? data.anchor : '' })
+  } else if (data.type === MSG.CLICKED) {
+    split.setActive('right')
+  } else if (data.type === MSG.OPENED) {
+    const path = typeof data.path === 'string' ? data.path : null
+    rightState.path = path
+    rightState.headings = Array.isArray(data.headings) ? data.headings : null
+    // 同じノートの OPENED は、書いている間の見出しの更新。ノートが変わったときだけカレンダーを描き直す。
+    if (path !== rightShown) {
+      rightShown = path
+      if (rightActive()) drawCalendar()
+    }
+    if (rightActive()) renderOutline()
+  } else if (data.type === MSG.STATE) {
+    rightState.path = typeof data.path === 'string' ? data.path : null
+    rightState.selection = typeof data.selection === 'string' ? data.selection : ''
+    rightState.dirty = Boolean(data.dirty)
+    if (data.askChat) {
+      // 右の枠で選んだ文字を、左の「チャットへ」と同じくチャットの入力欄へ送る。
+      putRightState({ askChat: data.askChat })
+      setStatusHint('チャットの入力欄へ送りました')
+    } else if (rightActive()) {
+      sendState()
+    }
+  } else if (data.type === MSG.SEARCH) {
+    openSwitcher()
+  } else if (data.type === MSG.CLOSE) {
+    closeSplit()
+  }
+}
+
+// 選んでいる文字をチャットの入力欄へ送る。右の枠では、左から CHAT を受けたときに使う。
+function sendSelectionToChat() {
+  const selection = view.state.selection.main
+  const text = view.state.sliceDoc(selection.from, selection.to)
+  if (!text) {
+    setStatusHint('先に文字を選んでください')
+    return
+  }
+  sendState({ askChat: { text: text.slice(0, 4000), at: Date.now() } })
+  setStatusHint('チャットの入力欄へ送りました')
+}
+
+function bindRightChrome() {
+  $('pane-close').hidden = false
+  $('pane-close').addEventListener('click', () => toLeft({ type: MSG.CLOSE }))
+  // 右の枠を押したり打ったりしたら、左に操作中にしてもらう。
+  const clicked = () => {
+    if (!paneActive) toLeft({ type: MSG.CLICKED })
+  }
+  $('editor').addEventListener('pointerdown', clicked, true)
+  $('editor').addEventListener('keydown', clicked, true)
+  window.addEventListener('message', (event) => {
+    if (!isPaneMessage(event, { origin: location.origin, source: parent })) return
+    receiveFromLeft(event.data)
+  })
+}
+
+async function receiveFromLeft(data) {
+  if (data.type === MSG.OPEN) {
+    if (typeof data.path !== 'string') return
+    // 名前を変えたり動かしたりしたあとは、古い場所へ保存しに行かずに開き直す。
+    if (data.reopen) {
+      const oldPath = currentPath
+      saver?.close()
+      saver = null
+      // close で古い場所の名前で残した一時保存を、新しい場所の名前へ移す。開き直したときに戻せるように。
+      const draft = oldPath && oldPath !== data.path ? drafts.get(oldPath) : null
+      if (draft) {
+        drafts.set(data.path, draft)
+        drafts.remove(oldPath)
+      }
+    }
+    await openNote(data.path, { push: false, anchor: data.anchor, startMode: data.startMode })
+  } else if (data.type === MSG.ACTIVE) {
+    paneActive = Boolean(data.active)
+    if (paneActive) {
+      postOpened()
+      sendState()
+    }
+  } else if (data.type === MSG.JUMP) {
+    if (!currentPath || !view) return
+    const pos = Math.max(0, Math.min(Number(data.from) || 0, view.state.doc.length))
+    view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
+  } else if (data.type === MSG.CHAT) {
+    sendSelectionToChat()
+  } else if (data.type === MSG.HISTORY) {
+    openHistory()
+  } else if (data.type === MSG.THEME) {
+    // 左が選んだ配色に合わせる。記録は左が持つので、ここでは保存しない。
+    themeChoice = data.theme === 'light' || data.theme === 'dark' ? data.theme : null
+    applyTheme()
+  } else if (data.type === MSG.SAVE) {
+    try {
+      commitOpenField()
+      await saver?.flush()
+      // 保存しきれなかったら、右の枠が閉じられたり移動を止めたりする前に、今の内容で一時保存を書き直しておく。
+      if (saver && !CLEAN_STATES.has($('status').dataset.state)) saver.keepDraft()
+    } finally {
+      // 保存が止まっているとき（ぶつかった、見つからないなど）は flush しても書けないので、まだ書きかけがあると返す。
+      toLeft({ type: MSG.SAVED, dirty: Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state) })
+    }
+  }
+}
+
+function setStatusHint(text) {
+  const box = $('status')
+  const previous = box.dataset.state
+  box.textContent = text
+  // 右の枠では「保存済み」を隠すので、案内を出している間だけ印を付けて見えるようにする。
+  box.dataset.hint = '1'
+  setTimeout(() => {
+    if (box.textContent !== text) return
+    box.textContent = STATUS_TEXT[previous] ?? ''
+    delete box.dataset.hint
+  }, 2500)
+}
+
+// チャットからClaudeが設定ファイルを書き換えたら、開いている画面にも反映する。
+const APPEARANCE_POLL_MS = 3000
+const darkScheme = window.matchMedia('(prefers-color-scheme: dark)')
+let appearance = {}
+let appliedVars = []
+
+// 明るい画面・暗い画面。エディターで選んだほうを使い、選んでいなければアプリの設定に従う（2026-11-08）。
+// アプリと同じ側を選び直したときは、選んだ記録を消して、またアプリの設定に従う。
+// ブラウザの保存領域が使えなくても、このタブの間は選んだほうを使えるよう、手元にも持つ。
+let themeChoice
+
+function chosenTheme() {
+  if (themeChoice === undefined) {
+    const theme = storage.get('theme', null)
+    themeChoice = theme === 'light' || theme === 'dark' ? theme : null
+  }
+  return themeChoice
+}
+
+function isDark() {
+  const theme = chosenTheme()
+  return theme ? theme === 'dark' : darkScheme.matches
+}
+
+function applyTheme() {
+  const theme = chosenTheme()
+  if (theme) document.documentElement.dataset.theme = theme
+  else delete document.documentElement.dataset.theme
+  const button = $('toggle-theme')
+  const dark = isDark()
+  button.textContent = dark ? '☀' : '☾'
+  button.title = dark ? '明るい画面にする' : '暗い画面にする'
+  button.setAttribute('aria-label', button.title)
+  applyAppearance()
+  // 本文の中の図（Mermaid）を、新しい明暗で描き直す。
+  view?.dispatch({ effects: setMode.of(mode) })
+  // 分けていれば、右の枠も同じ配色にしてもらう。
+  if (split?.isOpen()) split.post({ type: MSG.THEME, theme: chosenTheme() })
+}
+
+function toggleTheme() {
+  const next = isDark() ? 'light' : 'dark'
+  if (next === (darkScheme.matches ? 'dark' : 'light')) {
+    themeChoice = null
+    storage.remove('theme')
+  } else {
+    themeChoice = next
+    storage.set('theme', next)
+  }
+  applyTheme()
+}
+
+function applyAppearance() {
+  const vars = appearanceVars(appearance, isDark())
+  for (const name of appliedVars) document.documentElement.style.removeProperty(name)
+  for (const [name, value] of Object.entries(vars)) document.documentElement.style.setProperty(name, value)
+  appliedVars = Object.keys(vars)
+  // 文字の大きさが変わると、行の高さの計算をやり直す必要がある。
+  view?.requestMeasure()
+}
+
+async function syncAppearance() {
+  if (document.hidden) return
+  try {
+    const { ok, data } = await request('/api/appearance')
+    if (!ok || JSON.stringify(data) === JSON.stringify(appearance)) return
+    appearance = data
+    applyAppearance()
+  } catch {
+    // サーバーが止まっている間は、今の見た目のままにする。
+  }
+}
+
+async function start() {
+  localizeKeyHints(document) // WindowsではCmdの案内をCtrlにする（鍵の確認を待たずに）
+  await takeTicket()
+  bindChrome()
+  applyTheme()
+  if (PANE !== 'right') $('toggle-theme').addEventListener('click', toggleTheme)
+  applyMode(mode)
+  const reply = await request('/api/health')
+  if (reply.status === 401) return
+  const health = reply.data
+  setFileKey(health.fileKey)
+  await syncAppearance()
+  darkScheme.addEventListener('change', applyTheme)
+  setInterval(syncAppearance, APPEARANCE_POLL_MS)
+  vaultName = health.rootId
+  rootId = health.rootId
+  startVersionWatch(reply.version)
+  startConnectionWatch()
+  rootPaths = health.rootPaths
+  platform = health.platform === 'win32' ? 'win32' : 'darwin'
+  vaultLabel = health.root
+  if (PANE === 'right') {
+    await startRight()
+    return
+  }
+  filesOpen = new Set(storage.get(`files-open:${vaultName}`, []))
+  $('files').hidden = !storage.get('files-shown', innerWidth >= NARROW_WIDTH)
+  await refreshNotes()
+  const narrow = isNarrow()
+  showCalendar(storage.get('calendar-shown', !narrow), { remember: false })
+  // カレンダーをたたんでいても、今日のノートのボタンを出すか隠すかは起動時に決める。
+  await drawCalendar()
+  const params = new URLSearchParams(location.search)
+  const path = params.get('note')
+  if (path) {
+    await openNote(path, { push: false, anchor: decodeURIComponent(location.hash.slice(1)) })
+  } else {
+    if (params.get('today') === '1') await openPeriodicNote('daily', todayText(), { ask: false })
+  }
+  if (!path && !view) {
+    view = new EditorView({
+      state: EditorState.create({ doc: '', extensions: [EditorView.editable.of(false), placeholder(keyLabel('右の一覧からノートを開いてください。コピーしたパスをCmd+Vで貼っても開けます'))] }),
+      parent: $('editor'),
+    })
+    if ($('files').hidden) showFiles(true)
+  }
+  showPortMovedOnce(health)
+  setInterval(() => {
+    refreshNotes()
+    drawCalendar().catch(() => {})
+  }, 60_000)
+}
+
+// 右の枠は ?note や ?today を見ず、案内も出さない。空のまま左に準備ができたと知らせ、開くノートを待つ。
+async function startRight() {
+  // カレンダーとファイルの一覧は出さないので、描く処理が動かないよう隠しておく。
+  $('calendar').hidden = true
+  $('files').hidden = true
+  await refreshNotes()
+  if (!view) {
+    view = new EditorView({
+      state: EditorState.create({ doc: '', extensions: [EditorView.editable.of(false)] }),
+      parent: $('editor'),
+    })
+  }
+  toLeft({ type: MSG.READY })
+  setInterval(refreshNotes, 60_000)
+}
+
+window.noteEditor = { getView: () => view, getSaver: () => saver }
+takeToken()
+// 開いているタブへ#だけ変えて移動してきたときは、読み込み直しが起きない。
+window.addEventListener('hashchange', async () => {
+  const isToken = Boolean(tokenFromHash(location.hash))
+  const isTicket = Boolean(ticketFromHash(location.hash))
+  if (!isToken && !isTicket) return
+  const changed = isToken ? takeToken() : await takeTicket()
+  // 起動に失敗していたタブは、合言葉が同じでも開き直す。鍵を断られたことは、読み込み直したあとの開けない画面へ引き継ぐ。
+  if (changed || !view) {
+    if (!changed && keyRefused) markKeyRefused(sessionStore)
+    location.reload()
+  }
+})
+start()

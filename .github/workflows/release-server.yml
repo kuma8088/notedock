@@ -1,0 +1,456 @@
+# サーバーのリリース。タグ server-v<バージョン> を push すると動く。
+# 1. 4種類のサーバーのファイルを作り、同じ手順でもう一度作って指紋（SHA-256）を比べる（違っても止めない）。
+# 2. 4種類それぞれのパソコンで確認用プログラム（スモークテスト）を動かし、サーバーが知らせるバージョンも確かめる。
+#    1つでも失敗したら、リリースは作らない。
+# 3. pre-release の印を付けた下書きの Releases を作り、4つのファイル、SHA256SUMS、release.ts を置く。
+#    下書きを公開にするのは人の手で行う。
+name: release-server
+
+on:
+  push:
+    tags:
+      - 'server-v*'
+
+permissions: {}
+
+concurrency:
+  group: release-server-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DENO_VERSION: '2.9.8'
+  NODE_VERSION: '24'
+  RELEASE_REPO: kuma8088/notedock
+
+jobs:
+  build:
+    name: build (2 times, compare)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # main に入っていないコミット（作業中のブランチなど）に付けたタグからは、リリースを作らない。
+      # fetch-depth: 0 で全部のブランチの履歴を取ってあるので、origin/main の祖先かどうかだけを見る。
+      - name: Check that the tag is on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::タグ $TAG のコミット $GITHUB_SHA は main に入っていません。main に入れてからタグを付けてください。"
+            exit 1
+          fi
+          echo "on main: $GITHUB_SHA"
+
+      - name: Read the version from the tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#server-v}"
+          if ! printf '%s\n' "$version" | grep -Eq '^0\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then
+            echo "::error::タグ $TAG のバージョンは 0.x.y か 0.x.y-rc.n の形にしてください"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version: $version"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Show tool versions
+        run: |
+          deno --version
+          node --version
+          npm --version
+          # パイプで head が先に閉じると pipefail で止まることがあるので、Deno に版だけを出させる。
+          actual="$(deno eval 'console.log(Deno.version.deno)')"
+          if [ "$actual" != "$DENO_VERSION" ]; then
+            echo "::error::Deno のバージョンが $DENO_VERSION ではありません: $actual"
+            exit 1
+          fi
+
+      # version.test.mjs は作業場所の SERVER_VERSION が 0.0.0-dev であることを確かめるので、
+      # npm test はここでは動かさない（ci.yml で動かす）。
+      - name: Write the version into the server
+        working-directory: app
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: node scripts/set-version.mjs "$VERSION"
+
+      - name: Build 1
+        working-directory: app
+        env:
+          NOTEDOCK_ALLOW_DOWNLOAD: '1'
+        run: |
+          npm ci
+          npm run build
+          git diff --exit-code -- public
+          sh scripts/compile.sh
+
+      # 2回目が上書きする前に、1回目の4つのファイルを別の場所へ写す。
+      - name: Keep the files of build 1
+        working-directory: app
+        run: |
+          mkdir -p "$RUNNER_TEMP/build1"
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc; do
+            case "$t" in *windows*) e=.exe ;; *) e= ;; esac
+            cp "dist/notedock-server-$t$e" "$RUNNER_TEMP/build1/"
+          done
+          (cd "$RUNNER_TEMP/build1" && sha256sum notedock-server-* | sort -k 2)
+
+      - name: Build 2 (same steps)
+        working-directory: app
+        env:
+          NOTEDOCK_ALLOW_DOWNLOAD: '1'
+        run: |
+          rm -rf dist node_modules
+          npm ci
+          npm run build
+          git diff --exit-code -- public
+          sh scripts/compile.sh
+
+      # 違っても止めない。結果は Releases の説明に書く。
+      - name: Compare the fingerprints of build 1 and build 2
+        working-directory: app
+        run: |
+          out="$RUNNER_TEMP/meta"
+          mkdir -p "$out"
+          same=0
+          rows="$RUNNER_TEMP/rows.md"
+          : > "$rows"
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc; do
+            case "$t" in *windows*) e=.exe ;; *) e= ;; esac
+            f="notedock-server-$t$e"
+            a="$(sha256sum "$RUNNER_TEMP/build1/$f" | awk '{print $1}')"
+            b="$(sha256sum "dist/$f" | awk '{print $1}')"
+            if [ "$a" = "$b" ]; then
+              same=$((same + 1))
+              mark="同じ"
+            else
+              mark="違う"
+            fi
+            printf '| `%s` | `%s` | `%s` | %s |\n' "$f" "$a" "$b" "$mark" >> "$rows"
+          done
+          {
+            echo "## 同じ手順で2回作ったときの指紋"
+            echo
+            if [ "$same" -eq 4 ]; then
+              echo "同じ手順で2回作り、4つのサーバーのファイルの指紋（SHA-256）が、4つとも同じになりました。"
+            else
+              echo "同じ手順で2回作り、4つのサーバーのファイルのうち $((4 - same)) つの指紋（SHA-256）が違いました。置いているのは2回目のファイルです。"
+            fi
+            echo
+            echo "| ファイル | 1回目 | 2回目 | 結果 |"
+            echo "| --- | --- | --- | --- |"
+            cat "$rows"
+          } > "$out/reproducibility.md"
+          cat "$out/reproducibility.md"
+          echo "same=$same" > "$out/reproducibility.txt"
+          if [ "$same" -ne 4 ]; then
+            echo "::warning::2回作った指紋が $((4 - same)) つ違いました（リリースは続けます）"
+          fi
+
+      - name: Write release.ts and SHA256SUMS
+        working-directory: app
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          out="$RUNNER_TEMP/meta"
+          node scripts/write-release.mjs \
+            --version "$VERSION" \
+            --base-url "https://github.com/$RELEASE_REPO/releases/download/server-v$VERSION/" \
+            --dist dist \
+            --out "$out/release.ts"
+          cat "$out/release.ts"
+          count="$(grep -c 'sha256: "' "$out/release.ts" || true)"
+          if [ "$count" -ne 4 ]; then
+            echo "::error::release.ts の ASSETS が4つではありません: $count"
+            exit 1
+          fi
+          cp dist/notedock-server-* "$out/"
+          (cd "$out" && sha256sum notedock-server-aarch64-apple-darwin notedock-server-x86_64-apple-darwin \
+            notedock-server-aarch64-pc-windows-msvc.exe notedock-server-x86_64-pc-windows-msvc.exe release.ts > SHA256SUMS)
+          cat "$out/SHA256SUMS"
+          echo "deno $(deno eval 'console.log(Deno.version.deno)')" > "$out/deno-version.txt"
+
+      - name: Upload the release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/meta/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload aarch64-apple-darwin
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-aarch64-apple-darwin
+          path: |
+            app/dist/notedock-server-aarch64-apple-darwin
+            app/dist/notedock-smoke-aarch64-apple-darwin
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload x86_64-apple-darwin
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-x86_64-apple-darwin
+          path: |
+            app/dist/notedock-server-x86_64-apple-darwin
+            app/dist/notedock-smoke-x86_64-apple-darwin
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload aarch64-pc-windows-msvc
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-aarch64-pc-windows-msvc
+          path: |
+            app/dist/notedock-server-aarch64-pc-windows-msvc.exe
+            app/dist/notedock-smoke-aarch64-pc-windows-msvc.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload x86_64-pc-windows-msvc
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-x86_64-pc-windows-msvc
+          path: |
+            app/dist/notedock-server-x86_64-pc-windows-msvc.exe
+            app/dist/notedock-smoke-x86_64-pc-windows-msvc.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: smoke (${{ matrix.target }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      # 1つが失敗しても残りは最後まで動かし、どれが失敗したかを全部見えるようにする。
+      # release は全部の成功を待つので、1つでも失敗すればリリースは作らない。
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-26
+          - target: x86_64-apple-darwin
+            runner: macos-26-intel
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Download the files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist
+
+      # 実行環境が、確かめたい種類のパソコンかどうかを確かめる（別の種類の上で、まねして動かしていないか）。
+      - name: Check the runner
+        shell: node {0}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          const os = require('node:os')
+          const { execFileSync } = require('node:child_process')
+          const target = process.env.TARGET
+          const wantOs = target.includes('windows') ? 'win32' : 'darwin'
+          const wantArch = target.startsWith('aarch64') ? 'arm64' : 'x64'
+          console.log(`platform=${process.platform} arch=${process.arch} machine=${os.machine()} cpu=${os.cpus()[0]?.model}`)
+          if (process.platform === 'win32') {
+            console.log(`PROCESSOR_ARCHITECTURE=${process.env.PROCESSOR_ARCHITECTURE} PROCESSOR_IDENTIFIER=${process.env.PROCESSOR_IDENTIFIER}`)
+          }
+          let ok = process.platform === wantOs && process.arch === wantArch
+          if (process.platform === 'darwin') {
+            // Apple シリコンでは 1。Intel では 0 か、項目がない。Rosetta 2 の上でも本当の種類が分かる。
+            let arm64 = '0'
+            try {
+              arm64 = execFileSync('sysctl', ['-n', 'hw.optional.arm64'], { encoding: 'utf8' }).trim()
+            } catch {}
+            console.log(`hw.optional.arm64=${arm64}`)
+            if ((arm64 === '1') !== (wantArch === 'arm64')) ok = false
+          }
+          if (!ok) {
+            console.log(`::error::この実行環境は ${target} を確かめる環境ではありません`)
+            process.exit(1)
+          }
+
+      - name: Run the smoke test
+        shell: node {0}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const { spawnSync } = require('node:child_process')
+          const target = process.env.TARGET
+          const ext = target.includes('windows') ? '.exe' : ''
+          const server = path.resolve('dist', `notedock-server-${target}${ext}`)
+          const smoke = path.resolve('dist', `notedock-smoke-${target}${ext}`)
+          // 受け渡しの途中で実行の権限が外れるので、付け直す（Mac）。
+          if (process.platform !== 'win32') for (const f of [server, smoke]) fs.chmodSync(f, 0o755)
+          const r = spawnSync(smoke, [server], { stdio: 'inherit', timeout: 20 * 60 * 1000 })
+          if (r.error) console.log(`::error::スモークテストを起動できません: ${r.error.message}`)
+          if (r.status !== 0) {
+            console.log(`::error::スモークテストが失敗しました（${target}, status=${r.status}, signal=${r.signal}）`)
+            process.exit(1)
+          }
+
+      # binary.mjs はバージョンを確かめないので、ここで確かめる。
+      # 一時フォルダーをVaultにしてサーバーを起動し、応答の x-notedock-version がタグのバージョンと同じかを見る。
+      - name: Check the version the server reports
+        shell: node {0}
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          const fs = require('node:fs')
+          const os = require('node:os')
+          const path = require('node:path')
+          const http = require('node:http')
+          const { spawn } = require('node:child_process')
+          const target = process.env.TARGET
+          const expected = process.env.VERSION
+          const ext = target.includes('windows') ? '.exe' : ''
+          const server = path.resolve('dist', `notedock-server-${target}${ext}`)
+          const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'notedock-version-')))
+          const vault = path.join(tmp, 'vault')
+          const state = path.join(tmp, 'state')
+          fs.mkdirSync(vault)
+          fs.mkdirSync(state)
+          fs.writeFileSync(path.join(vault, 'home.md'), '# home\n')
+          const child = spawn(server, ['--root', vault, '--state-dir', state, '--port', '0', '--no-token'], { stdio: ['ignore', 'pipe', 'inherit'] })
+          let done = false
+          const finish = (code, message) => {
+            if (done) return
+            done = true
+            if (message) console.log(message)
+            try { child.kill() } catch {}
+            setTimeout(() => {
+              try { fs.rmSync(tmp, { recursive: true, force: true }) } catch {}
+              process.exit(code)
+            }, 2000)
+          }
+          const timer = setTimeout(() => finish(1, '::error::サーバーが60秒以内に動き出しませんでした'), 60000)
+          child.on('error', (e) => finish(1, `::error::サーバーを起動できません: ${e.message}`))
+          child.on('exit', (code, signal) => finish(1, `::error::サーバーが先に終わりました: code=${code} signal=${signal}`))
+          let out = ''
+          child.stdout.on('data', (chunk) => {
+            out += chunk
+            const m = out.match(/NoteDock: http:\/\/127\.0\.0\.1:(\d+)\//)
+            if (!m || done) return
+            const port = Number(m[1])
+            http.get({ host: '127.0.0.1', port, path: '/api/health' }, (res) => {
+              res.resume()
+              clearTimeout(timer)
+              const got = res.headers['x-notedock-version']
+              console.log(`port=${port} status=${res.statusCode} x-notedock-version=${got} expected=${expected}`)
+              if (got === expected) finish(0, `PASS version ${got}`)
+              else finish(1, `::error::サーバーが知らせるバージョンが違います: ${got}（タグは ${expected}）`)
+            }).on('error', (e) => {
+              clearTimeout(timer)
+              finish(1, `::error::サーバーにつながりません: ${e.message}`)
+            })
+          })
+
+  release:
+    name: draft release
+    needs: [build, smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download the release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: release
+
+      # 置く前に、受け渡しのあとの中身が SHA256SUMS と同じかを確かめる。
+      - name: Check the fingerprints
+        working-directory: release
+        run: |
+          sha256sum -c SHA256SUMS
+          ls -l
+
+      - name: Write the release notes
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          {
+            echo "NoteDock のサーバー $VERSION です。"
+            echo
+            echo "- Mac（Apple シリコン、Intel）と Windows（ARM64、x64）の4種類のサーバーのファイルを置いています。"
+            echo "- 4種類それぞれのパソコンで確認用プログラム（スモークテスト）を動かし、サーバーが知らせるバージョンが $VERSION であることを確かめました。"
+            echo "- \`release.ts\` は、Mod の \`hooks/release.ts\` に入れる、サーバーのファイルの目録です。"
+            echo "- 作るのに使った Deno: $(cat release/deno-version.txt)"
+            echo
+            cat release/reproducibility.md
+            echo
+            echo "## SHA256SUMS"
+            echo
+            echo '```'
+            cat release/SHA256SUMS
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      # 一度作ったリリースは置き直さない。同じタグのリリースがすでにあれば止める。
+      - name: Create the draft pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::タグ $TAG のリリースがすでにあります。置き直さず、新しいバージョンを出してください。"
+            exit 1
+          fi
+          cd release
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --title "NoteDock server $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            notedock-server-aarch64-apple-darwin \
+            notedock-server-x86_64-apple-darwin \
+            notedock-server-aarch64-pc-windows-msvc.exe \
+            notedock-server-x86_64-pc-windows-msvc.exe \
+            SHA256SUMS \
+            release.ts
