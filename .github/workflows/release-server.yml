@@ -145,22 +145,24 @@ jobs:
             b="$(sha256sum "dist/$f" | awk '{print $1}')"
             if [ "$a" = "$b" ]; then
               same=$((same + 1))
-              mark="同じ"
+              mark="一致"
             else
-              mark="違う"
+              mark="不一致"
             fi
             printf '| `%s` | `%s` | `%s` | %s |\n' "$f" "$a" "$b" "$mark" >> "$rows"
           done
           {
-            echo "## 同じ手順で2回作ったときの指紋"
+            echo "## ビルドの再現性"
             echo
             if [ "$same" -eq 4 ]; then
-              echo "同じ手順で2回作り、4つのサーバーのファイルの指紋（SHA-256）が、4つとも同じになりました。"
+              echo "同じ手順で2回ビルドして、ハッシュ値を比べました。4つの実行ファイルすべてで、1回目と2回目のハッシュ値が一致しました。"
+            elif [ "$same" -eq 0 ]; then
+              echo "同じ手順で2回ビルドして、ハッシュ値を比べました。4つの実行ファイルすべてで、1回目と2回目のハッシュ値が一致しませんでした。このリリースに添付しているのは、2回目にビルドしたファイルです。"
             else
-              echo "同じ手順で2回作り、4つのサーバーのファイルのうち $((4 - same)) つの指紋（SHA-256）が違いました。置いているのは2回目のファイルです。"
+              echo "同じ手順で2回ビルドして、ハッシュ値を比べました。4つの実行ファイルのうち $((4 - same)) つで、1回目と2回目のハッシュ値が一致しませんでした。このリリースに添付しているのは、2回目にビルドしたファイルです。"
             fi
             echo
-            echo "| ファイル | 1回目 | 2回目 | 結果 |"
+            echo "| ファイル | 1回目のハッシュ値 | 2回目のハッシュ値 | 比較結果 |"
             echo "| --- | --- | --- | --- |"
             cat "$rows"
           } > "$out/reproducibility.md"
@@ -412,16 +414,19 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           {
-            echo "NoteDock のサーバー $VERSION です。"
+            case "$VERSION" in *-rc.*) echo "NoteDock のサーバー $VERSION です。正式版の前に動作を確かめるための、リリース候補（プレリリース）です。" ;; *) echo "NoteDock のサーバー $VERSION です。" ;; esac
             echo
-            echo "- Mac（Apple シリコン、Intel）と Windows（ARM64、x64）の4種類のサーバーのファイルを置いています。"
-            echo "- 4種類それぞれのパソコンで確認用プログラム（スモークテスト）を動かし、サーバーが知らせるバージョンが $VERSION であることを確かめました。"
-            echo "- \`release.ts\` は、Mod の \`hooks/release.ts\` に入れる、サーバーのファイルの目録です。"
-            echo "- 作るのに使った Deno: $(cat release/deno-version.txt)"
+            echo "Mac（Apple シリコン、Intel）と Windows（x64、ARM64）向けに、サーバーの実行ファイルを4つ添付しています。GitHub Actions で、OS と CPU の組み合わせごとに対応するランナーを使ってスモークテストを実行しました。サーバーが返すバージョンが $VERSION になることも確認しています。"
+            echo
+            echo "\`release.ts\` は、Claude Code のプラグインのリリースのときに、プラグインのフォルダー \`mod/\` の中へ \`hooks/release.ts\` として取り込むファイルです。4つの実行ファイルの名前、サイズ、ハッシュ値（SHA-256）が書いてあります。利用者が自分で置く必要はありません。"
+            echo
+            echo "ビルドには $(sed 's/^deno /Deno /' release/deno-version.txt) を使いました。"
             echo
             cat release/reproducibility.md
             echo
             echo "## SHA256SUMS"
+            echo
+            echo "添付した \`SHA256SUMS\` の中身です。"
             echo
             echo '```'
             cat release/SHA256SUMS

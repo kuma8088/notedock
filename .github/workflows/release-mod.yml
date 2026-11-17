@@ -170,12 +170,15 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           {
-            echo "NoteDock の Mod $VERSION です。"
+            case "$VERSION" in *-rc.*) echo "NoteDock のプラグイン $VERSION です。正式版の前に動作を確かめるための、リリース候補（プレリリース）です。" ;; *) echo "NoteDock のプラグイン $VERSION です。" ;; esac
             echo
-            echo "- 使うサーバーは、リリース server-v$VERSION のファイルです。"
-            echo "- マーケットプレイスの一覧（.claude-plugin/marketplace.json）は、このリリースを公開したあと、ここに置いた zip を読み直して指紋を確かめてから書き換えます。"
+            echo "ふだんは、README の手順でリポジトリから入れてください。添付の \`notedock-mod-$VERSION.zip\` は、その手順でうまくいかないときに、デスクトップアプリの「Upload plugin」で入れるためのファイルです。"
+            echo
+            echo "このプラグインは、リリース server-v$VERSION のサーバーの実行ファイルを使います。初めて「ノートを開く」を押したときに、そこからダウンロードします。"
             echo
             echo "## SHA256SUMS"
+            echo
+            echo "添付した \`SHA256SUMS\` の中身です。"
             echo
             echo '```'
             cat "$RUNNER_TEMP/out/SHA256SUMS"
@@ -200,7 +203,7 @@ jobs:
             --verify-tag \
             --draft \
             --prerelease \
-            --title "NoteDock Mod $VERSION" \
+            --title "NoteDock plugin $VERSION" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             "notedock-mod-$VERSION.zip" \
             SHA256SUMS
