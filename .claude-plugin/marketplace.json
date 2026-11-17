@@ -4,5 +4,10 @@
     "name": "kuma8088"
   },
   "description": "NoteDock: Claudeアプリのブラウザパネルで、ノートのフォルダーを開いて書けるエディター",
-  "plugins": []
+  "plugins": [
+    {
+      "name": "notedock",
+      "source": "./mod"
+    }
+  ]
 }

@@ -172,9 +172,9 @@ jobs:
           {
             case "$VERSION" in *-rc.*) echo "NoteDock のプラグイン $VERSION です。正式版の前に動作を確かめるための、リリース候補（プレリリース）です。" ;; *) echo "NoteDock のプラグイン $VERSION です。" ;; esac
             echo
-            echo "ふだんは、README の手順でリポジトリから入れてください。添付の \`notedock-mod-$VERSION.zip\` は、その手順でうまくいかないときに、デスクトップアプリの「Upload plugin」で入れるためのファイルです。"
+            echo "通常は、README の手順でリポジトリから入れてください。その手順でうまくいかないときは、添付の \`notedock-mod-$VERSION.zip\` を、Claude のデスクトップアプリの「Upload plugin」から入れてください。"
             echo
-            echo "このプラグインは、リリース server-v$VERSION のサーバーの実行ファイルを使います。初めて「ノートを開く」を押したときに、そこからダウンロードします。"
+            echo "初めて「ノートを開く」を押したときに、プラグインが server-v$VERSION のリリースから、サーバーの実行ファイルをダウンロードします。"
             echo
             echo "## SHA256SUMS"
             echo
