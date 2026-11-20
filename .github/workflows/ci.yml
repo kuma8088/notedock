@@ -80,7 +80,6 @@ jobs:
           const fs = require('node:fs')
           const VERSION_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/
           const problems = []
-          const warnings = []
           const readJson = (file) => {
             try {
               return JSON.parse(fs.readFileSync(file, 'utf8'))
@@ -101,8 +100,6 @@ jobs:
           const baseUrl = text.match(/^export const BASE_URL = "([^"]*)"$/m)?.[1]
           if (!tsVersion || !VERSION_RE.test(tsVersion)) problems.push(`release.ts の VERSION が読めません: ${tsVersion}`)
           if (!baseUrl || !baseUrl.startsWith('https://') || !baseUrl.endsWith('/')) problems.push(`release.ts の BASE_URL の形が違います: ${baseUrl}`)
-          // サーバーと Mod は同じ番号にそろえる。出す途中のコミットでは一時的にずれることがあるので、ここでは知らせるだけ（release-mod.yml では止める）。
-          if (plugin && tsVersion && plugin.version !== tsVersion) warnings.push(`plugin.json の version（${plugin.version}）と release.ts の VERSION（${tsVersion}）が違います`)
           const market = readJson('.claude-plugin/marketplace.json')
           if (market) {
             if (!Array.isArray(market.plugins)) problems.push('marketplace.json の plugins が配列ではありません')
@@ -121,12 +118,16 @@ jobs:
               }
             }
           }
-          for (const w of warnings) console.log(`::warning::${w}`)
           if (problems.length) {
             for (const p of problems) console.log(`::error::${p}`)
             process.exit(1)
           }
           console.log(`OK plugin=${plugin?.version} release.ts=${tsVersion} marketplace plugins=${market?.plugins?.length}`)
+
+      # Mod が指すサーバーの Releases を確かめる（バージョンの一致、BASE_URL、SHA256SUMS とハッシュ値）。
+      # ここが赤なら main に入れない。Releases が下書きのままでも赤になる。
+      - name: Check that release.ts matches the published server release
+        run: node app/scripts/check-release-ref.mjs
 
       # 同じ中身から同じ指紋の zip ができること、テストのファイルが入らないことを確かめる。
       - name: Pack the Mod twice and compare

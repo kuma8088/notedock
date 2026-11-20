@@ -296,6 +296,17 @@ npm run build   # app/public を作り直す。コミットしてある app/publ
 - `ci.yml` のテストは Mac で動かしています。Windows 用のサーバーの実行ファイルを GitHub Actions の Windows で動作確認するのは、リリースのとき（`release-server.yml`）だけです
 - サーバーの実行ファイルは、Deno（2.9.8）でビルドしています。ビルドするのは `release-server.yml` です
 
+### リリースの順番
+
+サーバーの Releases を公開する前に、`release.ts` を `main` に入れないでください。入れると、更新した利用者のダウンロードが失敗します。
+
+1. サーバーの修正を `main` に入れる
+2. サーバーのタグを付けて、`release-server.yml` を動かす
+3. サーバーの Releases を公開する
+4. `release.ts` と `plugin.json` と `mod/` の修正を同じコミットで `main` に入れ、Mod のタグを付ける
+
+`mod/` を変えるときは、別のブランチで `ci.yml` が通ってから `main` に入れます。`ci.yml` は、`release.ts` と `plugin.json` のバージョンが同じか、サーバーの Releases の `SHA256SUMS` と `release.ts` のハッシュ値が合っているかを確かめます。
+
 ## ライセンス
 
 NoteDock は MIT ライセンスです（[LICENSE](LICENSE)）。
