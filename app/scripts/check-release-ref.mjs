@@ -21,7 +21,7 @@ export function checkReleaseRef({ pluginVersion, releaseTs, sums }) {
     problems.push(`release.ts の BASE_URL が server-v${version}/ で終わっていません: ${baseUrl}`)
   }
   if (sums === null) {
-    problems.push('サーバーの Releases の SHA256SUMS を取れません（Releases が下書き、またはまだありません）。サーバーの Releases を公開してから main に入れてください')
+    problems.push('サーバーの Releases から SHA256SUMS を取れません（下書き・未公開、またはネットワークの不調）。公開済みか確かめ、もう一度動かしてください')
     return problems
   }
   const listed = new Map()
@@ -44,7 +44,13 @@ export function checkReleaseRef({ pluginVersion, releaseTs, sums }) {
 
 // 直接動かされたときだけ（import されたときは動かさない）
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const plugin = JSON.parse(fs.readFileSync('mod/.claude-plugin/plugin.json', 'utf8'))
+  let plugin
+  try {
+    plugin = JSON.parse(fs.readFileSync('mod/.claude-plugin/plugin.json', 'utf8'))
+  } catch (e) {
+    console.log(`::error::mod/.claude-plugin/plugin.json を JSON として読めません: ${e.message}`)
+    process.exit(1)
+  }
   const releaseTs = fs.readFileSync('mod/hooks/release.ts', 'utf8')
   const baseUrl = releaseTs.match(/^export const BASE_URL = "([^"]*)"$/m)?.[1]
   let sums = null

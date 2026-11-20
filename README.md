@@ -305,7 +305,7 @@ npm run build   # app/public を作り直す。コミットしてある app/publ
 3. サーバーの Releases を公開する
 4. `release.ts` と `plugin.json` と `mod/` の修正を同じコミットで `main` に入れ、Mod のタグを付ける
 
-`mod/` を変えるときは、別のブランチで `ci.yml` が通ってから `main` に入れます。`ci.yml` は、`release.ts` と `plugin.json` のバージョンが同じか、サーバーの Releases の `SHA256SUMS` と `release.ts` のハッシュ値が合っているかを確かめます。
+`mod/` を変えるときは、別のブランチで `ci.yml` が通ってから `main` に入れます。`ci.yml` は、`release.ts` と `plugin.json` のバージョンが同じか、`BASE_URL` が `server-v<VERSION>/` で終わっているか、サーバーの Releases の `SHA256SUMS` と `release.ts` のハッシュ値が合っているかを確かめます。
 
 ## ライセンス
 

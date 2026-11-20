@@ -22,7 +22,7 @@ test('plugin.json と release.ts のバージョンが違えば問題として�
 test('SHA256SUMS を取れなければ（サーバーの Releases が下書き・ない）問題として返す', () => {
   const problems = checkReleaseRef({ pluginVersion: '0.1.0', releaseTs, sums: null })
   assert.equal(problems.length, 1)
-  assert.match(problems[0], /SHA256SUMS/)
+  assert.match(problems[0], /SHA256SUMS.*(下書き・未公開|ネットワーク)/)
 })
 
 test('release.ts の4種類のハッシュ値が SHA256SUMS と1つでも違えば問題として返す', () => {
