@@ -9,6 +9,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 
+import { SHUTDOWN_FALLBACK_MS, createApp } from '../server/app.mjs'
 import { VAULT_HEADER, VERSION_HEADER, canonicalRoot, vaultDirOf, vaultIdOf } from '../server/config.mjs'
 import { HANDOVER_EXIT, SERVER_VERSION } from '../server/version.mjs'
 import { ALREADY_RUNNING, PORT_BASE, PORT_SPAN, acquireLock, isServingCheck, listenOnFreePort, preferredPort, putBack } from '../server/instance.mjs'
@@ -935,6 +936,91 @@ test('止まる前に、受け付けていた保存を書き終える', { timeou
     assert.ok(readJson(path.join(vaultDir, 'handover.json')))
   } finally {
     await killAll(children)
+  }
+})
+
+// プロセスを起動せず、createApp に記録用の onShutdown を渡して動かす。終わったら closeApp で必ず閉じる。
+async function startAppWithMock() {
+  const { root, stateDir, vaultDir } = shutdownSetup()
+  const calls = []
+  const server = await createApp({ root, backupDir: path.join(stateDir, 'backups'), stateDir, vaultDir, onShutdown: (arg) => { calls.push(arg) } }).listen(0)
+  const { port, token } = readJson(path.join(vaultDir, 'server.json'))
+  return { root, server, port, token, calls, headers: { ...NOTE_HEADERS, 'x-note-token': token } }
+}
+
+function closeApp(server) {
+  return new Promise((resolve) => {
+    server.closeAllConnections()
+    server.close(() => resolve())
+  })
+}
+
+test('停止リクエストに 204 を返したあと、レスポンスを先に壊しても、onShutdown が1回だけ呼ばれる', { timeout: 30_000 }, async () => {
+  const app = await startAppWithMock()
+  try {
+    const socket = net.connect(app.port, '127.0.0.1')
+    await new Promise((resolve, reject) => {
+      socket.once('connect', resolve)
+      socket.once('error', reject)
+    })
+    const head = new Promise((resolve) => {
+      socket.once('data', (chunk) => {
+        // 204 の最初の行が届いた直後に、こちらからソケットを壊す
+        socket.destroy()
+        resolve(chunk.toString('latin1'))
+      })
+    })
+    socket.write([
+      'POST /api/shutdown HTTP/1.1',
+      `host: 127.0.0.1:${app.port}`,
+      'x-note-editor: 1',
+      `x-note-token: ${app.token}`,
+      `${VERSION_HEADER}: 0.1.0`,
+      'content-length: 0',
+      '',
+      '',
+    ].join('\r\n'))
+    assert.match(await head, /^HTTP\/1\.1 204 /)
+    await waitFor(() => app.calls.length > 0, SHUTDOWN_FALLBACK_MS + 1000, 'onShutdown が呼ばれない')
+    await sleep(300)
+    assert.deepEqual(app.calls, [{ to: '0.1.0' }])
+  } finally {
+    await closeApp(app.server)
+  }
+})
+
+test('停止処理の途中に来た2回目の停止リクエストは 503 を返し、onShutdown は1回だけ', { timeout: 30_000 }, async () => {
+  const app = await startAppWithMock()
+  try {
+    const base = `http://127.0.0.1:${app.port}`
+    const note = await (await fetch(`${base}/api/note?path=a.md`, { headers: app.headers })).json()
+    const body = JSON.stringify({ text: 'after shutdown request\n', baseHash: note.hash })
+    // 本文を途中まで送った保存で、止める処理を引き延ばす
+    let req
+    const saving = new Promise((resolve, reject) => {
+      req = http.request({ host: '127.0.0.1', port: app.port, path: '/api/note?path=a.md', method: 'PUT', headers: { ...app.headers, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => {
+        res.resume()
+        res.on('end', () => resolve(res.statusCode))
+      })
+      req.on('error', reject)
+      req.write(body.slice(0, 10))
+    })
+    await sleep(300)
+    const first = await fetch(`${base}/api/shutdown`, { method: 'POST', headers: { ...app.headers, [VERSION_HEADER]: '0.1.0' } })
+    assert.equal(first.status, 204)
+    const second = await fetch(`${base}/api/shutdown`, { method: 'POST', headers: { ...app.headers, [VERSION_HEADER]: '0.2.0' } })
+    assert.equal(second.status, 503)
+    // 予備のタイマーの時間を過ぎても、保存が終わるまでは止める処理の最後（onShutdown）へ進まない
+    await sleep(SHUTDOWN_FALLBACK_MS + 300)
+    assert.deepEqual(app.calls, [], '保存が終わるまで onShutdown を呼ばない')
+    req.end(body.slice(10))
+    assert.equal(await saving, 200)
+    await waitFor(() => app.calls.length > 0, 5_000, 'onShutdown が呼ばれない')
+    await sleep(SHUTDOWN_FALLBACK_MS + 300)
+    assert.deepEqual(app.calls, [{ to: '0.1.0' }])
+    assert.equal(fs.readFileSync(path.join(app.root, 'a.md'), 'utf8'), 'after shutdown request\n')
+  } finally {
+    await closeApp(app.server)
   }
 })
 
