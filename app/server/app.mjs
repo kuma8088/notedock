@@ -306,6 +306,7 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
       }
     }
     fallback = setTimeout(stop, SHUTDOWN_FALLBACK_MS)
+    fallback.unref?.()
     res.once('finish', stop)
     res.once('close', stop)
     return send(res, 204, '')

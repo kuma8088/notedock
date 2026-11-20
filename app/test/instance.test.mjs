@@ -989,6 +989,33 @@ test('停止リクエストに 204 を返したあと、レスポンスを先に
   }
 })
 
+test('停止リクエストのレスポンスに finish も close も来なくても、SHUTDOWN_FALLBACK_MS を過ぎると onShutdown が1回だけ呼ばれる', { timeout: 30_000 }, async () => {
+  const app = await startAppWithMock()
+  // 停止リクエストのレスポンスにだけ、finish と close の登録を捨てる。予備のタイマーだけが頼りになる。
+  const proto = http.ServerResponse.prototype
+  const hadOwn = Object.prototype.hasOwnProperty.call(proto, 'once')
+  const original = proto.once
+  proto.once = function (event, listener) {
+    if ((event === 'finish' || event === 'close') && this.req?.url?.startsWith('/api/shutdown')) return this
+    return original.call(this, event, listener)
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${app.port}/api/shutdown`, { method: 'POST', headers: { ...app.headers, [VERSION_HEADER]: '0.1.0' } })
+    assert.equal(res.status, 204)
+    const t0 = Date.now()
+    await sleep(Math.max(0, SHUTDOWN_FALLBACK_MS - 300))
+    assert.deepEqual(app.calls, [], 'タイマーの時間より前には呼ばない')
+    await waitFor(() => app.calls.length > 0, 1000 + 300, 'onShutdown が呼ばれない（予備のタイマーが効いていない）')
+    assert.ok(Date.now() - t0 >= SHUTDOWN_FALLBACK_MS - 300)
+    await sleep(300)
+    assert.deepEqual(app.calls, [{ to: '0.1.0' }])
+  } finally {
+    if (hadOwn) proto.once = original
+    else delete proto.once
+    await closeApp(app.server)
+  }
+})
+
 test('停止処理の途中に来た2回目の停止リクエストは 503 を返し、onShutdown は1回だけ', { timeout: 30_000 }, async () => {
   const app = await startAppWithMock()
   try {
@@ -1005,6 +1032,8 @@ test('停止処理の途中に来た2回目の停止リクエストは 503 を�
       req.on('error', reject)
       req.write(body.slice(0, 10))
     })
+    // 途中のアサーションが落ちたとき、未処理の失敗が混ざらないようにする（結果は下で await する）
+    saving.catch(() => {})
     await sleep(300)
     const first = await fetch(`${base}/api/shutdown`, { method: 'POST', headers: { ...app.headers, [VERSION_HEADER]: '0.1.0' } })
     assert.equal(first.status, 204)
