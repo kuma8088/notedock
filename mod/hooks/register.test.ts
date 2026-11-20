@@ -1084,12 +1084,31 @@ test('refused なら1回で、failed・20秒たっても止まらないときは
     x.prompts[0].resolve({ text: x.prompts[0].text })
     await x.nd.turnStart({ text: x.prompts[0].text, turnId: 't1' })
     await x.nd.turnComplete({ turnId: 't1' })
+    // refused の帯は10分で消える。failed・timeout の帯は、このチャットのあいだ出し続ける。
     await x.advance(10 * MIN)
-    expect(x.band()).toEqual({ kind: 'button', today: false })
+    if (tries === 1) expect(x.band()).toEqual({ kind: 'button', today: false })
+    else expect(x.band()?.text).toContain('アプリを終了して、開き直してください')
     await x.advance(10 * MIN)
     expect(count(x, 'requestShutdown')).toBe(tries)
     expect(count(x, 'startServer')).toBe(0)
   }
+})
+
+test('入れ替えに3回失敗した帯（アプリを終了して、開き直してください）は、10分を過ぎても出し続ける', async () => {
+  const x = world({ opened: true, installed: true, running: true, serverVersion: OLD, stopAfterMs: null })
+  await x.start()
+  await x.advance(4 * MIN)
+  const failed = {
+    kind: 'problem',
+    text: '古いバージョンのサーバーを入れ替えられませんでした。アプリを終了して、開き直してください（20秒たっても止まりませんでした）',
+    button: true,
+  }
+  expect(x.band()).toEqual(failed)
+  await x.advance(11 * MIN)
+  expect(x.band()).toEqual(failed)
+  await x.advance(60 * MIN)
+  expect(x.band()).toEqual(failed)
+  expect(count(x, 'requestShutdown')).toBe(3)
 })
 
 test('failed（refused 以外）を受けたら、帯に「アプリを終了して、開き直してください」と出す', async () => {
@@ -1265,13 +1284,12 @@ test('Windowsで古いバージョンのフォルダーを消せなかったら�
   expect(count(y, 'removeOldVersions')).toBe(1)
   await y.advance(10_000)
   expect(count(y, 'removeOldVersions')).toBe(2)
-  // 止める指示を送り直すたび（20秒待って止まらなければ、30秒後と、その120秒後）に、そこから2分、10秒おきに消し直す。
-  // 3回目は190秒ごろなので、310秒ごろまで消し直す。
+  // 止める指示を送り直しても（20秒待って止まらなければ、30秒後と、その120秒後）、10秒おきに消し直すのは最初の2分だけ。
   await y.advance(6 * MIN)
   expect(count(y, 'requestShutdown')).toBe(3)
   const n = count(y, 'removeOldVersions')
-  expect(n).toBeGreaterThanOrEqual(30)
-  expect(n).toBeLessThanOrEqual(34)
+  expect(n).toBeGreaterThanOrEqual(12)
+  expect(n).toBeLessThanOrEqual(14)
   await y.advance(5 * MIN)
   expect(count(y, 'removeOldVersions')).toBe(n)
 })

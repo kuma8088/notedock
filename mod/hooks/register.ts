@@ -238,7 +238,9 @@ export function createNotedock(opts: { version?: string } = {}) {
   let stopWindowUntil = 0 // 止める指示が通ったあと、この時刻までは、自分のバージョンが動いていなくても消し直す
   let mineRunning = false // 最後に見張りが見たのが、自分のバージョンのサーバー
   let lastClean = 0
-  let replaceNote: { text: string; until: number } | null = null // 入れ替えの案内（10分だけ）。until 0 は、次に描くときに決める
+  // 入れ替えの案内。until 0 は、次に描くときに10分後に決める。Infinity は、このチャットのあいだ出し続ける（3回やり直しても入れ替えられなかったとき）
+  let replaceNote: { text: string; until: number } | null = null
+  let stopSeen = false // 止める指示が通ったことがある（2回目以降は、消し直しを10秒おきに数え直さない）
   let superseded = false // 新しいバージョンのModが入っている（自分のファイルが無い）。新しいチャットを案内する
   // チャットが始まったときから、自分のファイルが無く新しいバージョンのフォルダーがあった。新しいバージョンを入れたあとで
   // 古いModに戻した（作業場所の開発用のModも同じ）とみなし、このチャットでは案内を出さず、いつもどおりダウンロードして使う。
@@ -530,10 +532,21 @@ export function createNotedock(opts: { version?: string } = {}) {
 
   // 入れ替えの知らせ。見張りの中から呼ばれるので、待たずに返る。
   function replaced(e: ReplaceEvent): void {
-    if (e.kind === 'failed') replaceNote = { text: (e.reason === 'refused' ? replaceRefused : replaceFailed)(REPLACE_WHY[e.reason]), until: 0 }
-    else if (e.kind === 'legacy') replaceNote = { text: MSG_LEGACY, until: 0 }
-    else {
+    // refused の帯は10分で消す。failed・timeout は、古いサーバーが止まりかけのまま残ると保存が断られ続けるので、出し続ける。
+    if (e.kind === 'failed') {
+      replaceNote = e.reason === 'refused'
+        ? { text: replaceRefused(REPLACE_WHY[e.reason]), until: 0 }
+        : { text: replaceFailed(REPLACE_WHY[e.reason]), until: Infinity }
+    } else if (e.kind === 'legacy') replaceNote = { text: MSG_LEGACY, until: 0 }
+    else if (stopSeen) {
+      // やり直しで、もう一度止める指示が通った。自分のバージョンが動いていなくても消し直せる時間だけを延ばす。
+      // 10秒おきに消し直すのは、最初に通ったときから2分だけ（cleanSince は数え直さない）。
+      void (async () => {
+        stopWindowUntil = (await now()) + CLEAN_RETRY_LIMIT_MS
+      })().catch(() => {})
+    } else {
       // 止める指示が通った。止まるのを待たずに、古いバージョンのフォルダーを消す（消し直しの間隔も、ここから数え直す）。
+      stopSeen = true
       cleaned = false
       void (async () => {
         const t = await now()
