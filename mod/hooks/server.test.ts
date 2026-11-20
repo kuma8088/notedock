@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { HostInfo } from './platform'
-import { createWatcher, findRunning, probe, readServerInfo, requestShutdown, startServer, vaultDirOf, vaultIdOf, type Running, type Started } from './server'
+import { createWatcher, findRunning, HELD_RETRY_MS, probe, readServerInfo, requestShutdown, startServer, vaultDirOf, vaultIdOf, type Running, type Started } from './server'
 
 const mac: HostInfo = { os: 'darwin', home: '/Users/yamada', stateDir: '/S/NoteDock', target: 'aarch64-apple-darwin', systemRoot: null }
 const VID = '0123456789abcdef'
@@ -496,4 +496,141 @@ test('自分が起動したサーバーは、バージョンが古く見えて�
   await y.w.tick(0)
   expect(await y.w.tick(5000)).toEqual({ kind: 'replacing' })
   expect(y.calls.shutdown).toBe(1)
+})
+
+// ---- 入れ替えを待つあいだと、失敗したあとのやり直し ----
+
+test('start が held を返したら、HELD_RETRY_MS のあいだは start を呼ばず、状態は replacing のまま', async () => {
+  const w = watch({ find: () => null, start: () => ({ held: true }) })
+  expect(await w.tick(0)).toEqual({ kind: 'replacing' })
+  expect(w.calls.start).toBe(1)
+  for (let t = 5000; t < HELD_RETRY_MS; t += 5000) {
+    expect(await w.tick(t)).toEqual({ kind: 'replacing' })
+  }
+  expect(w.calls.start).toBe(1)
+  // 待っているあいだも探し続け、新しいバージョンが答えればそれを使う。
+  expect(w.calls.find).toBe(HELD_RETRY_MS / 5000)
+})
+
+test('HELD_RETRY_MS を過ぎたら、もう一度 start を呼ぶ', async () => {
+  let held = true
+  const w = watch({ find: () => null, start: () => (held ? { held: true } : { running: R }) })
+  await w.tick(0)
+  await w.tick(HELD_RETRY_MS - 1)
+  expect(w.calls.start).toBe(1)
+  expect(await w.tick(HELD_RETRY_MS)).toEqual({ kind: 'replacing' })
+  expect(w.calls.start).toBe(2)
+  held = false
+  await w.tick(HELD_RETRY_MS + 5000)
+  expect(w.calls.start).toBe(2) // 2回目の held から、また30秒待つ
+  expect(await w.tick(2 * HELD_RETRY_MS)).toEqual({ kind: 'running', running: R })
+  expect(w.calls.start).toBe(3)
+  // 押したとき（reset）は、待たずにすぐ start を呼ぶ。
+  const w2 = watch({ find: () => null, start: () => ({ held: true }) })
+  await w2.tick(0)
+  w2.reset()
+  await w2.tick(1000)
+  expect(w2.calls.start).toBe(2)
+})
+
+test('入れ替えが failed（返事がない、読めない）なら、30秒後と、その120秒後にやり直し、合計3回で止める', async () => {
+  const old: Running = { ...R, version: '0.1.0' }
+  const x = replaceWatch({ found: () => old, shutdown: () => 'failed' })
+  // やり直しを待つあいだは、古いサーバーをそのまま使う。
+  expect(await x.w.tick(0)).toEqual({ kind: 'running', running: old })
+  expect(x.calls.shutdown).toBe(1)
+  for (let t = 5000; t < 30_000; t += 5000) await x.w.tick(t)
+  expect(x.calls.shutdown).toBe(1)
+  expect(await x.w.tick(30_000)).toEqual({ kind: 'running', running: old })
+  expect(x.calls.shutdown).toBe(2)
+  for (let t = 35_000; t < 150_000; t += 5000) await x.w.tick(t)
+  expect(x.calls.shutdown).toBe(2)
+  await x.w.tick(150_000)
+  expect(x.calls.shutdown).toBe(3)
+  for (let t = 155_000; t < 1_000_000; t += 5000) await x.w.tick(t)
+  expect(x.calls.shutdown).toBe(3)
+  expect(x.calls.start).toBe(0)
+})
+
+test('停止リクエストのあと、古いサーバーが STOP_WAIT_MS のうちに止まらなければ（timeout）、failed と同じくやり直す', async () => {
+  const old: Running = { ...R, version: '0.1.0' }
+  const x = replaceWatch({ found: () => old, shutdown: () => 'stopping' })
+  expect(await x.w.tick(0)).toEqual({ kind: 'replacing' })
+  expect(await x.w.tick(15_000)).toEqual({ kind: 'replacing' })
+  // 20秒たっても答えている。1回目の失敗。30秒後にやり直す。
+  expect(await x.w.tick(20_000)).toEqual({ kind: 'running', running: old })
+  expect(x.events.filter(e => e.kind === 'failed')).toEqual([])
+  await x.w.tick(45_000)
+  expect(x.calls.shutdown).toBe(1)
+  expect(await x.w.tick(50_000)).toEqual({ kind: 'replacing' })
+  expect(x.calls.shutdown).toBe(2)
+  // 2回目の失敗（70秒）。その120秒後（190秒）に3回目。
+  expect((await x.w.tick(70_000)).kind).toBe('running')
+  await x.w.tick(185_000)
+  expect(x.calls.shutdown).toBe(2)
+  expect(await x.w.tick(190_000)).toEqual({ kind: 'replacing' })
+  expect(x.calls.shutdown).toBe(3)
+  expect(await x.w.tick(210_000)).toEqual({ kind: 'running', running: old })
+  expect(x.events).toEqual([{ kind: 'stopping' }, { kind: 'stopping' }, { kind: 'stopping' }, { kind: 'failed', reason: 'timeout' }])
+  for (let t = 215_000; t < 1_000_000; t += 5000) await x.w.tick(t)
+  expect(x.calls.shutdown).toBe(3)
+})
+
+test('入れ替えに3回失敗したときだけ、onReplace に failed を1回渡す', async () => {
+  const old: Running = { ...R, version: '0.1.0' }
+  const x = replaceWatch({ found: () => old, shutdown: () => 'failed' })
+  await x.w.tick(0)
+  await x.w.tick(30_000)
+  expect(x.events).toEqual([])
+  await x.w.tick(150_000)
+  expect(x.events).toEqual([{ kind: 'failed', reason: 'failed' }])
+  for (let t = 155_000; t < 600_000; t += 5000) await x.w.tick(t)
+  expect(x.events).toEqual([{ kind: 'failed', reason: 'failed' }])
+  // 押しても（reset）、やり直しの数は戻さない。
+  x.w.reset()
+  await x.w.tick(600_000)
+  expect(x.calls.shutdown).toBe(3)
+
+  // やり直しのうちに入れ替われば、failed は出さない。
+  let cur: Running | null = old
+  const mineR: Running = { ...R, version: '0.2.0', pid: 2 }
+  let n = 0
+  const y = replaceWatch({ found: () => cur, shutdown: () => (++n < 2 ? 'failed' : 'stopping'), start: () => { cur = mineR; return { running: mineR, own: true } } })
+  await y.w.tick(0)
+  expect(await y.w.tick(30_000)).toEqual({ kind: 'replacing' })
+  cur = null
+  expect(await y.w.tick(35_000)).toEqual({ kind: 'running', running: mineR })
+  for (let t = 40_000; t < 600_000; t += 5000) await y.w.tick(t)
+  expect(y.events).toEqual([{ kind: 'stopping' }])
+  expect(y.calls.shutdown).toBe(2)
+})
+
+test('入れ替えが refused（相手のほうが新しい）なら、もうやり直さない', async () => {
+  const old: Running = { ...R, version: '0.1.0' }
+  const x = replaceWatch({ found: () => old, shutdown: () => 'refused' })
+  expect(await x.w.tick(0)).toEqual({ kind: 'running', running: old })
+  expect(x.events).toEqual([{ kind: 'failed', reason: 'refused' }])
+  for (let t = 5000; t < 1_000_000; t += 5000) await x.w.tick(t)
+  expect(x.calls.shutdown).toBe(1)
+  expect(x.events).toEqual([{ kind: 'failed', reason: 'refused' }])
+})
+
+test('停止リクエストの返事が届かず failed でも、サーバーが消えていれば、やり直しを待たずに自分のバージョンを起動し、failed は出さない', async () => {
+  // 古いサーバーが、204 を返しきらないうちに終了した（予備のタイマーが先に動いた）。
+  let cur: Running | null = { ...R, version: '0.1.0' }
+  const mineR: Running = { ...R, version: '0.2.0', pid: 2 }
+  const x = replaceWatch({
+    found: () => cur,
+    shutdown: () => { cur = null; return 'failed' },
+    start: () => { cur = mineR; return { running: mineR, own: true } },
+  })
+  await x.w.tick(0)
+  expect(x.calls.shutdown).toBe(1)
+  // 次の見張りの回（5秒後）で、いないのを見つけて起動する。30秒は待たない。
+  expect(await x.w.tick(5000)).toEqual({ kind: 'running', running: mineR })
+  expect(x.calls.start).toBe(1)
+  for (let t = 10_000; t < 600_000; t += 5000) await x.w.tick(t)
+  expect(x.events).toEqual([])
+  expect(x.calls.shutdown).toBe(1)
+  expect(x.calls.start).toBe(1)
 })

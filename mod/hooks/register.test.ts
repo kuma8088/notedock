@@ -1055,24 +1055,26 @@ test('動いているサーバーが同じか新しいバージョンなら、�
   }
 })
 
-test('refused・failed・20秒たっても止まらないときは、帯に理由を出し、そのサーバーを使い続け、二度と入れ替えを試さない', async () => {
-  const cases: [Opt, string][] = [
-    [{ shutdown: 'refused' }, 'サーバーに断られました'],
-    [{ shutdown: 'failed' }, '止める指示が届きませんでした'],
-    [{ stopAfterMs: null }, '20秒たっても止まりませんでした'],
+test('refused なら1回で、failed・20秒たっても止まらないときは3回やり直してから、帯に理由を出し、そのサーバーを使い続け、もう入れ替えを試さない', async () => {
+  const cases: [Opt, string, number][] = [
+    [{ shutdown: 'refused' }, 'サーバーに断られました', 1],
+    [{ shutdown: 'failed' }, '止める指示が届きませんでした', 3],
+    [{ stopAfterMs: null }, '20秒たっても止まりませんでした', 3],
   ]
-  for (const [opt, why] of cases) {
+  for (const [opt, why, tries] of cases) {
     const x = world({ opened: true, installed: true, running: true, serverVersion: OLD, ...opt })
     await x.start()
     if (opt.stopAfterMs === null) {
       await x.advance(15_000)
       expect(x.band()).toEqual({ kind: 'replacing' })
     }
-    await x.advance(30_000)
+    await x.advance(tries === 1 ? 30_000 : 4 * MIN)
     const b = x.band()
     expect(b?.kind).toBe('problem')
     expect(b?.text).toContain(why)
+    expect(b?.text).toContain(tries === 1 ? 'そのまま使っています' : 'アプリを終了して、開き直してください')
     expect(b?.button).toBe(true)
+    expect(count(x, 'requestShutdown')).toBe(tries)
     expect(count(x, 'startServer')).toBe(0)
     expect(x.srv.version).toBe(OLD)
     // そのサーバーを使い続ける。
@@ -1085,9 +1087,35 @@ test('refused・failed・20秒たっても止まらないときは、帯に理�
     await x.advance(10 * MIN)
     expect(x.band()).toEqual({ kind: 'button', today: false })
     await x.advance(10 * MIN)
-    expect(count(x, 'requestShutdown')).toBe(1)
+    expect(count(x, 'requestShutdown')).toBe(tries)
     expect(count(x, 'startServer')).toBe(0)
   }
+})
+
+test('failed（refused 以外）を受けたら、帯に「アプリを終了して、開き直してください」と出す', async () => {
+  const x = world({ opened: true, installed: true, running: true, serverVersion: OLD, shutdown: 'failed' })
+  await x.start()
+  // やり直しのあいだは、帯に失敗を出さない（そのサーバーを使う）。
+  await x.advance(MIN)
+  expect(count(x, 'requestShutdown')).toBe(2)
+  expect(x.band()).toEqual({ kind: 'button', today: false })
+  // 3回目も失敗したら、1回だけ出す。
+  await x.advance(2 * MIN)
+  expect(count(x, 'requestShutdown')).toBe(3)
+  expect(x.band()).toEqual({
+    kind: 'problem',
+    text: '古いバージョンのサーバーを入れ替えられませんでした。アプリを終了して、開き直してください（止める指示が届きませんでした）',
+    button: true,
+  })
+  // refused のときは、いまの文のまま。
+  const y = world({ opened: true, installed: true, running: true, serverVersion: OLD, shutdown: 'refused' })
+  await y.start()
+  await y.advance(6000)
+  expect(y.band()).toEqual({
+    kind: 'problem',
+    text: '古いバージョンのサーバーを入れ替えられなかったので、そのまま使っています（サーバーに断られました）',
+    button: true,
+  })
 })
 
 test('押したことのないフォルダーのチャットや、自分のバージョンのファイルがないチャットは、入れ替えない', async () => {
@@ -1192,10 +1220,13 @@ test('pid が変わっても古いバージョンが答え続けるなら、入�
   expect(x.band()).toEqual({ kind: 'replacing' })
   expect(count(x, 'startServer')).toBe(0)
   await x.advance(20_000)
+  // 1回目の失敗。帯は出さず、30秒後と、その120秒後にやり直す。
+  expect(x.band()).toEqual({ kind: 'button', today: false })
+  await x.advance(4 * MIN)
   expect(x.band()?.kind).toBe('problem')
   expect(x.band()?.text).toContain('20秒たっても止まりませんでした')
   expect(count(x, 'startServer')).toBe(0)
-  expect(count(x, 'requestShutdown')).toBe(1)
+  expect(count(x, 'requestShutdown')).toBe(3)
 })
 
 test('入れ替えに失敗したあと、ほかのチャットが入れ替えた新しいサーバーを見つけたら、失敗の帯を消してそれを使う', async () => {
@@ -1234,10 +1265,13 @@ test('Windowsで古いバージョンのフォルダーを消せなかったら�
   expect(count(y, 'removeOldVersions')).toBe(1)
   await y.advance(10_000)
   expect(count(y, 'removeOldVersions')).toBe(2)
-  await y.advance(3 * MIN)
+  // 止める指示を送り直すたび（20秒待って止まらなければ、30秒後と、その120秒後）に、そこから2分、10秒おきに消し直す。
+  // 3回目は190秒ごろなので、310秒ごろまで消し直す。
+  await y.advance(6 * MIN)
+  expect(count(y, 'requestShutdown')).toBe(3)
   const n = count(y, 'removeOldVersions')
-  expect(n).toBeGreaterThanOrEqual(12)
-  expect(n).toBeLessThanOrEqual(14)
+  expect(n).toBeGreaterThanOrEqual(30)
+  expect(n).toBeLessThanOrEqual(34)
   await y.advance(5 * MIN)
   expect(count(y, 'removeOldVersions')).toBe(n)
 })

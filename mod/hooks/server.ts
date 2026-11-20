@@ -13,6 +13,7 @@ export const ALREADY_RUNNING = 75 // もう動いている（ほかのチャッ�
 export const BAD_ARGS = 2 // Vaultの場所かポートの指定が使えない
 export const HANDED_OVER = 76 // 新しいバージョンに譲ったので起動しなかった（サーバーの HANDOVER_EXIT と同じ）
 export const HANDOVER_MS = 10 * 60_000 // handover.json を有効と見る時間（サーバーの HANDOVER_MS と同じ）
+export const HELD_RETRY_MS = 30_000 // 起動を控えた（held）あと、もう一度 start を呼ぶまでの間隔
 
 export type ServerInfo = { port: number; pid: number; root: string; token: string | null; ticket: string | null }
 // version は、応答の x-notedock-version。見出しのないサーバー（古い開発用のビルド）は null。
@@ -225,9 +226,13 @@ export function startServer($: Host, host: HostInfo, bin: string, root: string, 
 // now は、start が終わった時刻を取り直すのに使う（起動に時間がかかるため）。
 // after を渡すと、find・start が返ってこないときも一定時間で打ち切る（find は10秒、start は130秒）。
 // version（自分のバージョン）と shutdown を渡すと、古いバージョンのサーバーを入れ替える。
-//   入れ替えを試すのは1回だけ（reset でも戻さない）。自分が起動したサーバー（own）は、バージョンにかかわらず止めない。
+//   自分が起動したサーバー（own）は、バージョンにかかわらず止めない。
 //   止める指示が通ったら、最長20秒、見張りの回ごとに見る。答えなくなるか、自分と同じか新しいバージョンが答えたら、止まったとみなす。
 //   pid が変わっただけでは、止まったとみなさない（古いバージョンが起動し直したときにも変わるため）。
+//   返事がない・読めない（failed）か、20秒たっても止まらない（timeout）ときは、起動の失敗と同じ間隔（30秒・2分）でやり直し、
+//   3回で止める。onReplace の failed は、3回目の失敗で1回だけ出す。やり直しを待つあいだは、そのサーバーをそのまま使う。
+//   refused（相手のほうが新しい）は、やり直さない。やり直しの数は、起動の失敗とは別に数え、reset でも戻さない。
+// start が held（新しいバージョンに譲ったので、起動を控えた）を返したら、HELD_RETRY_MS のあいだは start を呼ばずに待つ（reset で戻す）。
 export function createWatcher(deps: {
   find: () => Promise<Running | null>
   start: () => Promise<Started>
@@ -248,7 +253,10 @@ export function createWatcher(deps: {
   let stopped: string | null = null
   let busy: 'find' | 'start' | null = null
   let last: WatchState = { kind: 'starting' }
-  let tried = false // 入れ替えを試した
+  let replaceOver = false // もう入れ替えを試さない（refused、または3回失敗した）
+  let replaceFailures = 0 // 入れ替えに失敗した回数（起動の失敗 failures とは別）
+  let replaceUntil = 0 // この時刻まで、入れ替えを試し直さない
+  let heldUntil = 0 // この時刻まで、start を呼ばない（held のあと）
   let stopSince: number | null = null // 止める指示が通った時刻（止まるのを待っているあいだ）
   let ownPid: number | null = null // このチャットが起動したサーバーの pid
   let legacySeen = false
@@ -301,6 +309,17 @@ export function createWatcher(deps: {
     return { kind: 'waiting', until }
   }
 
+  // 入れ替えの失敗を数える。3回目なら failed を知らせて、もう試さない。それ以外は、試し直す時刻を決める。
+  const replaceFail = (at: number, reason: 'failed' | 'timeout') => {
+    replaceFailures++
+    if (replaceFailures >= MAX_FAILURES) {
+      replaceOver = true
+      emit({ kind: 'failed', reason })
+      return
+    }
+    replaceUntil = at + BACKOFF_MS[replaceFailures - 1]!
+  }
+
   return {
     async tick(now) {
       if (busy === 'start') return { kind: 'starting' }
@@ -313,7 +332,7 @@ export function createWatcher(deps: {
           if (found && !notNewer(found)) {
             if (now - stopSince < STOP_WAIT_MS) return set({ kind: 'replacing' })
             stopSince = null
-            emit({ kind: 'failed', reason: 'timeout' })
+            replaceFail(now, 'timeout')
             return set({ kind: 'running', running: found })
           }
           stopSince = null // 止まった。答えなければ下で起動し、新しいバージョンが答えればそれを使う
@@ -321,8 +340,7 @@ export function createWatcher(deps: {
         if (found) {
           const replaceable = mine !== undefined && deps.shutdown !== undefined && found.pid !== ownPid
           const v = versionOf(found)
-          if (replaceable && !tried && v !== null && compareVersions(v, mine!) < 0) {
-            tried = true
+          if (replaceable && !replaceOver && now >= replaceUntil && v !== null && compareVersions(v, mine!) < 0) {
             let r: ShutdownResult
             try {
               r = await bound(deps.shutdown!(), SHUTDOWN_LIMIT_MS, 'failed' as ShutdownResult)
@@ -334,7 +352,11 @@ export function createWatcher(deps: {
               emit({ kind: 'stopping' })
               return set({ kind: 'replacing' })
             }
-            emit({ kind: 'failed', reason: r })
+            if (r === 'refused') {
+              replaceOver = true
+              emit({ kind: 'failed', reason: 'refused' })
+            } else replaceFail(await clock(now), 'failed')
+            // やり直しを待つあいだは、そのサーバーを使う。返事が届かないまま止まっていれば、次の回に見つからず、下で起動する。
             return set({ kind: 'running', running: found })
           }
           if (replaceable && v === null && !legacySeen) {
@@ -357,6 +379,7 @@ export function createWatcher(deps: {
           if (s.kind === 'stopped') return set(s)
         }
         if (now < until) return set({ kind: 'waiting', until })
+        if (now < heldUntil) return set({ kind: 'replacing' }) // 新しいバージョンを待っている。探すのは毎回続ける
         busy = 'start'
         let started: Started
         try {
@@ -365,7 +388,10 @@ export function createWatcher(deps: {
           started = { problem: failMessage(e instanceof Error && e.message ? e.message : '起動の処理が失敗しました') }
         }
         const after = await clock(now) // 起動にかかった時間のあとの時刻
-        if ('held' in started) return set({ kind: 'replacing' }) // 新しいバージョンを待つ。失敗には数えない
+        if ('held' in started) {
+          heldUntil = after + HELD_RETRY_MS
+          return set({ kind: 'replacing' }) // 新しいバージョンを待つ。失敗には数えない
+        }
         if ('running' in started) {
           runningSince = after
           // ほかのチャットのサーバーを使ったとき（75）は、「自分が起動したサーバーは止めない」に入れない。
@@ -382,6 +408,7 @@ export function createWatcher(deps: {
       until = 0
       runningSince = null
       stopped = null
+      heldUntil = 0
     },
   }
 }

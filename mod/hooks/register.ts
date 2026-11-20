@@ -52,7 +52,9 @@ const REPLACE_WHY: Record<'refused' | 'failed' | 'timeout', string> = {
   failed: '止める指示が届きませんでした',
   timeout: '20秒たっても止まりませんでした',
 }
-const replaceFailed = (why: string) => `古いバージョンのサーバーを入れ替えられなかったので、そのまま使っています（${why}）`
+// refused（相手のほうが新しい）は、そのまま使ってよい。failed・timeout は3回やり直しても入れ替えられなかったので、開き直してもらう。
+const replaceRefused = (why: string) => `古いバージョンのサーバーを入れ替えられなかったので、そのまま使っています（${why}）`
+const replaceFailed = (why: string) => `古いバージョンのサーバーを入れ替えられませんでした。アプリを終了して、開き直してください（${why}）`
 
 export type { ToolContext } from './tools'
 type Timer = { cancel: () => void }
@@ -528,7 +530,7 @@ export function createNotedock(opts: { version?: string } = {}) {
 
   // 入れ替えの知らせ。見張りの中から呼ばれるので、待たずに返る。
   function replaced(e: ReplaceEvent): void {
-    if (e.kind === 'failed') replaceNote = { text: replaceFailed(REPLACE_WHY[e.reason]), until: 0 }
+    if (e.kind === 'failed') replaceNote = { text: (e.reason === 'refused' ? replaceRefused : replaceFailed)(REPLACE_WHY[e.reason]), until: 0 }
     else if (e.kind === 'legacy') replaceNote = { text: MSG_LEGACY, until: 0 }
     else {
       // 止める指示が通った。止まるのを待たずに、古いバージョンのフォルダーを消す（消し直しの間隔も、ここから数え直す）。
