@@ -40,3 +40,33 @@ export async function markOpened($: Host, host: HostInfo, key: string, patch: Pa
     // 記録できなくても、開く処理は続ける。次に押したときにまた書く。
   }
 }
+
+// フォルダーの差し替えの記録：<保存フォルダー>/refresh.json。
+// 予備のチャット（~/.claude/spares/ で始まり、あとで選んだフォルダーへ移る）で、押したときにフォルダーを取り直して
+// 差し替えたことを残す。修正が効いたかを、あとから本人の手を借りずに確かめるため。最新の REFRESH_KEEP 件だけ残す。
+export type RefreshEntry = { at: number; from: string; to: string }
+export const REFRESH_KEEP = 20
+
+function refreshFile(host: HostInfo): string {
+  return joinPath(host.os, host.stateDir, 'refresh.json')
+}
+
+// .tmp-<乱数> に書いてから差し替える。書けなくても例外にしない（押したあとの処理は続ける）。
+export async function saveRefresh($: Host, host: HostInfo, entry: RefreshEntry): Promise<void> {
+  let list: RefreshEntry[] = []
+  try {
+    const j = JSON.parse(await $.fs.read(refreshFile(host)))
+    if (Array.isArray(j)) list = j.filter(e => e && typeof e.at === 'number' && typeof e.from === 'string' && typeof e.to === 'string')
+  } catch {
+    // 無い・壊れているときは、空から始める
+  }
+  list.push(entry)
+  list = list.slice(-REFRESH_KEEP)
+  const tmp = joinPath(host.os, host.stateDir, `.tmp-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`)
+  try {
+    await $.fs.write(tmp, JSON.stringify(list))
+    await runCmd($, moveCmd(host, tmp, refreshFile(host)))
+  } catch {
+    // 記録できなくても、差し替えと押したあとの処理は続ける
+  }
+}

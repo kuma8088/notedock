@@ -33,6 +33,8 @@ type Opt = {
   stopAfterMs?: number | null // stopping のあと、何ミリ秒で止まるか（null は止まらない）
   superseded?: boolean // 自分のファイルが無く、新しいバージョンのフォルダーがある
   removeFails?: number // removeOldVersions が、はじめの何回、消せないか
+  refreshFails?: boolean // refresh.json に書けない
+  rootDelayMs?: number // $.session.root() が答えるまでの時間
 }
 
 function world(o: Opt = {}) {
@@ -40,11 +42,12 @@ function world(o: Opt = {}) {
   const files = new Map<string, string>()
   const dirs = new Set<string>([ROOT, '/V', HOME])
   const log: string[] = []
+  const vaultRoots: string[] = [] // vaultIdOf に渡されたフォルダー
   const bands: any[] = []
   const toolSpecs: any[] = []
   const prompts: { text: string; rest: Record<string, unknown>; resolve: (r: any) => void; reject: (e: any) => void }[] = []
   const timers: { at: number; ms: number; fn: () => void; repeat: boolean; dead: boolean }[] = []
-  const counts = { env: 0, sleep: 0, stat: 0, spawn: 0 }
+  const counts = { env: 0, sleep: 0, stat: 0, spawn: 0, root: 0 }
   const mine = o.mine ?? MINE
   const srv = { running: !!o.running, ticket: 'KEY1', port: 8801, version: o.serverVersion === undefined ? mine : o.serverVersion, pid: 1 }
   const w = {
@@ -54,6 +57,9 @@ function world(o: Opt = {}) {
     surfaces: o.surfaces ?? ['desktop'],
     superseded: !!o.superseded,
     removeFails: o.removeFails ?? 0,
+    root: o.root ?? ROOT, // $.session.root() が返すフォルダー（あとから変えられる）
+    rootThrows: false,
+    rootDelayMs: 0,
   }
   const writeServer = () =>
     files.set(`${VDIR}/server.json`, JSON.stringify({ port: srv.port, pid: srv.pid, root: ROOT, token: TOKEN, ticket: srv.ticket }))
@@ -92,7 +98,13 @@ function world(o: Opt = {}) {
   const $: any = {
     env: { get: async (n: string) => { counts.env++; return n === 'HOME' ? HOME : undefined } },
     session: {
-      root: async () => o.root ?? ROOT,
+      root: async () => {
+        counts.root++
+        if (w.rootThrows) throw new Error('root を読めません')
+        const r = w.root
+        if (w.rootDelayMs) await new Promise<void>(res => add(w.rootDelayMs, () => res(), false))
+        return r
+      },
       surfaces: async () => w.surfaces,
       id: async () => 'sess-1',
     },
@@ -188,10 +200,11 @@ function world(o: Opt = {}) {
       }
       return r
     },
-    vaultIdOf: async () => {
+    vaultIdOf: async (_bin, root) => {
       log.push('vaultIdOf')
+      vaultRoots.push(root)
       if (o.vaultDelayMs) await new Promise<void>(r => add(o.vaultDelayMs!, () => r(), false))
-      return VID
+      return dirs.has(root) ? VID : null // 消えたフォルダーは調べられない
     },
     findRunning: async () => {
       // 見たときの状態を、答えるまでの時間のあとに返す（古い答えを作るため）。
@@ -215,11 +228,12 @@ function world(o: Opt = {}) {
     setBand: async b => { bands.push(b) },
     ...(o.realTools ? {} : { registerTools: async () => { log.push('registerTools') } }),
     claimChat: async dir => { log.push(`claimChat ${dir}`) },
+    ...(o.refreshFails ? { saveRefresh: async () => { throw new Error('書けません') } } : {}),
   })
   const nd = createNotedock({ version: mine })
 
   return {
-    $, nd, log, bands, toolSpecs, prompts, files, counts, srv, w, advance,
+    $, nd, log, bands, toolSpecs, prompts, files, dirs, vaultRoots, counts, srv, w, advance,
     band: () => (bands.length ? bands[bands.length - 1] : null),
     now: () => t,
     json: (p: string) => JSON.parse(files.get(p)!),
@@ -1055,24 +1069,26 @@ test('動いているサーバーが同じか新しいバージョンなら、�
   }
 })
 
-test('refused・failed・20秒たっても止まらないときは、帯に理由を出し、そのサーバーを使い続け、二度と入れ替えを試さない', async () => {
-  const cases: [Opt, string][] = [
-    [{ shutdown: 'refused' }, 'サーバーに断られました'],
-    [{ shutdown: 'failed' }, '止める指示が届きませんでした'],
-    [{ stopAfterMs: null }, '20秒たっても止まりませんでした'],
+test('refused なら1回で、failed・20秒たっても止まらないときは3回やり直してから、帯に理由を出し、そのサーバーを使い続け、もう入れ替えを試さない', async () => {
+  const cases: [Opt, string, number][] = [
+    [{ shutdown: 'refused' }, 'サーバーに断られました', 1],
+    [{ shutdown: 'failed' }, '止める指示が届きませんでした', 3],
+    [{ stopAfterMs: null }, '20秒たっても止まりませんでした', 3],
   ]
-  for (const [opt, why] of cases) {
+  for (const [opt, why, tries] of cases) {
     const x = world({ opened: true, installed: true, running: true, serverVersion: OLD, ...opt })
     await x.start()
     if (opt.stopAfterMs === null) {
       await x.advance(15_000)
       expect(x.band()).toEqual({ kind: 'replacing' })
     }
-    await x.advance(30_000)
+    await x.advance(tries === 1 ? 30_000 : 4 * MIN)
     const b = x.band()
     expect(b?.kind).toBe('problem')
     expect(b?.text).toContain(why)
+    expect(b?.text).toContain(tries === 1 ? 'そのまま使っています' : 'アプリを終了して、開き直してください')
     expect(b?.button).toBe(true)
+    expect(count(x, 'requestShutdown')).toBe(tries)
     expect(count(x, 'startServer')).toBe(0)
     expect(x.srv.version).toBe(OLD)
     // そのサーバーを使い続ける。
@@ -1082,12 +1098,57 @@ test('refused・failed・20秒たっても止まらないときは、帯に理�
     x.prompts[0].resolve({ text: x.prompts[0].text })
     await x.nd.turnStart({ text: x.prompts[0].text, turnId: 't1' })
     await x.nd.turnComplete({ turnId: 't1' })
+    // refused の帯は10分で消える。failed・timeout の帯は、このチャットのあいだ出し続ける。
     await x.advance(10 * MIN)
-    expect(x.band()).toEqual({ kind: 'button', today: false })
+    if (tries === 1) expect(x.band()).toEqual({ kind: 'button', today: false })
+    else expect(x.band()?.text).toContain('アプリを終了して、開き直してください')
     await x.advance(10 * MIN)
-    expect(count(x, 'requestShutdown')).toBe(1)
+    expect(count(x, 'requestShutdown')).toBe(tries)
     expect(count(x, 'startServer')).toBe(0)
   }
+})
+
+test('入れ替えに3回失敗した帯（アプリを終了して、開き直してください）は、10分を過ぎても出し続ける', async () => {
+  const x = world({ opened: true, installed: true, running: true, serverVersion: OLD, stopAfterMs: null })
+  await x.start()
+  await x.advance(4 * MIN)
+  const failed = {
+    kind: 'problem',
+    text: '古いバージョンのサーバーを入れ替えられませんでした。アプリを終了して、開き直してください（20秒たっても止まりませんでした）',
+    button: true,
+  }
+  expect(x.band()).toEqual(failed)
+  await x.advance(11 * MIN)
+  expect(x.band()).toEqual(failed)
+  await x.advance(60 * MIN)
+  expect(x.band()).toEqual(failed)
+  expect(count(x, 'requestShutdown')).toBe(3)
+})
+
+test('failed（refused 以外）を受けたら、帯に「アプリを終了して、開き直してください」と出す', async () => {
+  const x = world({ opened: true, installed: true, running: true, serverVersion: OLD, shutdown: 'failed' })
+  await x.start()
+  // やり直しのあいだは、帯に失敗を出さない（そのサーバーを使う）。
+  await x.advance(MIN)
+  expect(count(x, 'requestShutdown')).toBe(2)
+  expect(x.band()).toEqual({ kind: 'button', today: false })
+  // 3回目も失敗したら、1回だけ出す。
+  await x.advance(2 * MIN)
+  expect(count(x, 'requestShutdown')).toBe(3)
+  expect(x.band()).toEqual({
+    kind: 'problem',
+    text: '古いバージョンのサーバーを入れ替えられませんでした。アプリを終了して、開き直してください（止める指示が届きませんでした）',
+    button: true,
+  })
+  // refused のときは、いまの文のまま。
+  const y = world({ opened: true, installed: true, running: true, serverVersion: OLD, shutdown: 'refused' })
+  await y.start()
+  await y.advance(6000)
+  expect(y.band()).toEqual({
+    kind: 'problem',
+    text: '古いバージョンのサーバーを入れ替えられなかったので、そのまま使っています（サーバーに断られました）',
+    button: true,
+  })
 })
 
 test('押したことのないフォルダーのチャットや、自分のバージョンのファイルがないチャットは、入れ替えない', async () => {
@@ -1192,10 +1253,13 @@ test('pid が変わっても古いバージョンが答え続けるなら、入�
   expect(x.band()).toEqual({ kind: 'replacing' })
   expect(count(x, 'startServer')).toBe(0)
   await x.advance(20_000)
+  // 1回目の失敗。帯は出さず、30秒後と、その120秒後にやり直す。
+  expect(x.band()).toEqual({ kind: 'button', today: false })
+  await x.advance(4 * MIN)
   expect(x.band()?.kind).toBe('problem')
   expect(x.band()?.text).toContain('20秒たっても止まりませんでした')
   expect(count(x, 'startServer')).toBe(0)
-  expect(count(x, 'requestShutdown')).toBe(1)
+  expect(count(x, 'requestShutdown')).toBe(3)
 })
 
 test('入れ替えに失敗したあと、ほかのチャットが入れ替えた新しいサーバーを見つけたら、失敗の帯を消してそれを使う', async () => {
@@ -1234,7 +1298,9 @@ test('Windowsで古いバージョンのフォルダーを消せなかったら�
   expect(count(y, 'removeOldVersions')).toBe(1)
   await y.advance(10_000)
   expect(count(y, 'removeOldVersions')).toBe(2)
-  await y.advance(3 * MIN)
+  // 止める指示を送り直しても（20秒待って止まらなければ、30秒後と、その120秒後）、10秒おきに消し直すのは最初の2分だけ。
+  await y.advance(6 * MIN)
+  expect(count(y, 'requestShutdown')).toBe(3)
   const n = count(y, 'removeOldVersions')
   expect(n).toBeGreaterThanOrEqual(12)
   expect(n).toBeLessThanOrEqual(14)
@@ -1289,4 +1355,140 @@ test('自分のバージョンのサーバーが動いているときに古い�
   const done = count(x, 'removeOldVersions')
   await x.advance(60 * MIN)
   expect(count(x, 'removeOldVersions')).toBe(done)
+})
+
+// タスク6A：予備のチャット（~/.claude/spares/ で始まり、あとで選んだフォルダーへ移る）
+const SPARE = `${HOME}/.claude/spares/spare-AbCdEf`
+
+function spareWorld(o: Opt = {}) {
+  const x = world({ root: SPARE, ...o })
+  x.dirs.add(SPARE)
+  return x
+}
+
+// 予備のチャットが、選んだフォルダーへ移ったことにする（予備のフォルダーは消える）。
+function claim(x: ReturnType<typeof world>, to = ROOT) {
+  x.w.root = to
+  x.dirs.delete(SPARE)
+}
+
+test('チャットの開始時と押したときでフォルダーが違えば、押したときのフォルダーで開く', async () => {
+  const x = spareWorld()
+  await x.start()
+  claim(x)
+  await pressAndSend(x)
+  expect(Object.keys(x.json(`${STATE}/opened.json`))).toEqual([ROOT])
+  expect(x.prompts.length).toBe(1)
+  expect(x.band()?.kind).not.toBe('problem')
+})
+
+test('押したとき、refresh.json に差し替えの記録を1件書き足し、20件を超えたら古いものから消す', async () => {
+  const x = spareWorld()
+  const old = Array.from({ length: 20 }, (_, i) => ({ at: i, from: `/old/${i}`, to: ROOT }))
+  x.files.set(`${STATE}/refresh.json`, JSON.stringify(old))
+  await x.start()
+  claim(x)
+  await pressAndSend(x)
+  const list = x.json(`${STATE}/refresh.json`)
+  expect(list.length).toBe(20)
+  expect(list[0].from).toBe('/old/1')
+  expect(list[19].from).toBe(SPARE)
+  expect(list[19].to).toBe(ROOT)
+  expect(typeof list[19].at).toBe('number')
+  expect([...x.files.keys()].some(k => k.includes('.tmp-'))).toBe(false)
+})
+
+test('refresh.json に書けなくても、差し替えは保ち、押したあとの処理は続く', async () => {
+  const x = spareWorld({ refreshFails: true })
+  await x.start()
+  claim(x)
+  await pressAndSend(x)
+  expect(Object.keys(x.json(`${STATE}/opened.json`))).toEqual([ROOT])
+  expect(x.prompts.length).toBe(1)
+})
+
+test('取得し直しても予備のフォルダーのままで、そのフォルダーが消えていても、前の判定結果で進み、0.1.0 と同じ帯になる', async () => {
+  const x = spareWorld()
+  await x.start()
+  x.dirs.delete(SPARE) // 予備のフォルダーだけが消え、root は予備のまま
+  await x.nd.press(false)
+  await x.advance(5_000)
+  expect(x.band()?.kind).toBe('problem')
+  expect(x.band()?.text).toContain('サーバーのファイルからVaultを調べられませんでした')
+  expect(x.files.has(`${STATE}/refresh.json`)).toBe(false)
+  // busy が戻り、もう一度押せる
+  await x.nd.press(false)
+  await x.advance(0)
+  expect(x.bands.some(b => b?.kind === 'preparing')).toBe(true)
+  expect(x.bands.filter(b => b?.kind === 'preparing').length).toBe(2)
+})
+
+test('取得し直しで例外が出ても、前の判定結果で進む', async () => {
+  const x = world()
+  await x.start()
+  x.w.rootThrows = true
+  await pressAndSend(x)
+  expect(Object.keys(x.json(`${STATE}/opened.json`))).toEqual([ROOT])
+  expect(x.prompts.length).toBe(1)
+})
+
+test('一度開いたあとにフォルダーが変わっても、最初のフォルダーを使い続ける', async () => {
+  const x = world()
+  await x.start()
+  await pressAndSend(x)
+  x.dirs.add('/V/other')
+  x.w.root = '/V/other'
+  await x.nd.note('Home.md')
+  expect(x.files.has(`${STATE}/refresh.json`)).toBe(false)
+})
+
+test('/note でも、まだ開いていなければフォルダーを取得し直す', async () => {
+  const x = spareWorld({ installed: true })
+  await x.start()
+  claim(x)
+  await x.nd.note('Home.md')
+  const list = x.json(`${STATE}/refresh.json`)
+  expect(list[list.length - 1].to).toBe(ROOT)
+})
+
+test('refreshBase が同時に呼ばれても、io.root() は1回だけ呼ばれる', async () => {
+  const x = spareWorld({ installed: true })
+  await x.start()
+  claim(x)
+  const before = x.counts.root
+  await Promise.all([x.nd.note('Home.md'), x.nd.note('Home.md')])
+  expect(x.counts.root - before).toBe(1)
+})
+
+test('/note の取り直しの最中に押しても、押した側でもう一度取り直して差し替える', async () => {
+  const x = spareWorld()
+  await x.start()
+  claim(x)
+  x.w.rootDelayMs = 2_000
+  const note = x.nd.note('Home.md') // /note は busy でないときに取り直し始める
+  await x.advance(100) // /note が root() の答えを待っているところまで進める
+  await x.nd.press(false) // そのあいだに押す（busy になる）
+  for (let i = 0; i < 20 && x.prompts.length === 0; i++) await x.advance(500)
+  await note
+  expect(Object.keys(x.json(`${STATE}/opened.json`))).toEqual([ROOT])
+  expect(x.prompts.length).toBe(1)
+})
+
+test('前の判定が ok でなければ（ホームなど）、取り直しても差し替えない', async () => {
+  const x = world({ root: HOME })
+  await x.start()
+  x.w.root = ROOT
+  await x.nd.note('Home.md')
+  expect(x.files.has(`${STATE}/refresh.json`)).toBe(false)
+  expect(x.band()).toBe(null)
+})
+
+test('差し替えたら、古いフォルダーで調べた Vault の ID を捨て、新しいフォルダーで調べ直す', async () => {
+  const x = spareWorld({ installed: true })
+  await x.start()
+  await x.nd.note('Home.md') // 予備のフォルダーで ID を調べる
+  expect(x.vaultRoots[x.vaultRoots.length - 1]).toBe(SPARE)
+  claim(x)
+  await x.nd.note('Home.md')
+  expect(x.vaultRoots[x.vaultRoots.length - 1]).toBe(ROOT)
 })

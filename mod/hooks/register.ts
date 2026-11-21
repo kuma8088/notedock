@@ -8,7 +8,7 @@ import { chatFile, claimChat, describeNote, hideKeys, isSentText, MAX_TEXT, note
 import { summarizeTranscript } from './chat-log'
 import { compareVersions, ensureBinary, installedBinary, onlyNewerInstalled, removeOldVersions } from './install'
 import { editorUrl, openPrompt, retryPrompt } from './open'
-import { markOpened, readOpened, type OpenedEntry } from './opened'
+import { markOpened, readOpened, saveRefresh, type OpenedEntry, type RefreshEntry } from './opened'
 import { baseName, canonicalRoot, hostInfo, joinPath, makeStateDirCmd, moveCmd, PRODUCT, refusedReason, rootKey, runCmd, type HostInfo, type Os } from './platform'
 import { VERSION } from './release'
 import {
@@ -52,7 +52,9 @@ const REPLACE_WHY: Record<'refused' | 'failed' | 'timeout', string> = {
   failed: '止める指示が届きませんでした',
   timeout: '20秒たっても止まりませんでした',
 }
-const replaceFailed = (why: string) => `古いバージョンのサーバーを入れ替えられなかったので、そのまま使っています（${why}）`
+// refused（相手のほうが新しい）は、そのまま使ってよい。failed・timeout は3回やり直しても入れ替えられなかったので、開き直してもらう。
+const replaceRefused = (why: string) => `古いバージョンのサーバーを入れ替えられなかったので、そのまま使っています（${why}）`
+const replaceFailed = (why: string) => `古いバージョンのサーバーを入れ替えられませんでした。アプリを終了して、開き直してください（${why}）`
 
 export type { ToolContext } from './tools'
 type Timer = { cancel: () => void }
@@ -76,6 +78,7 @@ export type Io = {
   makeStateDir: (host: HostInfo) => Promise<number>
   readOpened: (host: HostInfo) => Promise<Record<string, OpenedEntry>>
   markOpened: (host: HostInfo, key: string, patch: Partial<OpenedEntry>) => Promise<void>
+  saveRefresh: (host: HostInfo, entry: RefreshEntry) => Promise<void> // フォルダーを差し替えた記録（refresh.json）
   installedBinary: (host: HostInfo) => Promise<string | { problem: string } | null>
   ensureBinary: (host: HostInfo) => Promise<{ bin: string } | { problem: string }>
   removeOldVersions: (host: HostInfo) => Promise<boolean | void> // false＝消せないフォルダーがあった
@@ -120,6 +123,7 @@ export function ioFor($: Host, over: Partial<Io> = {}): Io {
     makeStateDir: async host => (await runCmd($, makeStateDirCmd(host))).exitCode,
     readOpened: host => readOpened($, host),
     markOpened: (host, key, patch) => markOpened($, host, key, patch),
+    saveRefresh: (host, entry) => saveRefresh($, host, entry),
     installedBinary: host => installedBinary($, host),
     ensureBinary: host => ensureBinary($, host, () => {}),
     removeOldVersions: host => removeOldVersions($, host),
@@ -236,7 +240,9 @@ export function createNotedock(opts: { version?: string } = {}) {
   let stopWindowUntil = 0 // 止める指示が通ったあと、この時刻までは、自分のバージョンが動いていなくても消し直す
   let mineRunning = false // 最後に見張りが見たのが、自分のバージョンのサーバー
   let lastClean = 0
-  let replaceNote: { text: string; until: number } | null = null // 入れ替えの案内（10分だけ）。until 0 は、次に描くときに決める
+  // 入れ替えの案内。until 0 は、次に描くときに10分後に決める。Infinity は、このチャットのあいだ出し続ける（3回やり直しても入れ替えられなかったとき）
+  let replaceNote: { text: string; until: number } | null = null
+  let stopSeen = false // 止める指示が通ったことがある（2回目以降は、消し直しを10秒おきに数え直さない）
   let superseded = false // 新しいバージョンのModが入っている（自分のファイルが無い）。新しいチャットを案内する
   // チャットが始まったときから、自分のファイルが無く新しいバージョンのフォルダーがあった。新しいバージョンを入れたあとで
   // 古いModに戻した（作業場所の開発用のModも同じ）とみなし、このチャットでは案内を出さず、いつもどおりダウンロードして使う。
@@ -328,20 +334,61 @@ export function createNotedock(opts: { version?: string } = {}) {
   }
 
   function getBase(): Promise<Base> {
-    basePromise ??= (async (): Promise<Base> => {
-      const host = await io.hostInfo()
-      if ('problem' in host) return { kind: 'problem', text: host.problem }
-      const raw = String((await io.root()) ?? '')
-      // $.fs はネットワーク上の場所を断るので、canonicalRoot より先に見る。
-      if (raw.startsWith('\\\\') || raw.startsWith('//')) return { kind: 'problem', text: MSG_NETWORK }
-      const root = await io.canonicalRoot(raw)
-      if (!root) return { kind: 'skip' }
-      const why = refusedReason(root, host)
-      if (why === 'network') return { kind: 'problem', text: MSG_NETWORK }
-      if (why === 'broad') return { kind: 'skip' }
-      return { kind: 'ok', host, root, key: rootKey(root, host.os) }
-    })().then(b => (base = b))
+    basePromise ??= computeBase().then(b => (base = b))
     return basePromise
+  }
+
+  // チャットのフォルダーを読み、NoteDock を使えるかを判定する。
+  async function computeBase(): Promise<Base> {
+    const host = await io.hostInfo()
+    if ('problem' in host) return { kind: 'problem', text: host.problem }
+    const raw = String((await io.root()) ?? '')
+    // $.fs はネットワーク上の場所を断るので、canonicalRoot より先に見る。
+    if (raw.startsWith('\\\\') || raw.startsWith('//')) return { kind: 'problem', text: MSG_NETWORK }
+    const root = await io.canonicalRoot(raw)
+    if (!root) return { kind: 'skip' }
+    const why = refusedReason(root, host)
+    if (why === 'network') return { kind: 'problem', text: MSG_NETWORK }
+    if (why === 'broad') return { kind: 'skip' }
+    return { kind: 'ok', host, root, key: rootKey(root, host.os) }
+  }
+
+  // 予備のチャット（~/.claude/spares/ で始まり、メッセージを送ると選んだフォルダーへ移る）では、
+  // 開始時に読んだフォルダーが予備のフォルダーのままになる。押したときと /note のときに取り直す。
+  // 差し替えるのは、まだ開いていないときに、新しい判定が ok で、前と違うフォルダーのときだけ。
+  // それ以外（消えたフォルダーで skip になった、読めない、同じフォルダー）は、前の判定のまま進む（0.1.0 と同じ動き）。
+  let refreshP: Promise<void> | null = null
+  function refreshBase(fromPress: boolean): Promise<void> {
+    // 押した側は、/note の取り直しが動いていればそれを待ってから、自分でもう一度取り直す
+    // （/note の側は、押したあと busy になると差し替えずに終わるため）。
+    if (fromPress) return (refreshP ?? Promise.resolve()).then(() => refreshOnce(true))
+    refreshP ??= refreshOnce(false).finally(() => (refreshP = null))
+    return refreshP
+  }
+
+  async function refreshOnce(fromPress: boolean): Promise<void> {
+    const opening = () => active || activateP !== null || (!fromPress && busy)
+    try {
+      const before = await getBase()
+      if (opening()) return
+      const next = await computeBase()
+      // 前の判定が ok でないとき（ホームなど）は、帯も見回りも始まっていないので差し替えない。
+      if (opening() || before.kind !== 'ok' || next.kind !== 'ok' || before.key === next.key) return
+      base = next
+      basePromise = Promise.resolve(next)
+      vaultId = null
+      toolCtx = null
+      chatDir = null
+      chatInitP = null
+      needSeen = 0
+      try {
+        await io.saveRefresh(next.host, { at: await now(), from: before.root, to: next.root })
+      } catch {
+        // 記録できなくても、差し替えは保ち、押したあとの処理も止めない
+      }
+    } catch {
+      // 読めなければ、前の判定のまま進む
+    }
   }
 
   async function hasScreen(): Promise<boolean> {
@@ -528,10 +575,21 @@ export function createNotedock(opts: { version?: string } = {}) {
 
   // 入れ替えの知らせ。見張りの中から呼ばれるので、待たずに返る。
   function replaced(e: ReplaceEvent): void {
-    if (e.kind === 'failed') replaceNote = { text: replaceFailed(REPLACE_WHY[e.reason]), until: 0 }
-    else if (e.kind === 'legacy') replaceNote = { text: MSG_LEGACY, until: 0 }
-    else {
+    // refused の帯は10分で消す。failed・timeout は、古いサーバーが止まりかけのまま残ると保存が断られ続けるので、出し続ける。
+    if (e.kind === 'failed') {
+      replaceNote = e.reason === 'refused'
+        ? { text: replaceRefused(REPLACE_WHY[e.reason]), until: 0 }
+        : { text: replaceFailed(REPLACE_WHY[e.reason]), until: Infinity }
+    } else if (e.kind === 'legacy') replaceNote = { text: MSG_LEGACY, until: 0 }
+    else if (stopSeen) {
+      // やり直しで、もう一度止める指示が通った。自分のバージョンが動いていなくても消し直せる時間だけを延ばす。
+      // 10秒おきに消し直すのは、最初に通ったときから2分だけ（cleanSince は数え直さない）。
+      void (async () => {
+        stopWindowUntil = (await now()) + CLEAN_RETRY_LIMIT_MS
+      })().catch(() => {})
+    } else {
       // 止める指示が通った。止まるのを待たずに、古いバージョンのフォルダーを消す（消し直しの間隔も、ここから数え直す）。
+      stopSeen = true
       cleaned = false
       void (async () => {
         const t = await now()
@@ -678,6 +736,7 @@ export function createNotedock(opts: { version?: string } = {}) {
 
   // 押したあとの処理。ボタンのフックの外（裏の処理）で動く。
   async function pressWork(pressedToday: boolean, r: number): Promise<void> {
+    await refreshBase(true)
     if (base?.kind !== 'ok') return fail('このフォルダーでは使えません', r)
     const host = base.host
     try {
@@ -1089,13 +1148,17 @@ export function createNotedock(opts: { version?: string } = {}) {
 
   async function noteText(args: string): Promise<{ text: string }> {
     if (!io) return { text: MSG_PRESS }
+    await refreshBase(false)
     const b = await getBase()
     if (b.kind === 'skip') return { text: 'このフォルダーでは NoteDock を使えません。' }
     if (b.kind === 'problem') return { text: b.text }
     if (!vaultId) {
       // ダウンロードはしない。置いてあるファイルだけを使う。
       const have = await io.installedBinary(b.host)
-      if (typeof have === 'string') vaultId = await io.vaultIdOf(have, b.root)
+      if (typeof have === 'string') {
+        const id = await io.vaultIdOf(have, b.root)
+        if (base === b) vaultId = id // 待つあいだに押した側が差し替えていれば、古いフォルダーの ID は使わない
+      }
     }
     if (!vaultId) return { text: superseded ? `${MSG_NEWER}。` : MSG_PRESS }
     // 画面のあるチャットだけが話し相手になる。
