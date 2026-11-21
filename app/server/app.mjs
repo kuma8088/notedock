@@ -48,6 +48,8 @@ const MIME = {
 }
 
 const NEED_TICKET_GAP_MS = 2000
+// 止める指示に 204 を送ったあと、finish も close も来ないときに、止める処理へ進むまでの時間（AIの判断）。
+export const SHUTDOWN_FALLBACK_MS = 1_000
 
 function send(res, status, body, type = 'application/json; charset=utf-8') {
   res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store' })
@@ -274,16 +276,23 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
   }
 
   // 止める指示。合言葉・x-note-editor: 1（checkRequest）・送った側のほうが新しいバージョン、がそろったときだけ受け付ける。
-  // 204を送り終えてから、処理中の保存を待ち、接続を閉じ、onShutdown（handover.json・ロック・終了）へ進む。
+  // 204を送ってから、処理中の保存を待ち、接続を閉じ、onShutdown（handover.json・ロック・終了）へ進む。
+  // 2回目以降の指示は、handle の入口で 503 になるので、ここへは来ない。
   function shutdown(req, res) {
     if (noToken) return send(res, 403, { error: 'no-token' })
     const from = req.headers[VERSION_HEADER]
     if (typeof from !== 'string' || !VERSION_RE.test(from)) return send(res, 400, { error: 'version' })
     if (compareVersions(from, SERVER_VERSION) <= 0) return send(res, 409, { error: 'not newer' })
-    if (shuttingDown) return send(res, 204, '')
     shuttingDown = true
     inflight.delete(res)
-    res.once('finish', async () => {
+    let started = false
+    let fallback = null
+    // 204 を送り終えた（finish）、接続が先に切れた（close）、どちらも来ない（予備のタイマー）、のいちばん早いもので1回だけ動く。
+    // finish だけを待つと、送り終える前に接続が壊れたとき、いつまでも止まらない。
+    const stop = async () => {
+      if (started) return
+      started = true
+      clearTimeout(fallback)
       // 受け付けていた保存を書き終える。30秒は、処理中の要求を待つ上限（AIの判断。終わらない要求があっても止まれるように）。
       const deadline = Date.now() + 30_000
       while (inflight.size && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
@@ -295,7 +304,11 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
         console.error(`止める処理に失敗しました: ${error.message}`)
         process.exit(1)
       }
-    })
+    }
+    fallback = setTimeout(stop, SHUTDOWN_FALLBACK_MS)
+    fallback.unref?.()
+    res.once('finish', stop)
+    res.once('close', stop)
     return send(res, 204, '')
   }
 
