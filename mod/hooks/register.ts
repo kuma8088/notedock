@@ -8,7 +8,7 @@ import { chatFile, claimChat, describeNote, hideKeys, isSentText, MAX_TEXT, note
 import { summarizeTranscript } from './chat-log'
 import { compareVersions, ensureBinary, installedBinary, onlyNewerInstalled, removeOldVersions } from './install'
 import { editorUrl, openPrompt, retryPrompt } from './open'
-import { markOpened, readOpened, type OpenedEntry } from './opened'
+import { markOpened, readOpened, saveRefresh, type OpenedEntry, type RefreshEntry } from './opened'
 import { baseName, canonicalRoot, hostInfo, joinPath, makeStateDirCmd, moveCmd, PRODUCT, refusedReason, rootKey, runCmd, type HostInfo, type Os } from './platform'
 import { VERSION } from './release'
 import {
@@ -78,6 +78,7 @@ export type Io = {
   makeStateDir: (host: HostInfo) => Promise<number>
   readOpened: (host: HostInfo) => Promise<Record<string, OpenedEntry>>
   markOpened: (host: HostInfo, key: string, patch: Partial<OpenedEntry>) => Promise<void>
+  saveRefresh: (host: HostInfo, entry: RefreshEntry) => Promise<void> // フォルダーを差し替えた記録（refresh.json）
   installedBinary: (host: HostInfo) => Promise<string | { problem: string } | null>
   ensureBinary: (host: HostInfo) => Promise<{ bin: string } | { problem: string }>
   removeOldVersions: (host: HostInfo) => Promise<boolean | void> // false＝消せないフォルダーがあった
@@ -122,6 +123,7 @@ export function ioFor($: Host, over: Partial<Io> = {}): Io {
     makeStateDir: async host => (await runCmd($, makeStateDirCmd(host))).exitCode,
     readOpened: host => readOpened($, host),
     markOpened: (host, key, patch) => markOpened($, host, key, patch),
+    saveRefresh: (host, entry) => saveRefresh($, host, entry),
     installedBinary: host => installedBinary($, host),
     ensureBinary: host => ensureBinary($, host, () => {}),
     removeOldVersions: host => removeOldVersions($, host),
@@ -332,20 +334,61 @@ export function createNotedock(opts: { version?: string } = {}) {
   }
 
   function getBase(): Promise<Base> {
-    basePromise ??= (async (): Promise<Base> => {
-      const host = await io.hostInfo()
-      if ('problem' in host) return { kind: 'problem', text: host.problem }
-      const raw = String((await io.root()) ?? '')
-      // $.fs はネットワーク上の場所を断るので、canonicalRoot より先に見る。
-      if (raw.startsWith('\\\\') || raw.startsWith('//')) return { kind: 'problem', text: MSG_NETWORK }
-      const root = await io.canonicalRoot(raw)
-      if (!root) return { kind: 'skip' }
-      const why = refusedReason(root, host)
-      if (why === 'network') return { kind: 'problem', text: MSG_NETWORK }
-      if (why === 'broad') return { kind: 'skip' }
-      return { kind: 'ok', host, root, key: rootKey(root, host.os) }
-    })().then(b => (base = b))
+    basePromise ??= computeBase().then(b => (base = b))
     return basePromise
+  }
+
+  // チャットのフォルダーを読み、NoteDock を使えるかを判定する。
+  async function computeBase(): Promise<Base> {
+    const host = await io.hostInfo()
+    if ('problem' in host) return { kind: 'problem', text: host.problem }
+    const raw = String((await io.root()) ?? '')
+    // $.fs はネットワーク上の場所を断るので、canonicalRoot より先に見る。
+    if (raw.startsWith('\\\\') || raw.startsWith('//')) return { kind: 'problem', text: MSG_NETWORK }
+    const root = await io.canonicalRoot(raw)
+    if (!root) return { kind: 'skip' }
+    const why = refusedReason(root, host)
+    if (why === 'network') return { kind: 'problem', text: MSG_NETWORK }
+    if (why === 'broad') return { kind: 'skip' }
+    return { kind: 'ok', host, root, key: rootKey(root, host.os) }
+  }
+
+  // 予備のチャット（~/.claude/spares/ で始まり、メッセージを送ると選んだフォルダーへ移る）では、
+  // 開始時に読んだフォルダーが予備のフォルダーのままになる。押したときと /note のときに取り直す。
+  // 差し替えるのは、まだ開いていないときに、新しい判定が ok で、前と違うフォルダーのときだけ。
+  // それ以外（消えたフォルダーで skip になった、読めない、同じフォルダー）は、前の判定のまま進む（0.1.0 と同じ動き）。
+  let refreshP: Promise<void> | null = null
+  function refreshBase(fromPress: boolean): Promise<void> {
+    // 押した側は、/note の取り直しが動いていればそれを待ってから、自分でもう一度取り直す
+    // （/note の側は、押したあと busy になると差し替えずに終わるため）。
+    if (fromPress) return (refreshP ?? Promise.resolve()).then(() => refreshOnce(true))
+    refreshP ??= refreshOnce(false).finally(() => (refreshP = null))
+    return refreshP
+  }
+
+  async function refreshOnce(fromPress: boolean): Promise<void> {
+    const opening = () => active || activateP !== null || (!fromPress && busy)
+    try {
+      const before = await getBase()
+      if (opening()) return
+      const next = await computeBase()
+      // 前の判定が ok でないとき（ホームなど）は、帯も見回りも始まっていないので差し替えない。
+      if (opening() || before.kind !== 'ok' || next.kind !== 'ok' || before.key === next.key) return
+      base = next
+      basePromise = Promise.resolve(next)
+      vaultId = null
+      toolCtx = null
+      chatDir = null
+      chatInitP = null
+      needSeen = 0
+      try {
+        await io.saveRefresh(next.host, { at: await now(), from: before.root, to: next.root })
+      } catch {
+        // 記録できなくても、差し替えは保ち、押したあとの処理も止めない
+      }
+    } catch {
+      // 読めなければ、前の判定のまま進む
+    }
   }
 
   async function hasScreen(): Promise<boolean> {
@@ -693,6 +736,7 @@ export function createNotedock(opts: { version?: string } = {}) {
 
   // 押したあとの処理。ボタンのフックの外（裏の処理）で動く。
   async function pressWork(pressedToday: boolean, r: number): Promise<void> {
+    await refreshBase(true)
     if (base?.kind !== 'ok') return fail('このフォルダーでは使えません', r)
     const host = base.host
     try {
@@ -1104,13 +1148,17 @@ export function createNotedock(opts: { version?: string } = {}) {
 
   async function noteText(args: string): Promise<{ text: string }> {
     if (!io) return { text: MSG_PRESS }
+    await refreshBase(false)
     const b = await getBase()
     if (b.kind === 'skip') return { text: 'このフォルダーでは NoteDock を使えません。' }
     if (b.kind === 'problem') return { text: b.text }
     if (!vaultId) {
       // ダウンロードはしない。置いてあるファイルだけを使う。
       const have = await io.installedBinary(b.host)
-      if (typeof have === 'string') vaultId = await io.vaultIdOf(have, b.root)
+      if (typeof have === 'string') {
+        const id = await io.vaultIdOf(have, b.root)
+        if (base === b) vaultId = id // 待つあいだに押した側が差し替えていれば、古いフォルダーの ID は使わない
+      }
     }
     if (!vaultId) return { text: superseded ? `${MSG_NEWER}。` : MSG_PRESS }
     // 画面のあるチャットだけが話し相手になる。
