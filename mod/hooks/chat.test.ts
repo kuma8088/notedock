@@ -940,7 +940,7 @@ test('窓のチャット欄：選んでいる行を @ で指して添えたら�
   x.files.set(`${x.ROOT}/memo.md`, Array.from({ length: 20 }, (_, i) => `行${i + 1}`).join('\n'))
   x.editor({ path: 'memo.md', root: x.ROOT, dirty: true, selection: '行12\n行13', lines: { from: 12, to: 13 }, updatedAt: x.now(), sendChat: { text: '@memo.md#L12-13 を直して', at: x.now() } })
   await x.advance(1500)
-  const text = x.sends[0].text
+  const text = x.sends[0]?.text ?? ''
   expect((text.match(/行12/g) ?? []).length).toBe(1)
   expect(text).toContain('（エディターで開いているノート: memo.md。まだ保存していない変更があります）')
   expect(text).not.toContain('選んでいる文字')

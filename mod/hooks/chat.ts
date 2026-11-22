@@ -262,8 +262,9 @@ export function noteRefsIn(text: string, dropTail = false): string[] {
   const re = /(?<![0-9A-Za-z._%+-])@([^\s@#]+?\.md)(?![0-9A-Za-z_\-#/])/gi
   for (const m of text.matchAll(re)) {
     if (dropTail && (m.index ?? 0) + m[0].length === text.length) continue
-    if (!safeVaultPath(m[1]) || found.includes(m[1])) continue
-    found.push(m[1])
+    const path = m[1] ?? ''
+    if (!safeVaultPath(path) || found.includes(path)) continue
+    found.push(path)
     if (found.length >= MAX_MENTIONS) break
   }
   return found
