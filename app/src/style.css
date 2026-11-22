@@ -1159,6 +1159,7 @@ body[data-locked] #chat-open {
 #chat-title { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #chat-state { color: var(--muted); }
 #chat-head .spacer { flex: 1; }
+#chat-expand { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 30px; height: 26px; padding: 0; }
 #chat-grip { color: var(--muted); letter-spacing: -2px; }
 
 #chat-log {
@@ -1359,7 +1360,11 @@ body[data-locked] #chat-open {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 6px 8px;
-  max-height: 30vh;
+  box-sizing: border-box;
+  line-height: 1.5;
+  /* 打った量に合わせて伸びる（main.mjs の sizeInput）。ここまで伸びたら欄の中でスクロールする。 */
+  max-height: min(40vh, 300px);
+  overflow-y: hidden;
 }
 
 /* 入力欄もブラウザの青い線ではなく、枠と同じオレンジにそろえる（2026-11-08）。 */

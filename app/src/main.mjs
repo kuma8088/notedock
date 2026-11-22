@@ -1054,7 +1054,11 @@ function setupMentions(input) {
     // 取り消し（Cmd+Z）で戻せるよう、打ったのと同じ形で入れる。使えなければ値を直接替える。
     input.setSelectionRange(here.from, here.to)
     const added = next.value.slice(here.from, next.value.length - (input.value.length - here.to))
-    if (!document.execCommand?.('insertText', false, added)) input.value = next.value
+    // insertText が使えないときは input が起きないので、高さを合わせるために自分で知らせる。
+    if (!document.execCommand?.('insertText', false, added)) {
+      input.value = next.value
+      input.dispatchEvent(new Event('input'))
+    }
     input.setSelectionRange(next.caret, next.caret)
     close()
   }
@@ -1199,6 +1203,10 @@ function setupMentions(input) {
   return { close }
 }
 
+// 会話を広げる・たたむボタンのアイコン。広げるは外向きの矢印、たたむは内向きの矢印。
+const EXPAND_ICON_OPEN = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2.5h4v4M13.5 2.5 9 7M6.5 13.5h-4v-4M2.5 13.5 7 9"/></svg>'
+const EXPAND_ICON_CLOSE = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5h-4v-4M9.5 6.5 14 2M2.5 9.5h4v4M6.5 9.5 2 14"/></svg>'
+
 // チャット枠はいつも出す。前は ?chat=1 のときだけ出していたが、開き方によっては付かず、枠が消えていた（2026-11-08）。
 function setupChatBox() {
   const panel = $('chat-panel')
@@ -1210,6 +1218,24 @@ function setupChatBox() {
   const log = $('chat-log')
   const expand = $('chat-expand')
   const files = $('chat-files')
+  // 入力欄の高さを打った量に合わせる。上限（CSS の max-height）を超えたら、欄の中でスクロールする。
+  // @ の候補より先に付け、候補の一覧の位置を測るときには、もう新しい高さになっているようにする。
+  // 日本語の変換中も、変換中の文字の分だけ伸ばす（変換の窓が欄の外へずれないように、高さは変換中も合わせる）。
+  const sizeInput = () => {
+    input.style.height = 'auto'
+    const max = parseFloat(getComputedStyle(input).maxHeight) || Infinity
+    const want = input.scrollHeight + (input.offsetHeight - input.clientHeight)
+    input.style.height = `${Math.min(want, max)}px`
+    input.style.overflowY = want > max ? 'auto' : 'hidden'
+  }
+  input.addEventListener('input', sizeInput)
+  // 枠の幅が変わると折り返しが変わるので、幅が変わったときも合わせる（高さの変化では呼ばない）。
+  let inputWidth = 0
+  new ResizeObserver(() => {
+    if (input.clientWidth === inputWidth) return
+    inputWidth = input.clientWidth
+    sizeInput()
+  }).observe(input)
   const mentions = setupMentions(input)
   let waiting = 0
   let timer = 0
@@ -1270,7 +1296,11 @@ function setupChatBox() {
   const setExpanded = (open) => {
     log.hidden = !open
     expand.setAttribute('aria-expanded', String(open))
-    expand.textContent = open ? '会話をたたむ' : '会話を広げる'
+    // 文字のボタンは幅が狭いと2行に折り返すので、向きの変わる矢印のアイコンにする。何が起きるかは説明と読み上げのラベルで伝える。
+    const label = open ? '会話をたたむ' : '会話を広げる'
+    expand.innerHTML = open ? EXPAND_ICON_CLOSE : EXPAND_ICON_OPEN
+    expand.title = label
+    expand.setAttribute('aria-label', label)
     storage.set('chat-expanded', open)
     if (open) {
       markSeen()
@@ -1506,7 +1536,7 @@ function setupChatBox() {
   }
   $('chat-cancel').addEventListener('click', () => {
     stopWaiting()
-    say('待つのをやめました。返事は、会話を広げるかチャットのほうで見られます。')
+    say('待つのをやめました。返事は、上の矢印のボタンで会話を広げるか、チャットのほうで見られます。')
   })
   const poll = async () => {
     if (!waiting) return
@@ -1642,6 +1672,7 @@ function setupChatBox() {
     // このブラウザから送ったことを覚えておく。ほかのブラウザで送った文の返事は、読み込み直しても知らせない。
     tabFlags.set('chat-last-sent', at)
     input.value = ''
+    sizeInput()
     mentions.close()
     images = []
     showImages()
