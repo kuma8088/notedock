@@ -99,6 +99,14 @@ export function defaultNoteDir(currentPath, folders) {
   return folders.find((folder) => folder.normalize('NFC') === dir) ?? ''
 }
 
+// ノートの絶対パス。Vaultの外のノートや、場所が分からないときは null。
+// Windowsでは区切りを「\」にそろえる（「/」と混ざったパスを人に見せないため）。
+export function absolutePath(rootPaths, rel, platform = 'darwin') {
+  if (!rootPaths?.[0] || typeof rel !== 'string' || rel.startsWith('__outside__/')) return null
+  if (platform === 'win32') return `${rootPaths[0]}/${rel}`.replace(/[\\/]+/g, '\\')
+  return `${rootPaths[0]}/${rel}`
+}
+
 // ファイルパネルなどからコピーしたパスを、Vaultの中のノートに直す。パスでなければ null。
 export function resolvePasted(text, rootPaths, notes, platform = 'darwin') {
   let value = text.trim().replace(/^["']|["']$/g, '')

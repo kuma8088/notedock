@@ -26,10 +26,11 @@ import { findHeading, headingsOf, linkCompletion, wikiLinkCompletion } from './c
 import { calendarModel, shiftMonth } from './calendar.mjs'
 import { periodInfo, todayButtonHidden } from './periodic.mjs'
 import { PRODUCT } from './product.mjs'
-import { askChoice, askConfirm, askNewNote, askPlace, askText, showMessage } from './dialogs.mjs'
+import { askChoice, askConfirm, askNewNote, askPlace, askText, showCopyable, showMessage } from './dialogs.mjs'
+import { copyText } from './copy.mjs'
 import { keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
-import { ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
+import { absolutePath, ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
 import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
@@ -1767,6 +1768,7 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   else view = new EditorView({ state, parent: $('editor') })
   applyMode(nextMode)
   renderCrumbs(path)
+  $('copy-path').disabled = false
   document.title = path.split('/').at(-1).replace(/\.md$/i, '')
   if (push) pushNoteUrl(path, anchor)
   rememberRecent(path)
@@ -2780,6 +2782,9 @@ function bindLeftChrome() {
   $('toggle-calendar').addEventListener('click', () => showCalendar($('calendar').hidden))
   $('today-note').addEventListener('click', () => openPeriodicNote('daily', todayText(), { ask: false }))
   $('toggle-files').addEventListener('click', () => showFiles($('files').hidden))
+  // 押しても、書いていた場所からカーソルが動かないようにする。
+  $('copy-path').addEventListener('mousedown', (event) => event.preventDefault())
+  $('copy-path').addEventListener('click', copyNotePath)
   $('to-chat').addEventListener('click', () => (rightActive() ? split.post({ type: MSG.CHAT }) : sendSelectionToChat()))
   setupChatBox()
   setupSideResize()
@@ -2960,6 +2965,42 @@ async function receiveFromLeft(data) {
       // 保存が止まっているとき（ぶつかった、見つからないなど）は flush しても書けないので、まだ書きかけがあると返す。
       toLeft({ type: MSG.SAVED, dirty: Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state) })
     }
+  }
+}
+
+// 埋め込みの画面では選択してコピーする方法しか通らないことがあるので、それも用意する。
+function execCopy(text) {
+  const area = document.createElement('textarea')
+  area.value = text
+  area.setAttribute('readonly', '')
+  area.style.position = 'fixed'
+  area.style.opacity = '0'
+  document.body.append(area)
+  area.select()
+  try {
+    return document.execCommand('copy')
+  } finally {
+    area.remove()
+  }
+}
+
+// 今開いているノートの絶対パスをコピーする。閲覧だけのノートでも使える。
+// 押した直後でないとコピーを断るブラウザがあるので、サーバーを待たずにその場で作る。
+async function copyNotePath() {
+  if (!currentPath) return
+  const full = absolutePath(rootPaths, currentPath, platform)
+  if (!full) {
+    showMessage('このノートのパスを調べられませんでした。')
+    return
+  }
+  // 表のマスなどで入力していた場所へ戻す。
+  const before = document.activeElement
+  if (await copyText(full, { clipboard: navigator.clipboard, execCopy })) {
+    setStatusHint('コピーしました')
+    if (view && before === view.contentDOM) view.focus()
+    else if (before instanceof HTMLElement && before !== document.body && before.isConnected) before.focus()
+  } else {
+    showCopyable(keyLabel('コピーできませんでした。下のパスは選択済みです。Cmd+C でコピーしてください。'), full)
   }
 }
 
