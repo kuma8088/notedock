@@ -95,8 +95,8 @@ export function lineMention(state: EditorState, now: number, root: string, os: O
   if (!info || !lines) return null
   const { from, to } = lines
   if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < from) return null
-  // 空白のある場所は1語にならず、エンジンが @ の続きとして読めないので出さない。
-  if (/\s/.test(info.where)) return null
+  // 空白のある場所は1語にならず、# のある場所は行の指定（#L）と紛れるので、出さない。
+  if (/[\s#]/.test(info.where)) return null
   const text = `@${info.where}#L${from === to ? from : `${from}-${to}`}`
   if (token === text) return null
   const fits = token === '@' || text.startsWith(token) || MENTION_WORD.startsWith(token) || token.startsWith(MENTION_WORD)
@@ -105,7 +105,8 @@ export function lineMention(state: EditorState, now: number, root: string, os: O
   return {
     text,
     label: `選んでいる行：${state.path} の${range}`,
-    description: info.dirty ? 'NoteDock（保存していない変更は入らない）' : 'NoteDock',
+    // エンジンが読むのは保存したファイル。保存前の変更があると、行がずれることがある。
+    description: info.dirty ? 'NoteDock（保存前の変更があるので、行がずれることがある）' : 'NoteDock',
   }
 }
 

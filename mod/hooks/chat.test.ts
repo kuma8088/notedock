@@ -782,10 +782,10 @@ test('1行だけなら #L12、保存していない変更があれば添え書�
   const row = lineMention({ path: 'Home.md', lines: { from: 3, to: 3 }, dirty: true, updatedAt: 900 }, 1000, '/V/notes', 'darwin', '@')
   expect(row?.text).toBe('@Home.md#L3')
   expect(row?.label).toBe('選んでいる行：Home.md の3行')
-  expect(row?.description).toContain('保存していない変更')
+  expect(row?.description).toContain('行がずれる')
 })
 
-test('出さないとき：行を選んでいない・古い・別の語を打っている・もう選んだあと・場所に空白がある・@ 以外', async () => {
+test('出さないとき：行を選んでいない・古い・別の語を打っている・もう選んだあと・場所に空白や # がある・@ 以外', async () => {
   const x = await opened()
   x.editor({ path: 'Home.md', updatedAt: x.now() - 100 })
   expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
@@ -796,6 +796,8 @@ test('出さないとき：行を選んでいない・古い・別の語を打�
   expect(await x.nd.autocomplete({ token: '@Home.md#L1-2' })).toBe(null)
   expect(await x.nd.autocomplete({ token: '#' })).toBe(null)
   x.editor({ path: 'My Notes/Home.md', lines: { from: 1, to: 2 }, updatedAt: x.now() - 100 })
+  expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
+  x.editor({ path: 'a#b.md', lines: { from: 1, to: 2 }, updatedAt: x.now() - 100 })
   expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
   x.editor({ path: 'Home.md', lines: { from: 5, to: 2 }, updatedAt: x.now() - 100 })
   expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
@@ -813,7 +815,7 @@ test('エディターを開いていないチャットでは出さない', async
   expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
 })
 
-test('フックのつなぎ：prompt.autocomplete は @ の語にだけつなぎ、候補をエンジンの答えの先頭に足す', async () => {
+test('フックのつなぎ：prompt.autocomplete は @ の語にだけつなぎ、候補をほかのプラグインの候補より前に足す（エンジンの候補はこの下ではなく上に並ぶ）', async () => {
   const hooks: Record<string, { matcher: any; fn: (...a: any[]) => any }> = {}
   const on: any = (name: string, a: any, b?: any) => {
     hooks[name] = typeof a === 'function' ? { matcher: undefined, fn: a } : { matcher: a, fn: b }
