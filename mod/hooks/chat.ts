@@ -136,13 +136,103 @@ export function withNote(text: string, note: string | null): string {
   return note ? `${text}\n\n${note}` : text
 }
 
+// 窓のチャット欄で打った文の中の「@場所#L12-18」。Modが送る文では、エンジンは @ のファイルを読まないので、
+// Modが保存したファイルからその行を読み、文の末尾に添える。場所は Vault から見た場所に限る（外へ出る .. や絶対パスは読まない）。
+export const MENTION_HEAD = '（@ で指した行。保存したファイルから読んだもの）'
+const MAX_MENTIONS = 5 // 1つの文で読む @ の数
+const MAX_MENTION_LINES = 400 // 1つの @ で読む行の数
+const MAX_MENTION_TEXT = 20000 // 添える行の文字の合計
+
+export type LineRef = { path: string; from: number; to: number }
+
+export function lineRefsIn(text: string): LineRef[] {
+  const found: LineRef[] = []
+  const seen = new Set<string>()
+  const re = /(?:^|\s)@([^\s@#]+)#L(\d+)(?:-(\d+))?(?=$|[\s、。，,.!?！？）)」』])/g
+  for (const m of text.matchAll(re)) {
+    const path = m[1]
+    const from = Number(m[2])
+    const to = m[3] === undefined ? from : Number(m[3])
+    if (!safeVaultPath(path) || !Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 1 || to < from) continue
+    const key = `${path}#${from}-${to}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    found.push({ path, from, to })
+    if (found.length >= MAX_MENTIONS) break
+  }
+  return found
+}
+
+// Vault の中の .md だけ。絶対パス・ドライブ名・\ ・ . や .. の段・空の段は読まない。
+export function safeVaultPath(path: string): boolean {
+  if (!/\.md$/i.test(path) || path.startsWith('/') || /[\\:]/.test(path)) return false
+  return path.split('/').every(part => part !== '' && part !== '.' && part !== '..')
+}
+
+// 読んだ中身（読めなければ null）から、文に添える塊を作る。行には番号を付ける。
+export function mentionBlock(read: { ref: LineRef; where: string; text: string | null }[]): string | null {
+  if (!read.length) return null
+  const parts: string[] = []
+  let used = 0
+  for (const { ref, where, text } of read) {
+    const name = `@${where}#L${ref.from === ref.to ? ref.from : `${ref.from}-${ref.to}`}`
+    if (text === null) {
+      parts.push(`${name}: 読めませんでした`)
+      continue
+    }
+    const lines = text.replace(/\r\n?/g, '\n').split('\n')
+    if (lines.length && lines[lines.length - 1] === '') lines.pop()
+    if (ref.from > lines.length) {
+      parts.push(`${name}: このファイルは${lines.length}行までです`)
+      continue
+    }
+    const last = Math.min(ref.to, lines.length, ref.from + MAX_MENTION_LINES - 1)
+    const body: string[] = []
+    for (let n = ref.from; n <= last; n += 1) {
+      const line = `${n}\t${lines[n - 1]}`
+      if (used + line.length > MAX_MENTION_TEXT) break
+      used += line.length + 1
+      body.push(line)
+    }
+    const shown = ref.from + body.length - 1
+    const cut = shown < ref.to ? `（${shown}行目まで。ここで切りました）` : ''
+    const longest = Math.max(2, ...body.map(line => (line.match(/`+/g) ?? []).reduce((a, b) => Math.max(a, b.length), 0)))
+    const fence = '`'.repeat(longest + 1)
+    parts.push(`${name}${cut}\n${fence}\n${body.join('\n')}\n${fence}`)
+  }
+  return `${MENTION_HEAD}\n${parts.join('\n\n')}`
+}
+
+// 打った文の @ の行を読んで、添える塊を作る。read はファイルを読む関数（読めなければ throw）。
+// 読むのはエディターの Vault（state.root、無ければ会話のフォルダー）の中。塊に書く場所は、会話のフォルダーと同じなら Vault から見た場所。
+export async function mentionsForSend(typed: string, state: EditorState, root: string, os: Os, read: (path: string) => Promise<string>): Promise<string | null> {
+  const refs = lineRefsIn(typed)
+  if (!refs.length) return null
+  const vault = typeof state.root === 'string' && state.root ? state.root : root
+  const other = rootKey(vault, os) !== rootKey(root, os)
+  const win = (p: string) => (os === 'win32' ? p.replace(/\//g, '\\') : p)
+  const read2 = await Promise.all(
+    refs.map(async ref => {
+      const file = joinPath(os, win(vault), win(ref.path))
+      const text = await read(file).then(
+        t => (typeof t === 'string' ? t : null),
+        () => null,
+      )
+      return { ref, where: other ? file : ref.path, text }
+    }),
+  )
+  return mentionBlock(read2)
+}
+
 // 番の文が、エディターから送った文かどうか。sent は送った文そのもの（案内付き）か、
-// Modを読み込み直したあとならエディターが書いた送る文（案内なし）。後者は、末尾に案内が続く形も同じ文とみなす。
+// Modを読み込み直したあとならエディターが書いた送る文（案内なし）。後者は、末尾に案内か @ の行が続く形も同じ文とみなす。
 export function isSentText(turnText: string, sent: string): boolean {
   const a = turnText.trim()
   const b = sent.trim()
   if (a === b) return true
-  return b !== '' && a.startsWith(b) && a.slice(b.length).trimStart().startsWith(SEND_NOTE_HEAD)
+  if (b === '' || !a.startsWith(b)) return false
+  const rest = a.slice(b.length).trimStart()
+  return rest.startsWith(SEND_NOTE_HEAD) || rest.startsWith(MENTION_HEAD)
 }
 
 export function quoteForPrompt(text: string): string {

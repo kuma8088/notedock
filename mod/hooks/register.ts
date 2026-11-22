@@ -4,7 +4,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Band } from '../types'
-import { chatFile, describeNote, hexOf, hideKeys, isSentText, lineMention, linkDir, MAX_TEXT, newLinkText, noteForSend, quoteForPrompt, shareIsOn, titleFrom, TYPED_ORIGINS, withNote, type EditorState } from './chat'
+import { chatFile, describeNote, hexOf, hideKeys, isSentText, lineMention, linkDir, MAX_TEXT, mentionsForSend, newLinkText, noteForSend, quoteForPrompt, shareIsOn, titleFrom, TYPED_ORIGINS, withNote, type EditorState } from './chat'
 import { summarizeTranscript } from './chat-log'
 import { compareVersions, ensureBinary, installedBinary, onlyNewerInstalled, removeOldVersions } from './install'
 import { editorUrl, openPrompt, retryPrompt } from './open'
@@ -1038,7 +1038,10 @@ export function createNotedock(opts: { version?: string } = {}) {
       // Modが送る文には、Mod自身の prompt.submit フックが呼ばれない（呼んだプラグインのフックは通らず、context も渡せない）。
       // そこで、切り替えがオンなら、開いているノートの短い案内を文の末尾に足す（打った文と選んだ文字の上限はそれぞれ守る）。
       const note = (await io.shareIsOn(dir, base.host.os)) ? noteForSend(state, t, base.root, base.host.os) : null
-      const text = withNote(typed, note)
+      // 打った文の「@場所#L12-18」は、エンジンが読まない（Modが送る文のため）ので、Modが保存したファイルから読んで添える。
+      // 共有の切り替えには関係なく、本人が @ で指したときだけ。
+      const lines = await mentionsForSend(typed, state, base.root, base.host.os, io.read).catch(() => null)
+      const text = withNote(withNote(typed, lines), note)
       pending = { text, at }
       // Claudeが作業中なら、終わってから送られる。
       let p: Promise<any>

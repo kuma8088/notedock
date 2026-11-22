@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { chatFile, describeNote, hideKeys, lineMention, linkDir, quoteForPrompt, titleFrom, TYPED_ORIGINS } from './chat'
+import { chatFile, describeNote, hideKeys, isSentText, lineMention, lineRefsIn, linkDir, MENTION_HEAD, mentionBlock, mentionsForSend, quoteForPrompt, safeVaultPath, titleFrom, TYPED_ORIGINS } from './chat'
 import { createNotedock, ioFor, wire } from './register'
 import { VERSION } from './release'
 
@@ -833,4 +833,73 @@ test('フックのつなぎ：prompt.autocomplete は @ の語にだけつなぎ
   nd.autocomplete = async () => null
   const same: any = await h.fn({}, { text: '@', cursor: 1, token: '@', start: 0 }, next)
   expect(same.suggestions).toEqual([{ text: 'other' }])
+})
+
+test('打った文の @場所#L12-18 を拾う。Vault の外へ出る場所・絶対パス・.md でない場所は拾わない', () => {
+  expect(lineRefsIn('@a.md#L12-18 と @memo/b.md#L3 を見て。')).toEqual([
+    { path: 'a.md', from: 12, to: 18 },
+    { path: 'memo/b.md', from: 3, to: 3 },
+  ])
+  expect(lineRefsIn('x@a.md#L1 @a.md @a.md#L5-2 @a.md#L0')).toEqual([])
+  expect(lineRefsIn('@../x.md#L1 @/etc/x.md#L1 @a/./b.md#L1 @C:x.md#L1 @a.txt#L1')).toEqual([])
+  expect(lineRefsIn('@a.md#L1 @a.md#L1')).toEqual([{ path: 'a.md', from: 1, to: 1 }])
+  expect(lineRefsIn('（@a.md#L1-2）')).toEqual([])
+  expect(lineRefsIn('@a.md#L1-2、ここ')).toEqual([{ path: 'a.md', from: 1, to: 2 }])
+  expect(safeVaultPath('a/b.md')).toBe(true)
+  expect(safeVaultPath('a//b.md')).toBe(false)
+  expect(safeVaultPath('a\\b.md')).toBe(false)
+})
+
+test('@ の行を番号付きで添える。範囲が長すぎる・ファイルが短い・読めないときはそう書く', () => {
+  const text = 'l1\nl2\nl3\n'
+  const block = mentionBlock([
+    { ref: { path: 'a.md', from: 2, to: 3 }, where: 'a.md', text },
+    { ref: { path: 'b.md', from: 9, to: 9 }, where: 'b.md', text },
+    { ref: { path: 'c.md', from: 1, to: 1 }, where: 'c.md', text: null },
+  ])!
+  expect(block.startsWith(MENTION_HEAD)).toBe(true)
+  expect(block).toContain('@a.md#L2-3\n```\n2\tl2\n3\tl3\n```')
+  expect(block).toContain('@b.md#L9: このファイルは3行までです')
+  expect(block).toContain('@c.md#L1: 読めませんでした')
+  // 本文に ``` があれば、囲みをそれより長くする
+  expect(mentionBlock([{ ref: { path: 'a.md', from: 1, to: 1 }, where: 'a.md', text: '```js' }])).toContain('````\n1\t```js\n````')
+  const long = mentionBlock([{ ref: { path: 'a.md', from: 1, to: 1000 }, where: 'a.md', text: 'x\n'.repeat(1000) }])!
+  expect(long).toContain('400行目まで。ここで切りました')
+})
+
+test('読むのはエディターの Vault の中。会話のフォルダーが Vault と違えば、塊には Vault の中の場所を書く', async () => {
+  const seen: string[] = []
+  const read = async (p: string) => {
+    seen.push(p)
+    return 'a\nb\n'
+  }
+  const same = await mentionsForSend('@x/a.md#L2', { root: '/V/notes' }, '/V/notes', 'darwin', read)
+  expect(seen).toEqual(['/V/notes/x/a.md'])
+  expect(same).toContain('@x/a.md#L2\n')
+  const other = await mentionsForSend('@x/a.md#L2', { root: '/V/test' }, '/V/notes', 'darwin', read)
+  expect(seen[1]).toBe('/V/test/x/a.md')
+  expect(other).toContain('@/V/test/x/a.md#L2\n')
+  expect(await mentionsForSend('行の指定なし @x/a.md', { root: '/V/notes' }, '/V/notes', 'darwin', read)).toBe(null)
+  const win = await mentionsForSend('@x/a.md#L1', { root: 'C:\\Notes' }, 'C:\\Notes', 'win32', async p => (seen.push(p), 'a'))
+  expect(seen.at(-1)).toBe('C:\\Notes\\x\\a.md')
+  expect(win).toContain('@x/a.md#L1')
+})
+
+test('@ の行が続く文も、エディターから送った文とみなす（Modを読み込み直したあと）', () => {
+  expect(isSentText(`見て @a.md#L1\n\n${MENTION_HEAD}\n@a.md#L1`, '見て @a.md#L1')).toBe(true)
+  expect(isSentText('見て @a.md#L1 ほかの文', '見て @a.md#L1')).toBe(false)
+})
+
+test('窓のチャット欄で @場所#L を打って送ると、保存したファイルのその行を文に添える（共有がオフでも）', async () => {
+  const x = await opened()
+  x.files.set(`${x.ROOT}/memo.md`, Array.from({ length: 20 }, (_, i) => `行${i + 1}`).join('\n'))
+  x.editor({ path: 'memo.md', root: x.ROOT, updatedAt: x.now(), sendChat: { text: '@memo.md#L12-13 を直して', at: x.now() } })
+  const sentAt = x.now()
+  await x.advance(1500)
+  expect(x.sends.length).toBe(1)
+  expect(x.sends[0].text).toBe(`@memo.md#L12-13 を直して\n\n${MENTION_HEAD}\n@memo.md#L12-13\n`+'```'+`\n12\t行12\n13\t行13\n`+'```')
+  x.sends[0].resolve({})
+  await x.nd.turnStart({ text: x.sends[0].text, turnId: 'm1' })
+  await x.nd.turnComplete({ turnId: 'm1', answer: '直しました。', reason: 'done' })
+  expect(x.json('reply.json').for).toBe(sentAt)
 })

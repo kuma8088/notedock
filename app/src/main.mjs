@@ -41,6 +41,7 @@ import { createSplit } from './split.mjs'
 import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
 import { createConnectionWatch, createVersionWatch } from './connection.mjs'
 import { linesFrom, selectedLines } from './lines.mjs'
+import { applyMention, headingTarget, mentionCandidates, mentionQuery, sectionsOf, unwritableCount } from './mention.mjs'
 import { beginTableCell, showMenu } from './widgets.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
@@ -992,6 +993,187 @@ function readerView(parent, text) {
   return reader
 }
 
+// 窓のチャット欄の @ の候補。打っている語に合わせて一覧を出し、選んだら @場所#L12-18 か @場所 を入れる。
+// 選んでいる行と見出しの節の行は、Mod が送るときに保存したファイルから読んで文に添える。
+const MENTION_FRESH_MS = 5000
+function editorForMention() {
+  if (rightActive()) return { path: rightState.path, lines: rightState.lines, dirty: rightState.dirty }
+  if (!currentPath || !view) return { path: null, lines: null, dirty: false }
+  return { path: currentPath, lines: selectedLines(view.state), dirty: !CLEAN_STATES.has($('status').dataset.state) }
+}
+function noteIsDirty(path) {
+  if (!path) return false
+  if (path === rightState.path && rightState.dirty) return true
+  return path === currentPath && Boolean(view) && !CLEAN_STATES.has($('status').dataset.state)
+}
+function setupMentions(input) {
+  const list = $('chat-mentions')
+  const saved = new Map() // 場所 → { at, sections }。見出しの行は保存した中身から数える。
+  let items = []
+  let hidden = 0
+  let active = 0
+  let at = null
+  let seq = 0
+  const close = () => {
+    list.hidden = true
+    list.replaceChildren()
+    items = []
+    at = null
+    input.removeAttribute('aria-activedescendant')
+    input.setAttribute('aria-expanded', 'false')
+  }
+  const sectionsFor = async (path) => {
+    const got = saved.get(path)
+    if (got && Date.now() - got.at < MENTION_FRESH_MS) return got.sections
+    try {
+      const data = await api.read(path)
+      const sections = sectionsOf(data?.text ?? '')
+      saved.set(path, { at: Date.now(), sections })
+      return sections
+    } catch {
+      return null
+    }
+  }
+  const choose = (index) => {
+    const item = items[index]
+    if (!item || !at) return
+    const next = applyMention(input.value, at, item.insert)
+    input.value = next.value
+    input.setSelectionRange(next.caret, next.caret)
+    close()
+    input.focus()
+  }
+  const mark = () => {
+    list.querySelectorAll('[role="option"]').forEach((row, index) => {
+      const on = index === active
+      row.setAttribute('aria-selected', String(on))
+      if (on) {
+        input.setAttribute('aria-activedescendant', row.id)
+        row.scrollIntoView({ block: 'nearest' })
+      }
+    })
+  }
+  // 一覧の高さは、入力欄の上（枠が上にあるときは下）に画面の中で残っている分まで。
+  const fit = () => {
+    const box = input.getBoundingClientRect()
+    const below = $('chat-panel').dataset.dock?.startsWith('top')
+    list.dataset.side = below ? 'below' : 'above'
+    const room = below ? innerHeight - box.bottom - 16 : box.top - 16
+    list.style.maxHeight = `${Math.max(80, Math.min(280, room))}px`
+  }
+  const render = () => {
+    if (!items.length && !hidden) {
+      close()
+      return
+    }
+    // 場所に空白か # があるノートは、@ のあとに1語で書けない（# は行の指定と紛れる）ので出さず、理由だけ添える。
+    const note = document.createElement('p')
+    note.className = 'chat-mention-note'
+    note.textContent = `場所に空白か # があるノート（${hidden}件）は、@ のあとに1語で書けないので出していません`
+    list.replaceChildren(
+      ...items.map((item, index) => {
+        const row = document.createElement('div')
+        row.id = `chat-mention-${index}`
+        row.setAttribute('role', 'option')
+        row.className = `chat-mention chat-mention-${item.kind}`
+        const label = document.createElement('span')
+        label.className = 'chat-mention-label'
+        label.textContent = item.label
+        row.append(label)
+        if (item.detail) {
+          const detail = document.createElement('span')
+          detail.className = item.warn ? 'chat-mention-detail chat-mention-warn' : 'chat-mention-detail'
+          detail.textContent = item.detail
+          row.append(detail)
+        }
+        // 押したときに入力欄から目が離れないよう、mousedown で選ぶ。
+        row.addEventListener('mousedown', (event) => {
+          event.preventDefault()
+          choose(index)
+        })
+        row.addEventListener('mousemove', () => {
+          if (active === index) return
+          active = index
+          mark()
+        })
+        return row
+      }),
+      ...(hidden ? [note] : []),
+    )
+    list.hidden = false
+    input.setAttribute('aria-expanded', 'true')
+    fit()
+    mark()
+  }
+  const refresh = async () => {
+    const mine = ++seq
+    const found = mentionQuery(input.value, input.selectionStart ?? 0)
+    if (!found || input.selectionStart !== input.selectionEnd) {
+      close()
+      return
+    }
+    const editor = editorForMention()
+    const target = headingTarget({ query: found.query, editor, notes })
+    const sections = target ? await sectionsFor(target) : null
+    // 待っているあいだに打ち進めていたら、古い結果は捨てる。
+    if (mine !== seq) return
+    const again = mentionQuery(input.value, input.selectionStart ?? 0)
+    if (!again || again.from !== found.from || again.query !== found.query) return
+    const before = items[active]?.insert
+    at = found
+    items = mentionCandidates({
+      query: found.query,
+      editor,
+      notes,
+      headings: target && sections ? { path: target, sections, dirty: noteIsDirty(target) } : null,
+    })
+    hidden = unwritableCount(found.query, notes)
+    const keep = items.findIndex((item) => item.insert === before)
+    active = keep >= 0 ? keep : 0
+    render()
+  }
+  input.setAttribute('aria-controls', 'chat-mentions')
+  input.setAttribute('aria-autocomplete', 'list')
+  input.setAttribute('aria-expanded', 'false')
+  // IME の変換中は何もしない。確定したら（compositionend のあとの input で）読み直す。
+  input.addEventListener('input', (event) => {
+    if (event.isComposing) return
+    refresh()
+  })
+  input.addEventListener('compositionend', () => refresh())
+  input.addEventListener('click', () => refresh())
+  input.addEventListener('blur', () => close())
+  // チャット欄のほかの keydown（Cmd+Enter で送る）より先に呼ばれるよう、先に付ける。
+  input.addEventListener('keydown', (event) => {
+    if (event.isComposing || event.keyCode === 229) return
+    if (list.hidden) {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'Home' || event.key === 'End') setTimeout(refresh)
+      return
+    }
+    const take = () => {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+    }
+    if (!items.length && event.key !== 'Escape') return
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      take()
+      active = (active + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length
+      mark()
+    } else if ((event.key === 'Enter' && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) || (event.key === 'Tab' && !event.shiftKey)) {
+      take()
+      choose(active)
+    } else if (event.key === 'Escape') {
+      take()
+      close()
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'Home' || event.key === 'End') {
+      setTimeout(refresh)
+    } else if (event.key === 'Enter') {
+      close()
+    }
+  })
+  return { close }
+}
+
 // チャット枠はいつも出す。前は ?chat=1 のときだけ出していたが、開き方によっては付かず、枠が消えていた（2026-11-08）。
 function setupChatBox() {
   const panel = $('chat-panel')
@@ -1003,6 +1185,7 @@ function setupChatBox() {
   const log = $('chat-log')
   const expand = $('chat-expand')
   const files = $('chat-files')
+  const mentions = setupMentions(input)
   let waiting = 0
   let timer = 0
   let lastFor = 0
@@ -1434,6 +1617,7 @@ function setupChatBox() {
     // このブラウザから送ったことを覚えておく。ほかのブラウザで送った文の返事は、読み込み直しても知らせない。
     tabFlags.set('chat-last-sent', at)
     input.value = ''
+    mentions.close()
     images = []
     showImages()
     startWaiting(at)
