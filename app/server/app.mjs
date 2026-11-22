@@ -48,6 +48,24 @@ const MIME = {
 }
 
 const NEED_TICKET_GAP_MS = 2000
+// チャット欄の結び付け。
+// - Modは、エディターを開いたチャットごとに結び付けのフォルダー（chats/<推測できない名前>）を作り、link.json を書く。
+//   link.json には、開くリンクに付けた「結び付けの合図」（一度だけ使える乱数）のハッシュと期限が入る。
+// - 画面は、アドレスの #s=<合図> を POST /api/chat-bind で、このタブだけの鍵と引き換える。合図は一度使うと使えない。
+// - そのあと画面は、鍵を x-note-chat で送る。サーバーは鍵そのものを保存せず、ハッシュの名前の目録（chat-tabs/<ハッシュ>.json）
+//   からフォルダーを決める。link.json はModだけが書き、サーバーは書かない。
+export const CHAT_HEADER = 'x-note-chat'
+const CHAT_LINK_RE = /^[A-Za-z0-9_-]{43}$/
+const CHAT_FOLDER_RE = /^[0-9a-f]{64}$/
+const CHAT_USED_KEEP = 50 // 使い済みの合図のハッシュを、フォルダーごとにいくつ覚えるか
+// Modは10秒ごとに link.json の時刻を書き直す。これより古ければ、結び付いたチャットはもう無いとみなす。
+export const CHAT_LIVE_MS = 40 * 1000
+// 使われなくなった結び付けのフォルダーを片付けるまでの日数（AIの判断）。
+const CHAT_KEEP_MS = 7 * 24 * 60 * 60 * 1000
+
+export function chatHashOf(link) {
+  return crypto.createHash('sha256').update(link).digest('hex')
+}
 // 止める指示に 204 を送ったあと、finish も close も来ないときに、止める処理へ進むまでの時間（AIの判断）。
 export const SHUTDOWN_FALLBACK_MS = 1_000
 
@@ -90,7 +108,6 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
   if (!vaultDir) throw new Error('vaultDir is required')
   // VaultごとのファイルはvaultDir、全Vault共通の設定（見た目）はstateDirに置く。
   fs.mkdirSync(vaultDir, { recursive: true, mode: 0o700 })
-  const stateFile = path.join(vaultDir, 'current-note.json')
   // タブがどのVaultのものか見分ける印。サーバーを起動し直しても同じフォルダーなら変わらない。
   const rootId = vaultIdOf(root)
   const backups = createBackups(backupDir, { vaultId: rootId })
@@ -119,6 +136,87 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
     if (route === 'GET /api/events') return sameToken(url.searchParams.get('t'), token)
     if (route === 'GET /api/file' || route === 'GET /api/chat-image') return sameToken(url.searchParams.get('k'), fileKey)
     return false
+  }
+
+  // この要求の画面が結び付いているチャットのフォルダー。鍵が無い・形が違う・引き換えたものでない・Modの印が無いときは registered: false。
+  function chatOf(req) {
+    const cred = req.headers[CHAT_HEADER]
+    if (typeof cred !== 'string' || !CHAT_LINK_RE.test(cred)) return { dir: null, registered: false, partner: 'none' }
+    const folder = readChatJson(path.join(vaultDir, 'chat-tabs'), `${chatHashOf(cred)}.json`)?.chat
+    if (typeof folder !== 'string' || !CHAT_FOLDER_RE.test(folder)) return { dir: null, registered: false, partner: 'none' }
+    const dir = path.join(vaultDir, 'chats', folder)
+    let info = null
+    try { info = JSON.parse(fs.readFileSync(path.join(dir, 'link.json'), 'utf8')) } catch {}
+    if (!info || typeof info !== 'object') return { dir: null, registered: false, partner: 'none' }
+    const at = Number(info.at) || 0
+    const live = !info.closed && Date.now() - at <= CHAT_LIVE_MS
+    return { dir, registered: true, partner: live ? 'live' : 'gone', title: typeof info.title === 'string' ? info.title.slice(0, 200) : '' }
+  }
+
+  const readChatJson = (dir, name) => {
+    try { return JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')) } catch { return null }
+  }
+
+  // 結び付けの合図を、このタブだけの鍵と引き換える。合図は、Modが link.json に書いた期限内のもので、まだ使っていないものだけ。
+  async function chatBind(req, res) {
+    let bind
+    try { bind = JSON.parse(await readBody(req, 1024))?.bind } catch (error) {
+      if (error.status) throw error
+    }
+    if (typeof bind !== 'string' || !CHAT_LINK_RE.test(bind)) return send(res, 400, { error: 'bind' })
+    const want = chatHashOf(bind)
+    const top = path.join(vaultDir, 'chats')
+    let names = []
+    try { names = fs.readdirSync(top) } catch {}
+    for (const name of names) {
+      if (!CHAT_FOLDER_RE.test(name)) continue
+      const dir = path.join(top, name)
+      const info = readChatJson(dir, 'link.json')
+      if (!info || info.closed || !Array.isArray(info.binds)) continue
+      if (!info.binds.some((b) => b && b.h === want && Number(b.until) > Date.now())) continue
+      const used = readChatJson(dir, 'used.json')
+      const list = Array.isArray(used?.binds) ? used.binds : []
+      if (list.includes(want)) break
+      // 読む→書くを途中で待たずに行う（同じ合図が同時に2回来ても、引き換えるのは1回だけ）。
+      replaceFile(path.join(dir, 'used.json'), JSON.stringify({ binds: [...list, want].slice(-CHAT_USED_KEEP) }), { mode: 0o600 })
+      const cred = crypto.randomBytes(32).toString('base64url')
+      const tabs = path.join(vaultDir, 'chat-tabs')
+      fs.mkdirSync(tabs, { recursive: true, mode: 0o700 })
+      replaceFile(path.join(tabs, `${chatHashOf(cred)}.json`), JSON.stringify({ chat: name }), { mode: 0o600 })
+      return send(res, 200, { cred })
+    }
+    return send(res, 404, { error: 'bind' })
+  }
+
+  // 使われなくなった結び付けのフォルダー（link.json が7日より古い）と、そこを指すタブの鍵の目録を片付ける。
+  // 前の版の、Vaultに1つだけだったチャット欄のファイルも消す（もう使わない。前の版のModが読んでも、送らない側に倒れる）。
+  function pruneChats() {
+    for (const old of ['chat-owner.json', 'current-note.json', 'chat-reply.json', 'chat-log.json', 'share-note.json']) {
+      try { fs.rmSync(path.join(vaultDir, old), { force: true }) } catch {}
+    }
+    const top = path.join(vaultDir, 'chats')
+    let names = []
+    try { names = fs.readdirSync(top) } catch {}
+    const alive = new Set()
+    for (const name of names) {
+      if (!CHAT_FOLDER_RE.test(name)) continue
+      const dir = path.join(top, name)
+      try {
+        if (Date.now() - fs.statSync(path.join(dir, 'link.json')).mtimeMs > CHAT_KEEP_MS) fs.rmSync(dir, { recursive: true, force: true })
+        else alive.add(name)
+      } catch {
+        // link.json の無いフォルダーは、Modが書く途中かもしれないので残す。
+        alive.add(name)
+      }
+    }
+    const tabs = path.join(vaultDir, 'chat-tabs')
+    let tabNames = []
+    try { tabNames = fs.readdirSync(tabs) } catch {}
+    for (const name of tabNames) {
+      const chat = readChatJson(tabs, name)?.chat
+      if (typeof chat === 'string' && alive.has(chat)) continue
+      try { fs.rmSync(path.join(tabs, name), { force: true }) } catch {}
+    }
   }
 
   function notes() {
@@ -323,6 +421,8 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
     switch (route) {
       case 'POST /api/shutdown':
         return shutdown(req, res)
+      case 'POST /api/chat-bind':
+        return chatBind(req, res)
       case 'GET /api/health':
         return send(res, 200, {
           ok: true,
@@ -334,10 +434,10 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
           settingsErrors: settings().errors,
           ...(fileKey ? { fileKey } : {}),
         })
+      // 開いているノートを伝えるかどうかは、結び付いたチャットごとに覚える。
       case 'GET /api/share': {
-        let on = false
-        try { on = JSON.parse(fs.readFileSync(path.join(vaultDir, 'share-note.json'), 'utf8')).on === true } catch {}
-        return send(res, 200, { on })
+        const chat = chatOf(req)
+        return send(res, 200, { on: chat.registered && readChatJson(chat.dir, 'share.json')?.on === true })
       }
       case 'PUT /api/share': {
         let on
@@ -345,8 +445,9 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
           if (error.status) throw error
         }
         if (typeof on !== 'boolean') return send(res, 400, { error: 'on' })
-        fs.mkdirSync(vaultDir, { recursive: true, mode: 0o700 })
-        replaceFile(path.join(vaultDir, 'share-note.json'), JSON.stringify({ on }), { mode: 0o600 })
+        const chat = chatOf(req)
+        if (!chat.registered) return send(res, 409, { error: 'no-chat' })
+        replaceFile(path.join(chat.dir, 'share.json'), JSON.stringify({ on }), { mode: 0o600 })
         return send(res, 200, { on })
       }
       case 'GET /api/settings': {
@@ -463,42 +564,41 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
         fs.writeFileSync(file, bytes, { flag: 'wx' })
         return send(res, 201, { path: target })
       }
+      // 開いているノート・引用・送る文は、この画面が結び付いたチャットのフォルダーにだけ書く。
+      // 結び付いたチャットが無い画面の状態は、どのチャットにも渡さない（書かない）。送る文と引用は断る。
       case 'PUT /api/state': {
         const state = JSON.parse(await readBody(req, MAX_JSON))
-        fs.mkdirSync(vaultDir, { recursive: true, mode: 0o700 })
+        if (!state || typeof state !== 'object' || Array.isArray(state)) return send(res, 400, { error: 'state' })
+        const chat = chatOf(req)
+        const asks = Boolean(state.askChat || state.sendChat)
+        if (!chat.registered) return asks ? send(res, 409, { error: 'no-chat' }) : send(res, 200, { ok: true, linked: false })
+        if (asks && chat.partner !== 'live') return send(res, 409, { error: 'chat-gone' })
+        const file = path.join(chat.dir, 'state.json')
         // Modが読み取る前に次の状態で消えないよう、チャットへ送る文字は残す。
         let { askChat, sendChat } = state
         if (!askChat || !sendChat) {
-          try {
-            const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
-            askChat ??= saved.askChat
-            sendChat ??= saved.sendChat
-          } catch {
-            // 前の状態がなければ、そのまま書く。
-          }
+          const saved = readChatJson(chat.dir, 'state.json')
+          askChat ??= saved?.askChat
+          sendChat ??= saved?.sendChat
         }
-        fs.writeFileSync(stateFile, JSON.stringify({ ...state, askChat, sendChat, root, updatedAt: Date.now() }), { mode: 0o600 })
-        return send(res, 200, { ok: true })
+        replaceFile(file, JSON.stringify({ ...state, askChat, sendChat, root, updatedAt: Date.now() }), { mode: 0o600 })
+        return send(res, 200, { ok: true, linked: true })
       }
       // チャット欄の試験：Modが書いた最後の返事と、最後に送った文の時刻を返す。
       // 時刻も返すのは、ページを読み込み直しても返事待ちを続けられるようにするため。
+      // partner: 'live'（結び付いたチャットが動いている）・'gone'（結び付いたチャットがもう無い）・'none'（結び付いていない）。
+      // title は結び付いたチャットの名前（Modが分かる範囲で書いたもの）。
       case 'GET /api/chat-reply': {
-        let reply = {}
-        let sent = 0
-        try { reply = JSON.parse(fs.readFileSync(path.join(vaultDir, 'chat-reply.json'), 'utf8')) } catch {}
-        let ownerAt = 0
-        try { sent = JSON.parse(fs.readFileSync(stateFile, 'utf8')).sendChat?.at ?? 0 } catch {}
-        // 受け取るClaudeのセッションが動いているかを、Modが書き直す印の時刻で見る。
-        try { ownerAt = JSON.parse(fs.readFileSync(path.join(vaultDir, 'chat-owner.json'), 'utf8')).at ?? 0 } catch {}
-        return send(res, 200, { ...reply, sent, ownerAt })
+        const chat = chatOf(req)
+        if (!chat.registered) return send(res, 200, { partner: 'none', sent: 0 })
+        const reply = readChatJson(chat.dir, 'reply.json') ?? {}
+        const sent = readChatJson(chat.dir, 'state.json')?.sendChat?.at ?? 0
+        return send(res, 200, { ...(reply && typeof reply === 'object' ? reply : {}), sent, partner: chat.partner, title: chat.title })
       }
       // チャット枠の試験：Modが書き出した最近の会話を返す。
       case 'GET /api/chat-log': {
-        try {
-          return send(res, 200, JSON.parse(fs.readFileSync(path.join(vaultDir, 'chat-log.json'), 'utf8')))
-        } catch {
-          return send(res, 200, {})
-        }
+        const chat = chatOf(req)
+        return send(res, 200, (chat.registered && readChatJson(chat.dir, 'log.json')) || {})
       }
       // チャット枠に添付した画像は、Vaultに混ぜず、エディターの作業フォルダーに置く。
       case 'POST /api/chat-image': {
@@ -534,8 +634,10 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
           return send(res, 404, { error: 'not found' })
         }
       }
-      case 'GET /api/state':
-        return send(res, 200, fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : {})
+      case 'GET /api/state': {
+        const chat = chatOf(req)
+        return send(res, 200, (chat.registered && readChatJson(chat.dir, 'state.json')) || {})
+      }
       default:
         return send(res, 404, { error: 'not found' })
     }
@@ -616,7 +718,11 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
               return
             }
             backups.prune()
-            const pruner = setInterval(() => backups.prune(), 60 * 60 * 1000)
+            pruneChats()
+            const pruner = setInterval(() => {
+              backups.prune()
+              pruneChats()
+            }, 60 * 60 * 1000)
             pruner.unref?.()
             server.once('close', () => clearInterval(pruner))
             resolve(server)

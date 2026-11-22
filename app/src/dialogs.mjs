@@ -243,6 +243,23 @@ export function askChoice(message, choices) {
   })
 }
 
+// コピーできなかった文字を選んだ状態で見せ、Cmd+Cで写してもらう。
+export function showCopyable(message, text) {
+  return open((dialog, finish) => {
+    const label = document.createElement('p')
+    label.id = 'copyable-label'
+    label.textContent = message
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.readOnly = true
+    input.setAttribute('aria-labelledby', label.id)
+    input.value = text
+    input.addEventListener('keydown', (event) => event.stopPropagation())
+    dialog.append(label, input, actions(button('閉じる', () => finish(true), true)))
+    setTimeout(() => input.select(), 0)
+  })
+}
+
 export function showMessage(message) {
   return open((dialog, finish) => {
     const label = document.createElement('p')

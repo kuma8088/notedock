@@ -594,7 +594,7 @@ export class TableWidget extends WidgetType {
   }
   toDOM(view) {
     const { rows, align } = parseTable(this.source)
-    const wrap = element('div', { class: 'cm-table-wrap' })
+    const wrap = element('div', { class: this.readOnly ? 'cm-table-wrap cm-table-readonly' : 'cm-table-wrap' })
     wrap.noteSource = this.source
     const table = element('table', { class: 'cm-table' })
     const make = (row, rowIndex, tag) => {

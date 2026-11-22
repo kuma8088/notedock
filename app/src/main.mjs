@@ -20,16 +20,18 @@ import { Annotation, Compartment, EditorState, Transaction } from '@codemirror/s
 import { EditorView, placeholder, crosshairCursor, drawSelection, dropCursor, hoverTooltip, keymap, rectangularSelection } from '@codemirror/view'
 import { tags } from '@lezer/highlight'
 
-import { chatImageUrl, fileUrl, markKeyRefused, needTicketUrl, setFileKey, takeKeyRefused, ticketFromHash, tokenFromHash } from './access.mjs'
+import { bindChatCode, CHAT_PARTNER_TEXT, chatImageUrl, chatLinkFromHash, fileUrl, markKeyRefused, needTicketUrl, recalledChatLink, sendFailText, setFileKey, stashBindCode, takeKeyRefused, ticketFromHash, tokenFromHash } from './access.mjs'
 import { appearanceVars } from './appearance.mjs'
 import { findHeading, headingsOf, linkCompletion, wikiLinkCompletion } from './complete.mjs'
 import { calendarModel, shiftMonth } from './calendar.mjs'
 import { periodInfo, todayButtonHidden } from './periodic.mjs'
 import { PRODUCT } from './product.mjs'
-import { askChoice, askConfirm, askNewNote, askPlace, askText, showMessage } from './dialogs.mjs'
+import { askChoice, askConfirm, askNewNote, askPlace, askText, showCopyable, showMessage } from './dialogs.mjs'
+import { copyText } from './copy.mjs'
 import { keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
-import { ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
+import { absolutePath, ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
+import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
@@ -136,6 +138,48 @@ const sessionStore = (() => {
   }
 })()
 let keyRefused = takeKeyRefused(sessionStore)
+// チャット欄の送り先。chatLink は、このタブだけの鍵（サーバーが結び付けの合図と引き換えて渡したもの）。タブの中に覚え、読み込み直しても使う。
+// アドレスの #s= は、エディターを開いたチャットのModが作った、一度だけ使える結び付けの合図。合言葉や鍵がアドレスから消される前に読む。
+let chatLink = recalledChatLink(sessionStore)
+// 合図は、アドレスから消す前にタブの中へ退避し、引き換えが済むまで残す（bindChatCode）。
+function takeChatBindCode() {
+  const code = chatLinkFromHash(location.hash)
+  if (!code) return false
+  stashBindCode(sessionStore, code)
+  // 合言葉も鍵も無い形（#s= だけ）なら、ここでアドレスから消す。
+  if (!tokenFromHash(location.hash) && !ticketFromHash(location.hash)) {
+    window.history.replaceState(window.history.state, '', `${location.pathname}${location.search}`)
+  }
+  return true
+}
+takeChatBindCode()
+
+// 返事を見たか・このタブから送ったかの印。送り先はタブごとに違うので、タブの中（sessionStorage）に覚える。
+const tabFlags = {
+  get(key) {
+    try {
+      return Number(sessionStore?.getItem(`notedock-${key}`)) || 0
+    } catch {
+      return 0
+    }
+  },
+  set(key, value) {
+    try {
+      sessionStore?.setItem(`notedock-${key}`, String(value))
+    } catch {
+      // 保存領域が使えなければ、覚えない。
+    }
+  },
+}
+
+// 退避した結び付けの合図を、このタブだけの鍵と引き換える。合言葉が要る。引き換えられたらtrueを返す。
+// 起動時に合言葉が無く開けない画面（locked）になったタブでも送れるよう、request ではなく fetch で直接送る。
+async function bindChat() {
+  const cred = await bindChatCode({ store: sessionStore, fetchImpl: (url, init) => fetch(url, init), token: accessToken })
+  if (!cred) return false
+  chatLink = cred
+  return true
+}
 
 // 合言葉がURLに残らないよう、受け取ったらすぐ消す。変わっていればtrueを返す。
 function takeToken() {
@@ -235,6 +279,7 @@ async function request(url, options = {}) {
       'x-note-editor': '1',
       ...(rootId ? { 'x-note-root': rootId } : {}),
       ...tokenHeader(),
+      ...(chatLink ? { 'x-note-chat': chatLink } : {}),
       ...options.headers,
     },
   })
@@ -822,6 +867,7 @@ function extensionsFor(path, canEdit) {
     noteMarkdown(languages),
     contextSlot.of(noteContext.of({ path, known, newNoteDir: defaultNoteDir(path, noteFolders(notes)), api, editable: canEdit })),
     previewField,
+    hangingIndent,
     editableSlot.of(editableExtensions(canEdit)),
     editorKeys,
     editorEvents,
@@ -896,8 +942,6 @@ const CHAT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image
 const CHAT_IMAGE_MAX = 10 * 1024 * 1024
 // 作業中の印がこれより長く書き直されていなければ、Claudeが止まったとみなして出さない。
 const CHAT_STALE_MS = 20 * 1000
-// Modの持ち主の印がこれより古ければ、受け取るセッションがないと知らせる。
-const CHAT_NO_OWNER_MS = 40 * 1000
 
 // ドロップした場所に近い置き場所を選ぶ。上は左右の2か所、下は左・中央・右の3か所。
 function chatDockAt(x, y, width, height) {
@@ -969,15 +1013,26 @@ function setupChatBox() {
   const say = (text) => {
     wait.textContent = text
   }
-  // 話し相手（Modが印を書き直しているチャット）がいないあいだは、送れない。0も「いない」。
-  let noPartner = false
+  // このタブを開いたチャット（サーバーが partner: 'live' と答えるあいだ）にだけ送る。つながっていなければ送れない。
+  let noPartner = true
+  let partner = 'none'
   let sending = false
   const syncSend = () => {
     $('chat-send').disabled = Boolean(waiting) || sending || noPartner
   }
   const readOwner = (got) => {
-    noPartner = !got || Date.now() - (got.ownerAt ?? 0) > CHAT_NO_OWNER_MS
+    partner = got?.partner === 'live' || got?.partner === 'gone' ? got.partner : 'none'
+    noPartner = partner !== 'live'
     $('chat-owner').hidden = !noPartner
+    if (noPartner) $('chat-owner').textContent = CHAT_PARTNER_TEXT[partner]
+    $('chat-share-on').disabled = partner === 'none'
+    if (partner === 'none') {
+      $('chat-title').textContent = 'Claude（つながっていません）'
+      $('chat-title').title = $('chat-title').textContent
+    } else if (got?.title && !$('chat-title').dataset.fromLog) {
+      $('chat-title').textContent = `Claude · ${got.title}`
+      $('chat-title').title = $('chat-title').textContent
+    }
     syncSend()
   }
   const refreshOwner = () => document.body.dataset.locked || panel.hidden ? Promise.resolve() : request('/api/chat-reply').then(({ data }) => readOwner(data)).catch(() => {})
@@ -1189,10 +1244,13 @@ function setupChatBox() {
       if (!data || seq !== logSeq) return
       working = data.working && Date.now() - (data.at ?? 0) < CHAT_STALE_MS ? data.working : 0
       showWorking()
-      // チャットのタイトルを出す。まだ読めていなければ、プロジェクトの名前を出す。
-      const name = data.title || (data.project ? `Claude · ${data.project}` : 'Claude')
-      $('chat-title').textContent = name
-      $('chat-title').title = name
+      // つながっているチャットの名前を出す（Modが分かる範囲で書いたもの）。まだ読めていなければ、プロジェクトの名前を出す。
+      if (partner !== 'none' && (data.title || data.project)) {
+        const name = data.title ? `Claude · ${data.title}` : `Claude · ${data.project}`
+        $('chat-title').textContent = name
+        $('chat-title').title = name
+        $('chat-title').dataset.fromLog = '1'
+      }
       if (log.hidden || (data.at ?? 0) === logStamp || selectingInLog()) return
       renderLog(data.items ?? [])
       logStamp = data.at ?? 0
@@ -1207,7 +1265,7 @@ function setupChatBox() {
 
   // 返事が届いたことを知らせる。会話を広げていれば、そこに出るので知らせない。
   const markSeen = () => {
-    if (lastFor) storage.set('chat-reply-seen', lastFor)
+    if (lastFor) tabFlags.set('chat-reply-seen', lastFor)
     notice.hidden = true
     opener.classList.remove('unread')
   }
@@ -1254,9 +1312,10 @@ function setupChatBox() {
         arrived(got)
         return
       }
-      if (got && Date.now() - (got.ownerAt ?? 0) > CHAT_NO_OWNER_MS) {
-        say('受け取るClaudeのセッションが見つかりません。Claudeのチャットを開いてください。')
-      } else if (wait.textContent.startsWith('受け取る')) {
+      if (got) readOwner(got)
+      if (got && got.partner !== 'live') {
+        say('つながっていたチャットが見つかりません。返事は届かないかもしれません。')
+      } else if (wait.textContent.startsWith('つながっていた')) {
         say('送りました。返事を待っています…')
       }
     } catch {
@@ -1365,11 +1424,14 @@ function setupChatBox() {
     sending = false
     syncSend()
     if (!sent?.ok) {
-      say('送れませんでした。エディターを読み込み直して確かめてください。')
+      // 文はそのまま残す。相手の様子を読み直してから、サーバーが断った理由に合わせた案内を出す。
+      await refreshOwner()
+      // 相手がいない案内がすでに出ていれば、同じ文を重ねて出さない。
+      say(noPartner ? '送れませんでした。' : sendFailText(sent, partner))
       return
     }
     // このブラウザから送ったことを覚えておく。ほかのブラウザで送った文の返事は、読み込み直しても知らせない。
-    storage.set('chat-last-sent', at)
+    tabFlags.set('chat-last-sent', at)
     input.value = ''
     images = []
     showImages()
@@ -1390,7 +1452,7 @@ function setupChatBox() {
     .then(({ data }) => {
       if (waiting || !data) return
       if (data.sent && data.for !== data.sent && Date.now() - data.sent < CHAT_WAIT_MS) startWaiting(data.sent)
-      else if (data.for && data.text) arrived(data, data.for > storage.get('chat-reply-seen', 0) && data.for === storage.get('chat-last-sent', 0))
+      else if (data.for && data.text) arrived(data, data.for > tabFlags.get('chat-reply-seen') && data.for === tabFlags.get('chat-last-sent'))
     })
     .catch(() => {})
 }
@@ -1706,6 +1768,7 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   else view = new EditorView({ state, parent: $('editor') })
   applyMode(nextMode)
   renderCrumbs(path)
+  $('copy-path').disabled = false
   document.title = path.split('/').at(-1).replace(/\.md$/i, '')
   if (push) pushNoteUrl(path, anchor)
   rememberRecent(path)
@@ -2719,6 +2782,9 @@ function bindLeftChrome() {
   $('toggle-calendar').addEventListener('click', () => showCalendar($('calendar').hidden))
   $('today-note').addEventListener('click', () => openPeriodicNote('daily', todayText(), { ask: false }))
   $('toggle-files').addEventListener('click', () => showFiles($('files').hidden))
+  // 押しても、書いていた場所からカーソルが動かないようにする。
+  $('copy-path').addEventListener('mousedown', (event) => event.preventDefault())
+  $('copy-path').addEventListener('click', copyNotePath)
   $('to-chat').addEventListener('click', () => (rightActive() ? split.post({ type: MSG.CHAT }) : sendSelectionToChat()))
   setupChatBox()
   setupSideResize()
@@ -2902,6 +2968,42 @@ async function receiveFromLeft(data) {
   }
 }
 
+// 埋め込みの画面では選択してコピーする方法しか通らないことがあるので、それも用意する。
+function execCopy(text) {
+  const area = document.createElement('textarea')
+  area.value = text
+  area.setAttribute('readonly', '')
+  area.style.position = 'fixed'
+  area.style.opacity = '0'
+  document.body.append(area)
+  area.select()
+  try {
+    return document.execCommand('copy')
+  } finally {
+    area.remove()
+  }
+}
+
+// 今開いているノートの絶対パスをコピーする。閲覧だけのノートでも使える。
+// 押した直後でないとコピーを断るブラウザがあるので、サーバーを待たずにその場で作る。
+async function copyNotePath() {
+  if (!currentPath) return
+  const full = absolutePath(rootPaths, currentPath, platform)
+  if (!full) {
+    showMessage('このノートのパスを調べられませんでした。')
+    return
+  }
+  // 表のマスなどで入力していた場所へ戻す。
+  const before = document.activeElement
+  if (await copyText(full, { clipboard: navigator.clipboard, execCopy })) {
+    setStatusHint('コピーしました')
+    if (view && before === view.contentDOM) view.focus()
+    else if (before instanceof HTMLElement && before !== document.body && before.isConnected) before.focus()
+  } else {
+    showCopyable(keyLabel('コピーできませんでした。下のパスは選択済みです。Cmd+C でコピーしてください。'), full)
+  }
+}
+
 function setStatusHint(text) {
   const box = $('status')
   const previous = box.dataset.state
@@ -2991,6 +3093,7 @@ async function syncAppearance() {
 async function start() {
   localizeKeyHints(document) // WindowsではCmdの案内をCtrlにする（鍵の確認を待たずに）
   await takeTicket()
+  await bindChat()
   bindChrome()
   applyTheme()
   if (PANE !== 'right') $('toggle-theme').addEventListener('click', toggleTheme)
@@ -3061,12 +3164,18 @@ window.noteEditor = { getView: () => view, getSaver: () => saver }
 takeToken()
 // 開いているタブへ#だけ変えて移動してきたときは、読み込み直しが起きない。
 window.addEventListener('hashchange', async () => {
+  // 別のチャットから同じタブへ移ってきたときは、送り先もそのチャットに変える（引き換えてから読み込み直して、チャット欄を結び付け直す）。
+  const hadCode = takeChatBindCode()
   const isToken = Boolean(tokenFromHash(location.hash))
   const isTicket = Boolean(ticketFromHash(location.hash))
-  if (!isToken && !isTicket) return
+  if (!isToken && !isTicket) {
+    if (hadCode && (await bindChat())) location.reload()
+    return
+  }
   const changed = isToken ? takeToken() : await takeTicket()
+  const linkChanged = hadCode ? await bindChat() : false
   // 起動に失敗していたタブは、合言葉が同じでも開き直す。鍵を断られたことは、読み込み直したあとの開けない画面へ引き継ぐ。
-  if (changed || !view) {
+  if (changed || !view || linkChanged) {
     if (!changed && keyRefused) markKeyRefused(sessionStore)
     location.reload()
   }
