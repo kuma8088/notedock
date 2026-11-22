@@ -7,7 +7,7 @@ import { EditorState, EditorSelection } from '@codemirror/state'
 import { headingsOf, linkCompletion } from '../src/complete.mjs'
 import { relativeHref, resolveHref, slugify } from '../src/links.mjs'
 import { noteMarkdown } from '../src/markdown-ext.mjs'
-import { findCallouts, hiddenRanges, noteContext, previewField, setComposing, setMode } from '../src/preview.mjs'
+import { atNoteStart, findCallouts, headingPlace, hiddenRanges, noteContext, previewField, setComposing, setMode } from '../src/preview.mjs'
 import { addColumn, addRow, deleteRow, parseTable, replaceCell, setAlign, sortRows, splitRow } from '../src/table-model.mjs'
 import { CheckboxWidget, TableWidget, cleanCss, hasExternalRef, imagePlan, isExternalHref, keepHref } from '../src/widgets.mjs'
 import { deleteProperty, inferType, parseFrontmatter, renameProperty, setProperty } from '../src/yaml-lite.mjs'
@@ -323,4 +323,40 @@ test('keepHref: 許した図の <image> だけ、http(s) の画像を残す', ()
   assert.equal(keep('image', 'javascript:alert(1)', true), false)
   assert.equal(keep('image', 'https://x\\@y/', true), false)
   assert.equal(keep('image', '#a', false), true)
+})
+
+test('ノートの先頭の見出しだけに、上の余白を付けない印が付く（frontmatter の直後も先頭として扱う）', () => {
+  const firstClass = (doc) => {
+    const state = make(doc, doc.length)
+    const classes = []
+    state.field(previewField).deco.between(0, doc.length, (from, to, value) => {
+      if (value.spec.class?.includes('cm-heading')) classes.push([state.doc.lineAt(from).number, value.spec.class.includes('cm-heading-first')])
+    })
+    return classes
+  }
+  assert.deepEqual(firstClass('# 先頭\n本文\n## 二つ目'), [[1, true], [3, false]])
+  assert.deepEqual(firstClass('---\ntitle: a\n---\n\n# 先頭\n## 二つ目'), [[5, true], [6, false]])
+  assert.deepEqual(firstClass('本文\n# 先頭ではない'), [[2, false]])
+  const state = make('---\na: 1\n---\n# 見出し', 0)
+  assert.equal(atNoteStart(state, state.doc.line(4).from), true)
+  assert.equal(atNoteStart(make('x\n# 見出し', 0), 2), false)
+})
+
+test('見出しの上の余白の印: 先頭、段落などのあと、見出しのすぐあと', () => {
+  const doc = '# 先頭\n## 見出しのすぐあと\n本文\n\n### 段落のあと\n- 項目\n#### 箇条書きのあと\n\n\n##### 空行をはさんだ見出しのあと\n```\nx\n```\n###### コードのあと'
+  const state = make(doc, 0)
+  const place = (text) => headingPlace(state, doc.indexOf(text))
+  assert.equal(place('# 先頭'), ' cm-heading-first')
+  assert.equal(place('## 見出しのすぐあと'), '')
+  assert.equal(place('### 段落のあと'), ' cm-heading-after-block')
+  assert.equal(place('#### 箇条書きのあと'), ' cm-heading-after-block')
+  assert.equal(place('##### 空行'), '')
+  assert.equal(place('###### コードのあと'), ' cm-heading-after-block')
+  const quoted = '本文\n\n> 引用\n## 引用のあと\n\n> [!note]\n> コールアウト\n\n## コールアウトのあと\n\n---\n## 区切り線のあと\n\n| a |\n| - |\n| 1 |\n\n## 表のあと'
+  const s2 = make(quoted, 0)
+  const at = (text) => headingPlace(s2, quoted.indexOf(text))
+  assert.equal(at('## 引用のあと'), '')
+  assert.equal(at('## コールアウトのあと'), '')
+  assert.equal(at('## 区切り線のあと'), '')
+  assert.equal(at('## 表のあと'), ' cm-heading-after-block')
 })

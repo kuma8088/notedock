@@ -119,11 +119,11 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
         case 'ATXHeading4':
         case 'ATXHeading5':
         case 'ATXHeading6':
-          addLine(from, `cm-heading cm-h${name.slice(-1)}`)
+          addLine(from, `cm-heading cm-h${name.slice(-1)}${headingPlace(state, from)}`)
           return undefined
         case 'SetextHeading1':
         case 'SetextHeading2':
-          eachLine(state, from, to, (line) => addLine(line.from, `cm-heading cm-h${name.slice(-1)}`))
+          eachLine(state, from, to, (line) => addLine(line.from, `cm-heading cm-h${name.slice(-1)}${line.from === from ? headingPlace(state, from) : ''}`))
           return undefined
         case 'HeaderMark': {
           if (lineTouched(from)) return undefined
@@ -400,6 +400,36 @@ function decorateInlineHtml(node, doc, touches, add) {
   hideRange(add, node.from, node.to)
   hideRange(add, closeFrom, closeTo)
   if (closeFrom > node.to) add(node.to, closeFrom, Decoration.mark({ class: cls }))
+}
+
+// ノートの先頭（前にあるのが空行と frontmatter だけ）かどうか。先頭の見出しには上の余白を付けない（Obsidianの閲覧表示と同じ）。
+export function atNoteStart(state, pos) {
+  let start = 0
+  const first = syntaxTree(state).topNode.firstChild
+  if (first?.name === 'Frontmatter' && first.from === 0) start = first.to
+  // 先頭から順に見て、空白以外が出たところで止める（長いノートで毎回全部を切り出さない）。
+  for (const iter = state.doc.iterRange(start, pos); !iter.next().done; ) {
+    if (iter.value.trim() !== '') return false
+  }
+  return true
+}
+
+// 見出しの上の余白を決めるための印。ノートの先頭なら cm-heading-first（余白なし）。
+// 前のかたまりが段落・コード・表・箇条書きなら cm-heading-after-block（閲覧の表示で広く空ける。Obsidianの --heading-spacing）。
+// Obsidianの :is(p,pre,table,ul,ol) + 見出し と同じで、見出し・引用・コールアウト・区切り線のあとには付けない。
+const AFTER_BLOCK = new Set(['Paragraph', 'FencedCode', 'CodeBlock', 'Table', 'BulletList', 'OrderedList'])
+
+export function headingPlace(state, pos) {
+  if (atNoteStart(state, pos)) return ' cm-heading-first'
+  let line = state.doc.lineAt(pos)
+  while (line.number > 1) {
+    line = state.doc.line(line.number - 1)
+    if (line.text.trim() !== '') break
+  }
+  // 前の行を含む、いちばん外側のかたまり（Document の子）の種類で決める。
+  let block = syntaxTree(state).resolveInner(line.from, 1)
+  while (block.parent && block.parent.name !== 'Document') block = block.parent
+  return AFTER_BLOCK.has(block.name) ? ' cm-heading-after-block' : ''
 }
 
 function addIndentGuides(state, add) {

@@ -30,6 +30,7 @@ import { askChoice, askConfirm, askNewNote, askPlace, askText, showMessage } fro
 import { keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
 import { ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
+import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
@@ -822,6 +823,7 @@ function extensionsFor(path, canEdit) {
     noteMarkdown(languages),
     contextSlot.of(noteContext.of({ path, known, newNoteDir: defaultNoteDir(path, noteFolders(notes)), api, editable: canEdit })),
     previewField,
+    hangingIndent,
     editableSlot.of(editableExtensions(canEdit)),
     editorKeys,
     editorEvents,
