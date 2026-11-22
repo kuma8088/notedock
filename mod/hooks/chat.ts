@@ -16,6 +16,7 @@ export type EditorState = {
   root?: string
   askChat?: { text: string; at: number }
   sendChat?: { text: string; at: number }
+  lines?: { from: number; to: number } | null // 選んでいる行（1から数える）。何も選んでいなければ無い
 }
 
 export const MAX_TEXT = 4000 // 入力欄へ入れる文字、添える選択の文字、送る文の上限
@@ -79,6 +80,33 @@ function noteInfo(state: EditorState, now: number, root: string, os: Os): NoteIn
   const win = (p: string) => (os === 'win32' ? p.replace(/\//g, '\\') : p)
   const where = other ? joinPath(os, win(state.root as string), win(state.path)) : state.path
   return { where, dirty: !!state.dirty, selection: state.selection ? state.selection.slice(0, MAX_TEXT) : '' }
+}
+
+// 入力欄の @ の候補に出す「選んでいる行」の1行。text は候補を選んだときに入る文（@場所#L12-18）。
+// 本文はエンジンが @ のファイルとして読む（行の指定付き）。Modは本文を読まない。
+// 出さないとき（ノートが無い・古い・行を選んでいない・場所に空白がある・もう選んだあと）は null。
+export type LineMention = { text: string; label: string; description: string }
+
+const MENTION_WORD = '@選んでいる行'
+
+export function lineMention(state: EditorState, now: number, root: string, os: Os, token: string): LineMention | null {
+  const info = noteInfo(state, now, root, os)
+  const lines = state.lines
+  if (!info || !lines) return null
+  const { from, to } = lines
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < from) return null
+  // 空白のある場所は1語にならず、エンジンが @ の続きとして読めないので出さない。
+  if (/\s/.test(info.where)) return null
+  const text = `@${info.where}#L${from === to ? from : `${from}-${to}`}`
+  if (token === text) return null
+  const fits = token === '@' || text.startsWith(token) || MENTION_WORD.startsWith(token) || token.startsWith(MENTION_WORD)
+  if (!fits) return null
+  const range = from === to ? `${from}行` : `${from}〜${to}行`
+  return {
+    text,
+    label: `選んでいる行：${state.path} の${range}`,
+    description: info.dirty ? 'NoteDock（保存していない変更は入らない）' : 'NoteDock',
+  }
 }
 
 // 本人が打った発言に、prompt.submit のフックで context として添える文。

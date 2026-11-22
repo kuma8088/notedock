@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { chatFile, describeNote, hideKeys, linkDir, quoteForPrompt, titleFrom, TYPED_ORIGINS } from './chat'
+import { chatFile, describeNote, hideKeys, lineMention, linkDir, quoteForPrompt, titleFrom, TYPED_ORIGINS } from './chat'
 import { createNotedock, ioFor, wire } from './register'
 import { VERSION } from './release'
 
@@ -760,4 +760,75 @@ test('チャットが終わった理由を、デバッグのログと「終わ�
   const z = await opened()
   await z.nd.sessionEnd(undefined)
   expect(z.link().reason).toBe('unknown')
+})
+
+// ---- 入力欄の @ の候補「選んでいる行」 ----
+
+test('@ を打つと、選んでいる行の候補を出す。選ぶと @場所#L から行までが入る', async () => {
+  const x = await opened()
+  x.editor({ path: 'notes/Home.md', selection: '本文', lines: { from: 12, to: 18 }, updatedAt: x.now() - 100 })
+  expect(await x.nd.autocomplete({ token: '@' })).toEqual({
+    text: '@notes/Home.md#L12-18',
+    label: '選んでいる行：notes/Home.md の12〜18行',
+    description: 'NoteDock',
+  })
+  // 共有の切り替えがオフでも出す（本人が選んだときだけ渡るため）
+  x.share(false)
+  expect((await x.nd.autocomplete({ token: '@選' }))?.text).toBe('@notes/Home.md#L12-18')
+  expect((await x.nd.autocomplete({ token: '@notes/Ho' }))?.text).toBe('@notes/Home.md#L12-18')
+})
+
+test('1行だけなら #L12、保存していない変更があれば添え書きに出す', () => {
+  const row = lineMention({ path: 'Home.md', lines: { from: 3, to: 3 }, dirty: true, updatedAt: 900 }, 1000, '/V/notes', 'darwin', '@')
+  expect(row?.text).toBe('@Home.md#L3')
+  expect(row?.label).toBe('選んでいる行：Home.md の3行')
+  expect(row?.description).toContain('保存していない変更')
+})
+
+test('出さないとき：行を選んでいない・古い・別の語を打っている・もう選んだあと・場所に空白がある・@ 以外', async () => {
+  const x = await opened()
+  x.editor({ path: 'Home.md', updatedAt: x.now() - 100 })
+  expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
+  x.editor({ path: 'Home.md', lines: { from: 1, to: 2 }, updatedAt: x.now() - 31 * MIN })
+  expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
+  x.editor({ path: 'Home.md', lines: { from: 1, to: 2 }, updatedAt: x.now() - 100 })
+  expect(await x.nd.autocomplete({ token: '@src' })).toBe(null)
+  expect(await x.nd.autocomplete({ token: '@Home.md#L1-2' })).toBe(null)
+  expect(await x.nd.autocomplete({ token: '#' })).toBe(null)
+  x.editor({ path: 'My Notes/Home.md', lines: { from: 1, to: 2 }, updatedAt: x.now() - 100 })
+  expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
+  x.editor({ path: 'Home.md', lines: { from: 5, to: 2 }, updatedAt: x.now() - 100 })
+  expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
+})
+
+test('別のフォルダーのノートは、フォルダーからの場所で入れる', async () => {
+  const x = await opened()
+  x.editor({ path: 'Home.md', root: '/tmp/copy', lines: { from: 1, to: 2 }, updatedAt: x.now() - 100 })
+  expect((await x.nd.autocomplete({ token: '@' }))?.text).toBe('@/tmp/copy/Home.md#L1-2')
+})
+
+test('エディターを開いていないチャットでは出さない', async () => {
+  const x = world()
+  await x.start()
+  expect(await x.nd.autocomplete({ token: '@' })).toBe(null)
+})
+
+test('フックのつなぎ：prompt.autocomplete は @ の語にだけつなぎ、候補をエンジンの答えの先頭に足す', async () => {
+  const hooks: Record<string, { matcher: any; fn: (...a: any[]) => any }> = {}
+  const on: any = (name: string, a: any, b?: any) => {
+    hooks[name] = typeof a === 'function' ? { matcher: undefined, fn: a } : { matcher: a, fn: b }
+    return { catch: () => {} }
+  }
+  const row = { text: '@Home.md#L1-2', label: '選んでいる行：Home.md の1〜2行', description: 'NoteDock' }
+  const nd: any = { autocomplete: async () => row, toolActivity: () => {} }
+  wire(on, nd)
+  const h = hooks['prompt.autocomplete']!
+  expect(h.matcher.token.test('@a')).toBe(true)
+  expect(h.matcher.token.test('#a')).toBe(false)
+  const next = async () => ({ suggestions: [{ text: 'other' }] })
+  const out: any = await h.fn({}, { text: '@', cursor: 1, token: '@', start: 0 }, next)
+  expect(out.suggestions).toEqual([row, { text: 'other' }])
+  nd.autocomplete = async () => null
+  const same: any = await h.fn({}, { text: '@', cursor: 1, token: '@', start: 0 }, next)
+  expect(same.suggestions).toEqual([{ text: 'other' }])
 })

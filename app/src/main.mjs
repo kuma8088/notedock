@@ -40,6 +40,7 @@ import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
 import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
 import { createConnectionWatch, createVersionWatch } from './connection.mjs'
+import { linesFrom, selectedLines } from './lines.mjs'
 import { beginTableCell, showMenu } from './widgets.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
@@ -62,7 +63,7 @@ function setRightOpen(open) {
 // 右の枠が操作中か（右の枠で使う）。左から ACTIVE で知らされる。
 let paneActive = false
 // 左の枠で使う。右の枠から OPENED と STATE で知らされた、右の枠のノートの様子。
-let rightState = { path: null, selection: '', dirty: false, headings: null }
+let rightState = { path: null, selection: '', dirty: false, headings: null, lines: null }
 // 右の枠の準備ができたら開いてもらうノート。分けた直後や、分けてすぐ右で開くときに使う。
 let rightWant = null
 // 右の枠が最後に知らせてきた、開いているノート。同じノートの OPENED は見出しの更新として扱う。
@@ -1468,6 +1469,7 @@ function sendState(extra = {}) {
       type: MSG.STATE,
       path: open ? currentPath : null,
       selection: open ? view.state.sliceDoc(selection.from, selection.to).slice(0, 4000) : '',
+      lines: open ? selectedLines(view.state) : null,
       dirty: open && !CLEAN_STATES.has($('status').dataset.state),
       ...(extra.askChat ? { askChat: extra.askChat } : {}),
     })
@@ -1487,7 +1489,7 @@ function sendState(extra = {}) {
   const text = view.state.sliceDoc(selection.from, selection.to).slice(0, 4000)
   return request('/api/state', {
     method: 'PUT',
-    body: JSON.stringify({ path: currentPath, selection: text, dirty: !CLEAN_STATES.has($('status').dataset.state), ...extra }),
+    body: JSON.stringify({ path: currentPath, selection: text, lines: selectedLines(view.state), dirty: !CLEAN_STATES.has($('status').dataset.state), ...extra }),
   }).catch(() => null)
 }
 
@@ -1496,7 +1498,7 @@ function putRightState(extra = {}) {
   if ($('status').dataset.state === 'elsewhere') return Promise.resolve(null)
   return request('/api/state', {
     method: 'PUT',
-    body: JSON.stringify({ path: rightState.path, selection: rightState.selection, dirty: rightState.dirty, ...extra }),
+    body: JSON.stringify({ path: rightState.path, selection: rightState.selection, lines: rightState.lines, dirty: rightState.dirty, ...extra }),
   }).catch(() => null)
 }
 
@@ -2815,7 +2817,7 @@ async function closeSplit() {
   setRightOpen(false)
   rightWant = null
   rightShown = null
-  rightState = { path: null, selection: '', dirty: false, headings: null }
+  rightState = { path: null, selection: '', dirty: false, headings: null, lines: null }
   syncSplitButton()
 }
 
@@ -2880,6 +2882,7 @@ function receiveFromRight(data) {
     rightState.path = typeof data.path === 'string' ? data.path : null
     rightState.selection = typeof data.selection === 'string' ? data.selection : ''
     rightState.dirty = Boolean(data.dirty)
+    rightState.lines = linesFrom(data.lines)
     if (data.askChat) {
       // 右の枠で選んだ文字を、左の「チャットへ」と同じくチャットの入力欄へ送る。
       putRightState({ askChat: data.askChat })

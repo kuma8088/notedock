@@ -4,7 +4,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Band } from '../types'
-import { chatFile, describeNote, hexOf, hideKeys, isSentText, linkDir, MAX_TEXT, newLinkText, noteForSend, quoteForPrompt, shareIsOn, titleFrom, TYPED_ORIGINS, withNote, type EditorState } from './chat'
+import { chatFile, describeNote, hexOf, hideKeys, isSentText, lineMention, linkDir, MAX_TEXT, newLinkText, noteForSend, quoteForPrompt, shareIsOn, titleFrom, TYPED_ORIGINS, withNote, type EditorState } from './chat'
 import { summarizeTranscript } from './chat-log'
 import { compareVersions, ensureBinary, installedBinary, onlyNewerInstalled, removeOldVersions } from './install'
 import { editorUrl, openPrompt, retryPrompt } from './open'
@@ -1243,6 +1243,16 @@ export function createNotedock(opts: { version?: string } = {}) {
       return state ? describeNote(state, await now(), base.root, base.host.os) : null
     },
 
+    // 入力欄で @ から打っているとき、このチャットに結び付いたエディターで選んでいる行を、候補の1行として返す。
+    // 選ぶと「@場所#L12-18」が入り、エンジンがその行を読んでClaudeに渡す。共有の切り替え（share.json）には関係なく出す。
+    async autocomplete(e: { token?: string }): Promise<{ text: string; label: string; description: string } | null> {
+      if (!io || typeof e.token !== 'string' || !e.token.startsWith('@')) return null
+      const dir = await chatReady()
+      if (!dir || base?.kind !== 'ok') return null
+      const state = (await readJson(cf(dir, 'state.json'))) as EditorState | null
+      return state ? lineMention(state, await now(), base.root, base.host.os, e.token) : null
+    },
+
     // チャットが終わったら、結び付けの印を「終わった」にし、番号を捨てる（エディターは送れない状態になる）。
     // /clear では同じチャットの画面が続く（Modもそのまま）ので、結び付けは残し、名前と会話の記録だけを新しくする。
     async sessionEnd(reason: string | undefined): Promise<void> {
@@ -1376,6 +1386,13 @@ export function wire(on: Parameters<Register>[0], nd: ReturnType<typeof createNo
   on('prompt.submit', async ($, e, next) => {
     const note = await nd.promptSubmit(e).catch(() => null)
     return next(note ? { ...e, context: [...(e.context ?? []), note] } : e)
+  })
+
+  // 入力欄の @ の候補に「選んでいる行：○○.md の12〜18行」を足す。エンジンの候補の下に並ぶ。
+  on('prompt.autocomplete', { token: /^@/ }, async ($, e, next) => {
+    const got = await next(e)
+    const row = await nd.autocomplete(e).catch(() => null)
+    return row ? { suggestions: [row, ...got.suggestions] } : got
   })
 
   on('session.end', async ($, e, next) => {
