@@ -1084,7 +1084,7 @@ function setupMentions(input) {
     }
     // 場所に空白や # @ : \ があるノートは、@ のあとに1語で書けない（# は行の指定と紛れる）ので出さず、理由だけ添える。
     const note = document.createElement('p')
-    note.className = 'chat-mention-note'
+    note.className = 'chat-mention-hidden'
     note.textContent = `場所に空白や # @ : \\ があるノート（${hidden}件）は、@ のあとに1語で書けないので出していません`
     list.replaceChildren(
       ...items.map((item, index) => {

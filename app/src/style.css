@@ -1346,7 +1346,7 @@ body[data-locked] #chat-open {
 .chat-mention-selection .chat-mention-label { font-weight: 600; }
 .chat-mention-detail { color: var(--muted); font-size: 11.5px; }
 .chat-mention-warn { color: var(--warning); }
-.chat-mention-note { margin: 4px 8px 2px; color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+.chat-mention-hidden { margin: 4px 8px 2px; color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
 
 #chat-add { font-size: 15px; padding: 3px 9px; }
 
