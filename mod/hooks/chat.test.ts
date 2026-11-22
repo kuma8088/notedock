@@ -1006,7 +1006,7 @@ test('会話のフォルダーと Vault が違うときは、@場所（ノート
   expect(isSentText(`見て @b.md\n\n${other}`, '見て @b.md')).toBe(true)
 })
 
-test('添える塊は、名前や囲みも含めて上限の中に収める', () => {
+test('添える塊の中身は名前や囲みも含めて上限の中に収め、入らなかった @ も断りの1行は入れる', () => {
   const long = 'y'.repeat(300)
   const text = Array.from({ length: 400 }, () => long).join('\n')
   const where = `/${'d'.repeat(3000)}/a.md`
