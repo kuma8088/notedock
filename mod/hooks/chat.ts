@@ -148,7 +148,8 @@ export type LineRef = { path: string; from: number; to: number }
 export function lineRefsIn(text: string): LineRef[] {
   const found: LineRef[] = []
   const seen = new Set<string>()
-  const re = /(?:^|\s)@([^\s@#]+)#L(\d+)(?:-(\d+))?(?=$|[\s、。，,.!?！？）)」』])/g
+  // @ の前が英数字や . _ % + - のとき（メールアドレスなど）は拾わない。後ろは数字・英字・- 以外なら何が続いてもよい（「@a.md#L1を直して」）。
+  const re = /(?<![0-9A-Za-z._%+-])@([^\s@#]+)#L(\d+)(?:-(\d+))?(?![0-9A-Za-z_-])/g
   for (const m of text.matchAll(re)) {
     const path = m[1]
     const from = Number(m[2])
@@ -163,10 +164,10 @@ export function lineRefsIn(text: string): LineRef[] {
   return found
 }
 
-// Vault の中の .md だけ。絶対パス・ドライブ名・\ ・ . や .. の段・空の段は読まない。
+// Vault の中の .md だけ。絶対パス・ドライブ名・\ ・ . で始まる段（.. や .git も）・空の段は読まない（サーバーが断る名前と合わせる）。
 export function safeVaultPath(path: string): boolean {
   if (!/\.md$/i.test(path) || path.startsWith('/') || /[\\:]/.test(path)) return false
-  return path.split('/').every(part => part !== '' && part !== '.' && part !== '..')
+  return path.split('/').every(part => part !== '' && !part.startsWith('.'))
 }
 
 // 読んだ中身（読めなければ null）から、文に添える塊を作る。行には番号を付ける。
@@ -194,8 +195,12 @@ export function mentionBlock(read: { ref: LineRef; where: string; text: string |
       used += line.length + 1
       body.push(line)
     }
+    if (!body.length) {
+      parts.push(`${name}: 長すぎるので添えませんでした`)
+      continue
+    }
     const shown = ref.from + body.length - 1
-    const cut = shown < ref.to ? `（${shown}行目まで。ここで切りました）` : ''
+    const cut = shown < Math.min(ref.to, lines.length) ? `（${shown}行目まで。長いのでここで切りました）` : shown < ref.to ? `（このファイルは${lines.length}行までです）` : ''
     const longest = Math.max(2, ...body.map(line => (line.match(/`+/g) ?? []).reduce((a, b) => Math.max(a, b.length), 0)))
     const fence = '`'.repeat(longest + 1)
     parts.push(`${name}${cut}\n${fence}\n${body.join('\n')}\n${fence}`)
@@ -205,8 +210,17 @@ export function mentionBlock(read: { ref: LineRef; where: string; text: string |
 
 // 打った文の @ の行を読んで、添える塊を作る。read はファイルを読む関数（読めなければ throw）。
 // 読むのはエディターの Vault（state.root、無ければ会話のフォルダー）の中。塊に書く場所は、会話のフォルダーと同じなら Vault から見た場所。
-export async function mentionsForSend(typed: string, state: EditorState, root: string, os: Os, read: (path: string) => Promise<string>): Promise<string | null> {
-  const refs = lineRefsIn(typed)
+// real は、たどった先の場所を返す関数（読めなければ throw）。シンボリックリンクで Vault の外へ出る場所は読まない。
+// 打った文が上限（MAX_TEXT）で切られていたら、末尾で切れたかもしれない指定は読まない（別の行を読まないため）。
+export async function mentionsForSend(
+  typed: string,
+  state: EditorState,
+  root: string,
+  os: Os,
+  read: (path: string) => Promise<string>,
+  real: (path: string) => Promise<string>,
+): Promise<string | null> {
+  const refs = lineRefsIn(typed.length >= MAX_TEXT ? typed.replace(/\S*$/, '') : typed)
   if (!refs.length) return null
   const vault = typeof state.root === 'string' && state.root ? state.root : root
   const other = rootKey(vault, os) !== rootKey(root, os)
@@ -214,10 +228,16 @@ export async function mentionsForSend(typed: string, state: EditorState, root: s
   const read2 = await Promise.all(
     refs.map(async ref => {
       const file = joinPath(os, win(vault), win(ref.path))
-      const text = await read(file).then(
-        t => (typeof t === 'string' ? t : null),
-        () => null,
+      const inside = await Promise.all([real(vault), real(file)]).then(
+        ([v, f]) => rootKey(f, os).startsWith(`${rootKey(v, os).replace(/[\\/]+$/, '')}${os === 'win32' ? '\\' : '/'}`),
+        () => false,
       )
+      const text = inside
+        ? await read(file).then(
+            t => (typeof t === 'string' ? t : null),
+            () => null,
+          )
+        : null
       return { ref, where: other ? file : ref.path, text }
     }),
   )

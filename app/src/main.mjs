@@ -1014,13 +1014,19 @@ function setupMentions(input) {
   let active = 0
   let at = null
   let seq = 0
-  const close = () => {
+  const hide = () => {
     list.hidden = true
     list.replaceChildren()
     items = []
     at = null
     input.removeAttribute('aria-activedescendant')
     input.setAttribute('aria-expanded', 'false')
+  }
+  const close = () => {
+    // 待っている読み込みの結果で、閉じた一覧を出し直さない。保存した中身も次に開くときに読み直す。
+    seq += 1
+    saved.clear()
+    hide()
   }
   const sectionsFor = async (path) => {
     const got = saved.get(path)
@@ -1036,12 +1042,17 @@ function setupMentions(input) {
   }
   const choose = (index) => {
     const item = items[index]
-    if (!item || !at) return
-    const next = applyMention(input.value, at, item.insert)
-    input.value = next.value
+    // 打ち進めたあとでも合うよう、語の場所はその場で取り直す。
+    const here = mentionQuery(input.value, input.selectionStart ?? 0) ?? at
+    if (!item || !here) return
+    const next = applyMention(input.value, here, item.insert)
+    input.focus()
+    // 取り消し（Cmd+Z）で戻せるよう、打ったのと同じ形で入れる。使えなければ値を直接替える。
+    input.setSelectionRange(here.from, here.to)
+    const added = next.value.slice(here.from, next.value.length - (input.value.length - here.to))
+    if (!document.execCommand?.('insertText', false, added)) input.value = next.value
     input.setSelectionRange(next.caret, next.caret)
     close()
-    input.focus()
   }
   const mark = () => {
     list.querySelectorAll('[role="option"]').forEach((row, index) => {
@@ -1063,7 +1074,8 @@ function setupMentions(input) {
   }
   const render = () => {
     if (!items.length && !hidden) {
-      close()
+      // 見出しを待っているあいだは、読み込みを止めずに隠すだけにする。
+      hide()
       return
     }
     // 場所に空白か # があるノートは、@ のあとに1語で書けない（# は行の指定と紛れる）ので出さず、理由だけ添える。
@@ -1114,24 +1126,33 @@ function setupMentions(input) {
     }
     const editor = editorForMention()
     const target = headingTarget({ query: found.query, editor, notes })
-    const sections = target ? await sectionsFor(target) : null
-    // 待っているあいだに打ち進めていたら、古い結果は捨てる。
+    const show = (sections) => {
+      const before = items[active]?.insert
+      at = found
+      items = mentionCandidates({
+        query: found.query,
+        editor,
+        notes,
+        headings: target && sections ? { path: target, sections, dirty: noteIsDirty(target) } : null,
+      })
+      hidden = unwritableCount(found.query, notes)
+      const keep = items.findIndex((item) => item.insert === before)
+      active = keep >= 0 ? keep : 0
+      render()
+    }
+    // 先にノートの候補を出し、見出しは読めたら足す。
+    const cached = target ? saved.get(target) : null
+    show(cached && Date.now() - cached.at < MENTION_FRESH_MS ? cached.sections : null)
+    if (!target || (cached && Date.now() - cached.at < MENTION_FRESH_MS)) return
+    const sections = await sectionsFor(target)
+    // 待っているあいだに打ち進めたり閉じたりしていたら、古い結果は捨てる。
     if (mine !== seq) return
     const again = mentionQuery(input.value, input.selectionStart ?? 0)
     if (!again || again.from !== found.from || again.query !== found.query) return
-    const before = items[active]?.insert
-    at = found
-    items = mentionCandidates({
-      query: found.query,
-      editor,
-      notes,
-      headings: target && sections ? { path: target, sections, dirty: noteIsDirty(target) } : null,
-    })
-    hidden = unwritableCount(found.query, notes)
-    const keep = items.findIndex((item) => item.insert === before)
-    active = keep >= 0 ? keep : 0
-    render()
+    show(sections)
   }
+  // 一覧のスクロールバーを押しても、入力欄から目が離れて閉じないようにする。
+  list.addEventListener('mousedown', (event) => event.preventDefault())
   input.setAttribute('aria-controls', 'chat-mentions')
   input.setAttribute('aria-autocomplete', 'list')
   input.setAttribute('aria-expanded', 'false')

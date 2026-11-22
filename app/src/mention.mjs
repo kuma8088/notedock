@@ -6,20 +6,24 @@ export const SELECTION_WORD = '選んでいる行'
 const MAX_NOTES = 30
 const MAX_HEADINGS = 30
 
-// カーソルの前の語が @ で始まっていれば、その語の始まりと、@ のあとに打った文字を返す。
-// @ の前が文の頭か空白のときだけ（メールアドレスなどで出さない）。
+// カーソルの前の語に @ があれば、@ の場所と、@ のあとに打った文字を返す。
+// @ の前が英数字や . _ % + - のとき（メールアドレスなど）は出さない。「これを@」のような日本語のあとは出す（Mod の読み取りと同じ決まり）。
 export function mentionQuery(value, caret) {
-  let start = caret
-  while (start > 0 && !/\s/.test(value[start - 1])) start -= 1
-  if (value[start] !== '@') return null
+  let word = caret
+  while (word > 0 && !/\s/.test(value[word - 1])) word -= 1
+  const at = value.lastIndexOf('@', caret - 1)
+  if (at < word) return null
+  if (at > 0 && /[0-9A-Za-z._%+-]/.test(value[at - 1])) return null
+  const start = at
   let end = caret
   while (end < value.length && !/\s/.test(value[end])) end += 1
   return { from: start, to: end, query: value.slice(start + 1, caret) }
 }
 
 // 空白や # のある場所は、@ の続きとして1語に書けない（# は行の指定と紛れる）ので候補に出さない。
+// @ : \ を含む場所と、. で始まる段がある場所も、Mod が読まないので出さない。
 export function writablePath(path) {
-  return typeof path === 'string' && path !== '' && !/[\s#]/.test(path)
+  return typeof path === 'string' && path !== '' && !/[\s#@:\\]/.test(path) && path.split('/').every((part) => part !== '' && !part.startsWith('.'))
 }
 
 export function lineToken(path, from, to) {

@@ -67,6 +67,7 @@ export type Io = {
   after: (ms: number, fn: () => void) => Timer
   every: (ms: number, fn: () => void) => Timer
   read: (path: string) => Promise<string>
+  realPath: (path: string) => Promise<string> // たどった先の場所（シンボリックリンクを解いたもの）。無ければ throw
   write: (path: string, text: string) => Promise<void>
   root: () => Promise<string>
   surfaces: () => Promise<readonly string[]>
@@ -117,6 +118,11 @@ export function ioFor($: Host, over: Partial<Io> = {}): Io {
     after: (ms, fn) => $.clock.after(ms, fn),
     every: (ms, fn) => $.clock.every(ms, fn),
     read: path => $.fs.read(path),
+    realPath: async path => {
+      const found = await $.fs.stat(path, { resolve: true })
+      if (typeof found?.realPath !== 'string') throw new Error('no real path')
+      return found.realPath
+    },
     write: (path, text) => $.fs.write(path, text),
     root: () => $.session.root(),
     surfaces: () => $.session.surfaces(),
@@ -1040,7 +1046,7 @@ export function createNotedock(opts: { version?: string } = {}) {
       const note = (await io.shareIsOn(dir, base.host.os)) ? noteForSend(state, t, base.root, base.host.os) : null
       // 打った文の「@場所#L12-18」は、エンジンが読まない（Modが送る文のため）ので、Modが保存したファイルから読んで添える。
       // 共有の切り替えには関係なく、本人が @ で指したときだけ。
-      const lines = await mentionsForSend(typed, state, base.root, base.host.os, io.read).catch(() => null)
+      const lines = await mentionsForSend(typed, state, base.root, base.host.os, io.read, io.realPath).catch(() => null)
       const text = withNote(withNote(typed, lines), note)
       pending = { text, at }
       // Claudeが作業中なら、終わってから送られる。

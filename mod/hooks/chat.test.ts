@@ -843,11 +843,17 @@ test('打った文の @場所#L12-18 を拾う。Vault の外へ出る場所・�
   expect(lineRefsIn('x@a.md#L1 @a.md @a.md#L5-2 @a.md#L0')).toEqual([])
   expect(lineRefsIn('@../x.md#L1 @/etc/x.md#L1 @a/./b.md#L1 @C:x.md#L1 @a.txt#L1')).toEqual([])
   expect(lineRefsIn('@a.md#L1 @a.md#L1')).toEqual([{ path: 'a.md', from: 1, to: 1 }])
-  expect(lineRefsIn('（@a.md#L1-2）')).toEqual([])
+  expect(lineRefsIn('（@a.md#L1-2）')).toEqual([{ path: 'a.md', from: 1, to: 2 }])
   expect(lineRefsIn('@a.md#L1-2、ここ')).toEqual([{ path: 'a.md', from: 1, to: 2 }])
+  // 空白なしで続く日本語と、@ の前の日本語。メールアドレスの形は拾わない
+  expect(lineRefsIn('@a.md#L12-18を直して')).toEqual([{ path: 'a.md', from: 12, to: 18 }])
+  expect(lineRefsIn('これ@a.md#L1 見て')).toEqual([{ path: 'a.md', from: 1, to: 1 }])
+  expect(lineRefsIn('me@a.md#L1 @a.md#L1x @a.md#L1-2-3')).toEqual([])
+  expect(lineRefsIn('@.git/x.md#L1 @a/.hidden.md#L1')).toEqual([])
   expect(safeVaultPath('a/b.md')).toBe(true)
   expect(safeVaultPath('a//b.md')).toBe(false)
   expect(safeVaultPath('a\\b.md')).toBe(false)
+  expect(safeVaultPath('.obsidian/x.md')).toBe(false)
 })
 
 test('@ の行を番号付きで添える。範囲が長すぎる・ファイルが短い・読めないときはそう書く', () => {
@@ -864,7 +870,9 @@ test('@ の行を番号付きで添える。範囲が長すぎる・ファイル
   // 本文に ``` があれば、囲みをそれより長くする
   expect(mentionBlock([{ ref: { path: 'a.md', from: 1, to: 1 }, where: 'a.md', text: '```js' }])).toContain('````\n1\t```js\n````')
   const long = mentionBlock([{ ref: { path: 'a.md', from: 1, to: 1000 }, where: 'a.md', text: 'x\n'.repeat(1000) }])!
-  expect(long).toContain('400行目まで。ここで切りました')
+  expect(long).toContain('400行目まで。長いのでここで切りました')
+  expect(mentionBlock([{ ref: { path: 'a.md', from: 2, to: 9 }, where: 'a.md', text }])).toContain('@a.md#L2-9（このファイルは3行までです）')
+  expect(mentionBlock([{ ref: { path: 'a.md', from: 1, to: 1 }, where: 'a.md', text: 'y'.repeat(30000) }])).toContain('@a.md#L1: 長すぎるので添えませんでした')
 })
 
 test('読むのはエディターの Vault の中。会話のフォルダーが Vault と違えば、塊には Vault の中の場所を書く', async () => {
@@ -873,16 +881,31 @@ test('読むのはエディターの Vault の中。会話のフォルダーが 
     seen.push(p)
     return 'a\nb\n'
   }
-  const same = await mentionsForSend('@x/a.md#L2', { root: '/V/notes' }, '/V/notes', 'darwin', read)
+  const real = async (p: string) => p
+  const same = await mentionsForSend('@x/a.md#L2', { root: '/V/notes' }, '/V/notes', 'darwin', read, real)
   expect(seen).toEqual(['/V/notes/x/a.md'])
   expect(same).toContain('@x/a.md#L2\n')
-  const other = await mentionsForSend('@x/a.md#L2', { root: '/V/test' }, '/V/notes', 'darwin', read)
+  const other = await mentionsForSend('@x/a.md#L2', { root: '/V/test' }, '/V/notes', 'darwin', read, real)
   expect(seen[1]).toBe('/V/test/x/a.md')
   expect(other).toContain('@/V/test/x/a.md#L2\n')
-  expect(await mentionsForSend('行の指定なし @x/a.md', { root: '/V/notes' }, '/V/notes', 'darwin', read)).toBe(null)
-  const win = await mentionsForSend('@x/a.md#L1', { root: 'C:\\Notes' }, 'C:\\Notes', 'win32', async p => (seen.push(p), 'a'))
+  expect(await mentionsForSend('行の指定なし @x/a.md', { root: '/V/notes' }, '/V/notes', 'darwin', read, real)).toBe(null)
+  const win = await mentionsForSend('@x/a.md#L1', { root: 'C:\\Notes' }, 'C:\\Notes', 'win32', async p => (seen.push(p), 'a'), real)
   expect(seen.at(-1)).toBe('C:\\Notes\\x\\a.md')
   expect(win).toContain('@x/a.md#L1')
+})
+
+test('シンボリックリンクで Vault の外へ出る場所は読まない。上限で切れた文の末尾の指定も読まない', async () => {
+  const seen: string[] = []
+  const read = async (p: string) => (seen.push(p), 'a\nb\n')
+  const real = async (p: string) => (p === '/V/notes/link.md' ? '/etc/secret.md' : p)
+  const out = await mentionsForSend('@link.md#L1 @ok.md#L1', { root: '/V/notes' }, '/V/notes', 'darwin', read, real)
+  expect(seen).toEqual(['/V/notes/ok.md'])
+  expect(out).toContain('@link.md#L1: 読めませんでした')
+  const cut = `${'あ'.repeat(4000 - '@ok.md#L1 @ok.md#L1'.length - 1)} @ok.md#L2 @ok.md#L1`
+  expect(cut.length).toBe(4000)
+  const got = await mentionsForSend(cut, { root: '/V/notes' }, '/V/notes', 'darwin', read, real)
+  expect(got).toContain('@ok.md#L2')
+  expect(got).not.toContain('@ok.md#L1\n')
 })
 
 test('@ の行が続く文も、エディターから送った文とみなす（Modを読み込み直したあと）', () => {

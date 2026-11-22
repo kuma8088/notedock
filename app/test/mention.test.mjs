@@ -8,6 +8,8 @@ test('@ の語は、文の頭か空白のあとだけ', () => {
   assert.deepEqual(mentionQuery('見て @me', 6), { from: 3, to: 6, query: 'me' })
   assert.deepEqual(mentionQuery('a @memo b', 5), { from: 2, to: 7, query: 'me' })
   assert.equal(mentionQuery('mail@example', 12), null)
+  assert.deepEqual(mentionQuery('これを@pl', 6), { from: 3, to: 6, query: 'pl' })
+  assert.equal(mentionQuery('x.@a', 4), null)
   assert.equal(mentionQuery('abc', 3), null)
   assert.equal(mentionQuery('@a b', 4), null)
 })
@@ -17,6 +19,8 @@ test('空白や # のある場所は書けない', () => {
   assert.equal(writablePath('a b.md'), false)
   assert.equal(writablePath('a#b.md'), false)
   assert.equal(writablePath(''), false)
+  assert.equal(writablePath('a@b.md'), false)
+  assert.equal(writablePath('.obsidian/x.md'), false)
 })
 
 test('行の指定。1行だけなら数は1つ', () => {
