@@ -1014,6 +1014,7 @@ function setupMentions(input) {
   let active = 0
   let at = null
   let seq = 0
+  let closed = 0 // 閉じた回数。閉じる前に出した読み込みの中身は覚えない
   const hide = () => {
     list.hidden = true
     list.replaceChildren()
@@ -1025,18 +1026,19 @@ function setupMentions(input) {
   const close = () => {
     // 待っている読み込みの結果で、閉じた一覧を出し直さない。保存した中身も次に開くときに読み直す。
     seq += 1
+    closed += 1
     saved.clear()
     hide()
   }
   const sectionsFor = async (path) => {
-    const mine = seq
+    const mine = closed
     const got = saved.get(path)
     if (got && Date.now() - got.at < MENTION_FRESH_MS) return got.sections
     try {
       const data = await api.read(path)
       const sections = sectionsOf(data?.text ?? '')
       // 閉じたあとに届いた中身は覚えない（閉じるときに消したものを書き戻さない）。
-      if (mine === seq) saved.set(path, { at: Date.now(), sections })
+      if (mine === closed) saved.set(path, { at: Date.now(), sections })
       return sections
     } catch {
       return null
