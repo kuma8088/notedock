@@ -4,7 +4,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Band } from '../types'
-import { chatFile, claimChat, describeNote, hideKeys, isSentText, MAX_TEXT, noteForSend, quoteForPrompt, releaseChat, shareIsOn, TYPED_ORIGINS, withNote, type EditorState } from './chat'
+import { chatFile, describeNote, hexOf, hideKeys, isSentText, linkDir, MAX_TEXT, newLinkText, noteForSend, quoteForPrompt, shareIsOn, titleFrom, TYPED_ORIGINS, withNote, type EditorState } from './chat'
 import { summarizeTranscript } from './chat-log'
 import { compareVersions, ensureBinary, installedBinary, onlyNewerInstalled, removeOldVersions } from './install'
 import { editorUrl, openPrompt, retryPrompt } from './open'
@@ -31,10 +31,11 @@ const RETRY_WINDOW_MS = 2 * 60_000 // 番が始まってから、頼み直しを
 const HINT_MS = 10 * 60_000 // 頼んでいないときの案内や、押したあとの理由を出しておく長さ
 const RUN_WAIT_MS = 140_000 // 押したあと、サーバーが動き出すのを待つ上限（起動の上限2分＋少し）
 const CHAT_MS = 1000 // チャット欄の見回りの間隔（エディターから送られた文、引用、話し相手の印、会話の記録）
-const OWNER_BEAT_MS = 10_000 // 話し相手は、この間隔で印の時刻を書き直す（エディターは40秒より古い印を「相手なし」とみなす）
+const OWNER_BEAT_MS = 10_000 // 結び付けの印（link.json）の時刻を書き直す間隔（サーバーは40秒より古い印を「つながっていたチャットが無い」とみなす）
 const LOG_MIN_MS = 2000 // 会話の記録の書き出しは、2秒に1回まで
 const LOG_BEAT_MS = 5000 // Claudeの作業中は、5秒ごとに書き直して、まだ動いていると分かるようにする
 const CHAT_RECENT_MS = 30 * 60_000 // 送った文の番を待つ上限
+const SEND_STALE_MS = 2 * 60_000 // エディターが書いてから、これより時間がたった送る文は送らない（AIの判断）
 const TOOLS_RETRY_MS = 30_000 // ツールを登録できなかったとき、登録し直す間隔
 const CLEAN_RETRY_MS = 10_000 // 古いバージョンのフォルダーを消せなかったとき、消し直す間隔
 const CLEAN_RETRY_LIMIT_MS = 2 * 60_000 // 消し直しを10秒おきに続ける長さ
@@ -69,7 +70,6 @@ export type Io = {
   write: (path: string, text: string) => Promise<void>
   root: () => Promise<string>
   surfaces: () => Promise<readonly string[]>
-  sessionId: () => Promise<string>
   registerNote: () => Promise<unknown>
   registerNotedock: () => Promise<unknown>
   submit: (text: string) => Promise<any>
@@ -91,18 +91,24 @@ export type Io = {
   readServerInfo: (host: HostInfo, vaultId: string) => Promise<ServerInfo | null>
   setBand: (band: Band) => Promise<void>
   registerTools: (ctx: ToolContext) => Promise<ToolFailure[] | void> // 断られたツールの名前と理由（空なら全部登録できた）
-  claimChat: (vaultDir: string, sessionId: string, os: Os, since?: number) => Promise<void>
-  releaseChat: (vaultDir: string, sessionId: string, os: Os) => Promise<void>
-  shareIsOn: (vaultDir: string, os: Os) => Promise<boolean>
+  randomLink: () => string // 推測できない番号（このチャットとエディターを結び付ける）
+  hashLink: (raw: string) => Promise<string> // 番号のハッシュ（結び付けのフォルダーの名前）
+  loadLink: () => Promise<string | null> // このチャットの番号（Modを読み込み直しても残る $.state）
+  saveLink: (raw: string | null) => Promise<void>
+  shareIsOn: (dir: string, os: Os) => Promise<boolean>
   exists: (path: string) => Promise<boolean>
   messages: () => Promise<readonly any[]>
   fill: (text: string) => Promise<unknown> // 入力欄の今のカーソルの位置に入れる
   sendAsUser: (text: string) => Promise<any> // 本人の発言として送る（エディターのチャット欄から）
   move: (host: HostInfo, from: string, to: string) => Promise<number> // 差し替える（終了コード）
   fetch: (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{ status: number; ok: boolean; text: string }>
+  debug: (text: string) => void // Modのデバッグのログに1行（画面にもClaudeにも出さない）
 }
 
 const bandAtom = atom({ plugin: 'notedock', key: 'band' } as const, null)
+const LINK_RE = /^[A-Za-z0-9_-]{43}$/ // 乱数（32バイト）を base64url にした形
+const FOLDER_RE = /^[0-9a-f]{64}$/ // 結び付けのフォルダーの名前（乱数のハッシュ）
+const BIND_KEEP = 5 // 同時に使える結び付けの合図の数（開き直しや /note を重ねたとき）
 
 // テストでは over で、ダウンロード・起動・帯などを代役に差し替える。
 export function ioFor($: Host, over: Partial<Io> = {}): Io {
@@ -114,7 +120,6 @@ export function ioFor($: Host, over: Partial<Io> = {}): Io {
     write: (path, text) => $.fs.write(path, text),
     root: () => $.session.root(),
     surfaces: () => $.session.surfaces(),
-    sessionId: () => $.session.id(),
     registerNote: () => $.command.register({ name: 'note', description: 'ノートをNoteDockで開くリンクを出す（例: /note Home.md）', argumentHint: '[ノートの場所]' }),
     registerNotedock: () => $.command.register({ name: 'notedock', description: 'ノートをNoteDockで開くリンクを出す（例: /notedock Home.md）', argumentHint: '[ノートの場所]' }),
     submit: text => $.prompt.submit({ text }),
@@ -136,8 +141,19 @@ export function ioFor($: Host, over: Partial<Io> = {}): Io {
     readServerInfo: (host, id) => readServerInfo($, host, id),
     setBand: band => update($, bandAtom, () => band),
     registerTools: ctx => registerTools($, ctx),
-    claimChat: (dir, sessionId, os, since) => claimChat($, dir, sessionId, os, since),
-    releaseChat: (dir, sessionId, os) => releaseChat($, dir, sessionId, os),
+    randomLink: () => {
+      const bytes = new Uint8Array(32)
+      crypto.getRandomValues(bytes)
+      return newLinkText(bytes)
+    },
+    hashLink: async raw => hexOf(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw))),
+    loadLink: async () => {
+      const value = (await $.state.get({ plugin: 'notedock', key: 'chatLink' }))?.value
+      return typeof value === 'string' && FOLDER_RE.test(value) ? value : null
+    },
+    saveLink: async raw => {
+      await $.state.set({ plugin: 'notedock', key: 'chatLink' }, raw)
+    },
     shareIsOn: (dir, os) => shareIsOn($, dir, os),
     exists: path => $.fs.exists(path),
     messages: () => $.session.messages(),
@@ -145,6 +161,7 @@ export function ioFor($: Host, over: Partial<Io> = {}): Io {
     sendAsUser: text => $.prompt.submit({ text, asUser: true }),
     move: async (host, from, to) => (await runCmd($, moveCmd(host, from, to))).exitCode,
     fetch: (url, init) => $.http.fetch(url, init),
+    debug: text => $.ui.log(text, { to: 'debug' }),
   }
   return { ...io, ...over }
 }
@@ -211,6 +228,7 @@ type Sent = {
   confirmed: boolean // turn.start で番が始まったのを見た（submit が返った時刻は仮）
   retried: boolean
   req: number // どの押した回の頼みか
+  link: string | null // 開くリンクに付けた、このチャットの番号（頼み直しにも付ける）
 }
 
 // version は、このModのバージョン（テストでは差し替える）。サーバーを入れ替えるかどうかを、これと比べて決める。
@@ -268,9 +286,15 @@ export function createNotedock(opts: { version?: string } = {}) {
   let shown = 'null'
   let sent: Sent | null = null
 
-  // チャット欄。話し相手（chat-owner.json に書かれたチャット）だけが、送る・引用・会話の記録を受け持つ。
-  let sessionId = ''
+  // チャット欄。エディターを開いたこのチャットが作った番号（link）に結び付いたエディターだけと、送る・引用・会話の記録をやり取りする。
+  let link: { hash: string } | null = null // このチャットの結び付けのフォルダーの名前（推測できない乱数のハッシュ）
+  let binds: { h: string; until: number }[] = [] // まだ使える結び付けの合図のハッシュと期限
+  let endedWhy = 'unknown' // 最後にチャットが終わった理由（「終わった」の印に書く）
+  let bindsLoaded = false // Modを読み込み直したあと、link.json から合図を戻したか
+  let linkP: Promise<void> | null = null
+  let restoreP: Promise<void> | null = null
   let chatDir: string | null = null // Vault別フォルダーがあると確かめた場所
+  let chatInitFor = '' // どの番号の結び付けのフォルダーで、残っていた頼みを読んだか
   let chatInitP: Promise<void> | null = null
   let lastAsk = 0 // 最後に見た引用の頼み（askChat）の時刻
   let lastSend = 0 // 最後に見た送る文（sendChat）の時刻
@@ -282,7 +306,9 @@ export function createNotedock(opts: { version?: string } = {}) {
   let logWritten = 0
   let lastChat = 0
   let chatBusy = false
-  let claimWanted = 0 // 準備が終わる前に本人が発言した時刻。準備が終わったら、この時刻で相手になる（0は無し）
+  let lastBeat = 0
+  let title = '' // エディターに出す、このチャットの名前（分かる範囲で）
+  let titleFixed = false // 本人の発言から名前を決めた
 
   const now = async (): Promise<number> => io.now()
   const delay = (ms: number) => new Promise<void>(resolve => io.after(ms, () => resolve()))
@@ -380,6 +406,7 @@ export function createNotedock(opts: { version?: string } = {}) {
       toolCtx = null
       chatDir = null
       chatInitP = null
+      chatInitFor = ''
       needSeen = 0
       try {
         await io.saveRefresh(next.host, { at: await now(), from: before.root, to: next.root })
@@ -401,6 +428,7 @@ export function createNotedock(opts: { version?: string } = {}) {
 
   // 裏の処理の始まり。session.start から $.clock.after(0) で呼ぶ。
   async function boot(): Promise<void> {
+    void restoreLink()
     const b = await getBase()
     if (b.kind === 'skip') {
       stage = 'off'
@@ -416,7 +444,6 @@ export function createNotedock(opts: { version?: string } = {}) {
         if ((await now()) - started >= SCREEN_WAIT_MS) {
           // 画面のないチャット。あとで session.attach が来たら続ける。
           stage = 'noScreen'
-          claimWanted = 0 // 画面のないチャットへの発言は、本人が画面で打ったものではない
           screenTimer?.cancel()
         }
       })().catch(() => {})
@@ -673,7 +700,9 @@ export function createNotedock(opts: { version?: string } = {}) {
     const info = base?.kind === 'ok' && vaultId ? await io.readServerInfo(base.host, vaultId) : null
     // 鍵が読めなければ頼めない。開いている途中の帯を終わらせ、押し直してもらう（fail が open-pending も0にする）。
     if (!info?.ticket) return fail(MSG_HINT, s.req)
-    submit(retryPrompt({ port: info.port, ticket: info.ticket, today: s.today }), s.req, () => {})
+    // 最初の合図は、ほかのタブが使ったかもしれないので、頼み直しでは新しい合図を付ける。
+    const code = s.link ? await ensureLink() : null
+    submit(retryPrompt({ port: info.port, ticket: info.ticket, today: s.today, link: code }), s.req, () => {})
     await writePending(0)
   }
 
@@ -782,11 +811,14 @@ export function createNotedock(opts: { version?: string } = {}) {
       if (st.kind !== 'running') return fail(st.kind === 'stopped' ? st.problem : `NoteDockのサーバーが動き出しませんでした。${MSG_AGAIN}`, r)
       // 鍵は、その時点の server.json から読む。
       const info = await io.readServerInfo(host, vaultId!)
-      const text = openPrompt({ port: info?.port ?? st.running.port, ticket: info?.ticket ?? st.running.ticket ?? null, today: pressedToday })
+      // アプリの画面があるチャットだけが、エディターのチャット欄の送り先になる。開くリンクに、このチャットの番号を付ける。
+      const chat = (await hasApp()) && takesLink(st.running.version) ? await ensureLink() : null
+      if (r !== req) return
+      const text = openPrompt({ port: info?.port ?? st.running.port, ticket: info?.ticket ?? st.running.ticket ?? null, today: pressedToday, link: chat })
       const at = await now()
       await writePending(at + OPEN_WAIT_MS) // 頼む直前に書く
       if (r !== req) return
-      const s: Sent = { text, at, today: pressedToday, turnId: null, turnStart: 0, confirmed: false, retried: false, req: r }
+      const s: Sent = { text, at, today: pressedToday, turnId: null, turnStart: 0, confirmed: false, retried: false, req: r, link: chat }
       sent = s
       pressStage = 'opening'
       await render()
@@ -800,106 +832,207 @@ export function createNotedock(opts: { version?: string } = {}) {
   const os = (): Os => (base?.kind === 'ok' ? base.host.os : 'darwin')
   const cf = (dir: string, name: string) => chatFile(os(), dir, name)
 
-  // 話し相手の印を読み直し、このチャットのものか確かめる。書く・送る直前に呼ぶ（ほかのチャットが移したばかりの印を上書きしないため）。
-  async function ownerNow(dir: string, me: string): Promise<{ session?: string; at?: number } | null> {
-    const current = await readJson(cf(dir, 'chat-owner.json'))
-    return me !== '' && current?.session === me ? current : null
+  // 画面がターミナルだけのチャットは、エディターのチャット欄の送り先にしない（Claudeアプリやエディター拡張の画面があるときだけ）。
+  async function hasApp(): Promise<boolean> {
+    try {
+      return (await io.surfaces()).some(s => s !== 'terminal')
+    } catch {
+      return false
+    }
   }
 
-  async function mySession(): Promise<string> {
-    if (!sessionId) sessionId = String((await io.sessionId()) ?? '')
-    return sessionId
+  // 結び付けの合図（#s=）を読めるのは、このModと同じか新しいバージョンのサーバーの画面だけ。古い画面は #c= だけの形しか読めない。
+  function takesLink(version: unknown): boolean {
+    return typeof version === 'string' && VERSION_RE.test(version) && compareVersions(version, mine) >= 0
   }
 
-  // チャット欄を使える場所。画面のあるチャットで、Vaultが分かっていて、Vault別フォルダーがある（サーバーが一度動いた）ときだけ。
-  // ほかのVaultのファイルは読まない、書かない。
-  async function chatReady(): Promise<string | null> {
-    if (stage !== 'screen' || base?.kind !== 'ok' || !vaultId) return null
-    const dir = vaultDirOf(base.host, vaultId)
-    if (chatDir !== dir) {
+  // Modを読み込み直したときは、このチャットの結び付けのフォルダーの名前を $.state から戻す（開いているエディターが、そのまま送れるように）。
+  function restoreLink(): Promise<void> {
+    restoreP ??= (async () => {
       try {
-        if (!(await io.exists(dir))) return null
+        const saved = await io.loadLink()
+        if (saved && !link) link = { hash: saved }
+      } catch {
+        // 戻せなければ、次に開いたときに新しく作る。
+      }
+    })()
+    return restoreP
+  }
+
+  // エディターを開くときに呼ぶ。このチャットの結び付けのフォルダー（名前は推測できない乱数）が無ければ作り、
+  // 開くリンクに付ける「結び付けの合図」（一度だけ使える乱数）を作って返す。リンクに載るのは合図だけで、
+  // サーバーは合図と引き換えに、そのタブだけの鍵を渡す。合図は使うか15分たつと使えなくなるので、会話の記録に残っても使い回せない。
+  async function ensureLink(): Promise<string | null> {
+    await restoreLink()
+    if (!link) {
+      linkP ??= (async () => {
+        const raw = io.randomLink()
+        if (!LINK_RE.test(raw)) throw new Error('番号を作れませんでした')
+        const hash = await io.hashLink(raw)
+        try {
+          await io.saveLink(hash)
+        } catch {
+          // 覚えられなくても、このModが動いているあいだは使える。
+        }
+        link = { hash }
+        binds = []
+        bindsLoaded = true
+        // 新しい結び付けのフォルダーには、まだ何も無い。これから届く頼みは、どれも新しいものとして扱う。
+        chatInitFor = hash
+        lastAsk = lastSend = lastReplied = 0
+        chatInitP = Promise.resolve()
+      })().finally(() => (linkP = null))
+      try {
+        await linkP
       } catch {
         return null
       }
-      chatDir = dir
     }
+    let code: string
+    try {
+      code = io.randomLink()
+      if (!LINK_RE.test(code)) return null
+      const t = await now()
+      binds = [...binds.filter(b => b.until > t), { h: await io.hashLink(code), until: t + OPEN_WAIT_MS }].slice(-BIND_KEEP)
+    } catch {
+      return null
+    }
+    await beat(true)
+    return code
+  }
+
+  // 結び付けのフォルダー。Vaultが分かっていて、フォルダーの名前があるときだけ。
+  function myLinkDir(): string | null {
+    if (base?.kind !== 'ok' || !vaultId || !link) return null
+    return linkDir(base.host.os, vaultDirOf(base.host, vaultId), link.hash)
+  }
+
+  // 結び付けの印（link.json）を書き直す。サーバーは、この印がある結び付けのタブからだけ、送る文を受け付ける。
+  // 印には、まだ使える結び付けの合図のハッシュも書く（合図そのものは書かない）。
+  async function beat(force = false): Promise<void> {
+    const dir = myLinkDir()
+    const hash = link?.hash
+    if (!dir || !hash || base?.kind !== 'ok' || !vaultId) return
+    const t = await now()
+    if (!force && t - lastBeat < OWNER_BEAT_MS) return
+    if (!(await hasApp())) return
+    try {
+      if (!(await io.exists(vaultDirOf(base.host, vaultId)))) return
+      // Modを読み込み直したあとは、まだ使える合図を link.json から戻す（開く途中だったタブが引き換えられるように）。
+      if (!bindsLoaded) {
+        bindsLoaded = true
+        const saved = (await readJson(cf(dir, 'link.json')))?.binds
+        if (Array.isArray(saved)) {
+          const known = new Set(binds.map(b => b.h))
+          for (const b of saved) if (b && typeof b.h === 'string' && /^[0-9a-f]{64}$/.test(b.h) && Number(b.until) > t && !known.has(b.h)) binds.unshift({ h: b.h, until: Number(b.until) })
+          binds = binds.slice(-BIND_KEEP)
+        }
+      }
+      // チャットが終わったあと（番号を捨てたあと）に、古い見回りが印を生き返らせない。
+      if (link?.hash !== hash) return
+      binds = binds.filter(b => b.until > t)
+      await io.write(cf(dir, 'link.json'), JSON.stringify({ at: t, title, binds }))
+      // 書いているあいだにチャットが終わっていたら、「終わった」の印を書き直し、$.state にも戻さない。
+      if (link?.hash !== hash) {
+        await io.write(cf(dir, 'link.json'), JSON.stringify({ at: 0, closed: true, reason: endedWhy }))
+        return
+      }
+      lastBeat = t
+      // $.state が消えていたら（/clear のあとなど）、覚え直す。
+      if ((await io.loadLink().catch(() => hash)) !== hash && link?.hash === hash) await io.saveLink(hash).catch(() => {})
+    } catch {
+      // 書けなければ、次の見回りで書き直す。
+    }
+  }
+
+  // チャット欄を使える場所（このチャットの結び付けのフォルダー）。画面のあるチャットで、Vaultが分かっていて、
+  // Vault別フォルダーがあり（サーバーが一度動いた）、このチャットの番号があるときだけ。ほかのVault・ほかの番号のファイルは読まない、書かない。
+  async function chatReady(): Promise<string | null> {
+    if (stage !== 'screen' || base?.kind !== 'ok' || !vaultId) return null
+    await restoreLink()
+    const vdir = vaultDirOf(base.host, vaultId)
+    if (chatDir !== vdir) {
+      try {
+        if (!(await io.exists(vdir))) return null
+      } catch {
+        return null
+      }
+      chatDir = vdir
+    }
+    const dir = myLinkDir()
+    if (!dir || !link) return null
     // 読み込んだときに残っていた頼みは、もう済んだものとみなす。
-    chatInitP ??= (async () => {
-      const state = (await readJson(cf(dir, 'current-note.json'))) as EditorState | null
-      lastAsk = Number(state?.askChat?.at) || 0
-      lastSend = Number(state?.sendChat?.at) || 0
-      lastReplied = Number((await readJson(cf(dir, 'chat-reply.json')))?.for) || 0
-    })()
+    if (chatInitFor !== link.hash) {
+      chatInitFor = link.hash
+      chatInitP = (async () => {
+        const state = (await readJson(cf(dir, 'state.json'))) as EditorState | null
+        lastAsk = Number(state?.askChat?.at) || 0
+        lastSend = Number(state?.sendChat?.at) || 0
+        lastReplied = Number((await readJson(cf(dir, 'reply.json')))?.for) || 0
+      })()
+    }
     await chatInitP
     return dir
   }
 
-  // 準備が終わる前に本人が発言していたら、ここで相手になる。ただし、そのあとにほかのチャットで
-  // 本人が発言して相手が移っていたら（印の since がこちらの発言より新しければ）、取らない。
-  // 期限は付けない（発言してから「ノートを開く」を押すまで、人の時間がかかることがあるため）。
-  // あとから別のチャットで本人が発言していれば、since の比べ合いで負けるので、取るのは最後に本人が打ったチャットだけ。
-  async function claimLater(dir: string, me: string): Promise<void> {
-    if (!me) return // チャットの番号がまだ分からない。覚えたまま、次の見回りでやり直す
-    const said = claimWanted
-    claimWanted = 0
-    const cur = (await readJson(cf(dir, 'chat-owner.json'))) as { session?: string; at?: number; since?: number } | null
-    if (cur?.session === me) return
-    // since の無い印（前の版のModが書いたもの）は、いつ相手になったかが分からないので、取る側に倒す。
-    // at は10秒ごとに書き直されるので、比べると、生きている前の版の相手からはいつまでも取れなくなるため。
-    const theirs = Number(cur?.since) || 0
-    if (cur?.session && theirs >= said) return
-    await io.claimChat(dir, me, os(), said)
-  }
-
   async function failReply(dir: string, at: number, why: string): Promise<void> {
     try {
-      await io.write(cf(dir, 'chat-reply.json'), JSON.stringify({ for: at, text: `チャットへ送れませんでした。（${why}）`, failed: true, at: await now() }))
+      await io.write(cf(dir, 'reply.json'), JSON.stringify({ for: at, text: `チャットへ送れませんでした。（${why}）`, failed: true, at: await now() }))
     } catch {
       // 書けなければ、エディターは待つのをやめるボタンで抜けられる。
     }
   }
 
-  // チャット欄の見回りの1回分（今のModの見回りと同じ動き）。自分から話し相手になることはしない。
+  // チャット欄の見回りの1回分。このチャットの番号に結び付いたエディターとだけやり取りする。
   async function chatStep(t: number): Promise<void> {
     const dir = await chatReady()
     if (!dir || base?.kind !== 'ok') return
-    if (working && t - logWritten > LOG_BEAT_MS) logDirty = true
-    const me = await mySession()
-    if (claimWanted) await claimLater(dir, me)
-    const owner = (await ownerNow(dir, me)) !== null
-    // 印が自分のもので古ければ書き直す（スリープ明けで10秒以上あいたときも）。これは引き継ぎではない。
-    // ほかのチャットの印は、古くても書き換えない。書く直前にもう一度読み、移っていれば何もしない。
-    if (owner) {
-      const mine = await ownerNow(dir, me)
-      if (mine && t - (Number(mine.at) || 0) > OWNER_BEAT_MS) await io.claimChat(dir, me, os(), Number((mine as { since?: number }).since) || undefined)
+    // ターミナルだけのチャットになっていれば、印も書き直さない（40秒たつと、エディターは送れない状態になる）。
+    // そのあいだに届いた送る文は、あとで遅れて送らないよう、送れなかったことを返して済ませる。
+    if (!(await hasApp())) {
+      const waiting = ((await readJson(cf(dir, 'state.json'))) as EditorState | null)?.sendChat
+      if (waiting && waiting.at > lastSend) {
+        lastSend = waiting.at
+        lastReplied = waiting.at
+        await failReply(dir, waiting.at, 'このチャットの画面が開いていません')
+      }
+      return
     }
-    if (owner && logDirty && t - logWritten >= LOG_MIN_MS) {
+    if (working && t - logWritten > LOG_BEAT_MS) logDirty = true
+    await beat()
+    if (logDirty && t - logWritten >= LOG_MIN_MS) {
       logDirty = false
       logWritten = t
       try {
-        // Claudeへの「開いて」の頼みには鍵付きのURLが入るので、書く前に鍵を消す（誰の発言でも）。
+        // Claudeへの「開いて」の頼みには鍵付きのURLが入るので、書く前に鍵と番号を消す（誰の発言でも）。
         const items = summarizeTranscript(await io.messages()).map(item => ({ ...item, text: hideKeys(item.text) }))
-        // タイトルは読まない（記録ファイルを読むコマンドを使わないため）。エディターはフォルダーの名前を出す。
-        await io.write(cf(dir, 'chat-log.json'), JSON.stringify({ working: working?.since ?? 0, items, project: baseName(base.root), title: '', at: t }))
+        const project = baseName(base.root)
+        if (!titleFixed) {
+          title = titleFrom(items, project)
+          titleFixed = title !== project
+        }
+        await io.write(cf(dir, 'log.json'), JSON.stringify({ working: working?.since ?? 0, items, project, title, at: t }))
       } catch {
         // 書けなくても、次に会話が動いたときにもう一度書く。
       }
     }
-    const state = (await readJson(cf(dir, 'current-note.json'))) as EditorState | null
+    const state = (await readJson(cf(dir, 'state.json'))) as EditorState | null
     if (state?.askChat && state.askChat.at > lastAsk) {
       lastAsk = state.askChat.at
-      if (owner) {
-        try {
-          await io.fill(quoteForPrompt(String(state.askChat.text ?? '')))
-        } catch {
-          // 入れられなければ、それまで。
-        }
+      try {
+        await io.fill(quoteForPrompt(String(state.askChat.text ?? '')))
+      } catch {
+        // 入れられなければ、それまで。
       }
     }
     if (state?.sendChat && state.sendChat.at > lastSend) {
       lastSend = state.sendChat.at
-      if (!owner || !(await ownerNow(dir, me))) return // 送る直前に、まだ話し相手か確かめる
+      // 書かれてから時間がたった文は送らない（Modが止まっていたあいだに受け付けた文を、あとで本人の発言として入れないため）。
+      if (t - state.sendChat.at > SEND_STALE_MS) {
+        lastReplied = state.sendChat.at
+        await failReply(dir, state.sendChat.at, '時間がたったので送りませんでした')
+        return
+      }
       const typed = String(state.sendChat.text ?? '').slice(0, MAX_TEXT)
       const at = state.sendChat.at
       // Modが送る文には、Mod自身の prompt.submit フックが呼ばれない（呼んだプラグインのフックは通らず、context も渡せない）。
@@ -938,7 +1071,7 @@ export function createNotedock(opts: { version?: string } = {}) {
     if (!dir) return
     // 送った文の目印は、Modを読み込み直すと消える。そのときはエディターが書いた送る文と照らし合わせる。
     if (!pending) {
-      const asked = ((await readJson(cf(dir, 'current-note.json'))) as EditorState | null)?.sendChat
+      const asked = ((await readJson(cf(dir, 'state.json'))) as EditorState | null)?.sendChat
       if (asked && asked.at > lastReplied) pending = { text: String(asked.text ?? '').slice(0, MAX_TEXT), at: asked.at }
     }
     if (!pending) return
@@ -954,12 +1087,13 @@ export function createNotedock(opts: { version?: string } = {}) {
   async function chatTurnComplete(e: { turnId: string; answer?: string; reason?: string }): Promise<void> {
     working = null
     logDirty = true
-    if (!chatTurn || e.turnId !== chatTurn.turnId || !chatDir) return
+    const dir = myLinkDir()
+    if (!chatTurn || e.turnId !== chatTurn.turnId || !dir) return
     const reply = { for: chatTurn.at, text: hideKeys(e.answer ?? ''), reason: e.reason, at: await now() }
     lastReplied = chatTurn.at
     chatTurn = null
     try {
-      await io.write(cf(chatDir, 'chat-reply.json'), JSON.stringify(reply))
+      await io.write(cf(dir, 'reply.json'), JSON.stringify(reply))
     } catch {
       // 書けなければ、エディターは待つのをやめるボタンで抜けられる。
     }
@@ -1037,7 +1171,7 @@ export function createNotedock(opts: { version?: string } = {}) {
       }
       // 同じModの中で session.start がもう一度来たときのため、覚えている帯もそろえ、画面があれば描き直す。
       shown = 'null'
-      sessionId = '' // /clear のあとなどに変わっていれば、読み直す
+      restoreP = null // 読み込み直したときは、このチャットの番号を $.state から戻し直す
       if (stage === 'screen') {
         try {
           await render()
@@ -1095,35 +1229,56 @@ export function createNotedock(opts: { version?: string } = {}) {
       await finishOpening()
     },
 
-    // 本人が発言したら、このチャットを話し相手にする。エディターの切り替えがオンなら、開いているノートを添える文を返す。
+    // 本人が打った発言にだけ、このチャットに結び付いたエディターの切り替えがオンなら、開いているノートを添える文を返す。
+    // 別のセッションからのメッセージやタスクの知らせ（打った発言ではないもの）には添えない。発言しても、送り先は変わらない。
     async promptSubmit(e: { text?: string; origin?: { kind?: string } }): Promise<string | null> {
-      const typed = TYPED_ORIGINS.has(e.origin?.kind ?? '')
+      if (!io || !TYPED_ORIGINS.has(e.origin?.kind ?? '')) return null
       const dir = await chatReady()
-      if (!dir || base?.kind !== 'ok') {
-        // 新しいチャットの最初の発言は、Modの準備（画面の確認、Vaultの確認）より先に届く。
-        // 本人の発言なら時刻を覚えておき、準備が終わったところで相手になる（見回りの claimLater）。
-        // session.start より先に届いたとき（io がまだ無いとき）は、この場で時計を読む。
-        // $.clock.now() も壁時計（Date.now() と同じ時計）である前提。since の比べ合いに使うため。
-        if (typed && stage !== 'off' && stage !== 'noScreen') claimWanted = io ? await now() : Date.now()
-        return null
-      }
-      if (typed) {
-        claimWanted = 0
-        await io.claimChat(dir, await mySession(), base.host.os)
-      }
+      if (!dir || base?.kind !== 'ok') return null
+      if (!(await hasApp())) return null
       // エディターから送った文（案内を足し済み）がここへ来ても、二重に添えない（ふつうは呼ばれないが念のため）。
       if (pending && isSentText(String(e.text ?? ''), pending.text)) return null
       if (!(await io.shareIsOn(dir, base.host.os))) return null
-      const state = (await readJson(cf(dir, 'current-note.json'))) as EditorState | null
+      const state = (await readJson(cf(dir, 'state.json'))) as EditorState | null
       return state ? describeNote(state, await now(), base.root, base.host.os) : null
     },
 
-    // チャットが終わったら話し相手を外す。/clear では同じチャットが続くので外さない。
+    // チャットが終わったら、結び付けの印を「終わった」にし、番号を捨てる（エディターは送れない状態になる）。
+    // /clear では同じチャットの画面が続く（Modもそのまま）ので、結び付けは残し、名前と会話の記録だけを新しくする。
     async sessionEnd(reason: string | undefined): Promise<void> {
-      if (reason === 'clear') return
-      const dir = chatDir ?? (base?.kind === 'ok' && vaultId ? vaultDirOf(base.host, vaultId) : null)
-      if (!dir) return
-      await io.releaseChat(dir, await mySession(), os())
+      // どの理由で終わったかを、デバッグのログと「終わった」の印に残す（決まった言葉だけ。ほかは unknown）。
+      // 型定義では /clear は reason 'clear' で届くが、Claudeアプリでは別の言葉で届くことがある（2026-11-22、VMで /clear のあと送れなくなった）。
+      const why = typeof reason === 'string' && /^[a-z_]{1,32}$/.test(reason) ? reason : 'unknown'
+      try {
+        void Promise.resolve(io?.debug(`notedock: session.end reason=${why}`)).catch(() => {})
+      } catch {
+        // 書けなくても続ける。
+      }
+      if (reason === 'clear') {
+        title = ''
+        titleFixed = false
+        logDirty = true
+        return
+      }
+      const dir = myLinkDir()
+      endedWhy = why
+      link = null
+      binds = []
+      lastBeat = 0
+      // 終わりの持ち時間は短いので、送れなくする印を先に書く。会話の抜粋も消す。
+      if (dir) {
+        try {
+          await io.write(cf(dir, 'link.json'), JSON.stringify({ at: 0, closed: true, reason: why }))
+          await io.write(cf(dir, 'log.json'), '{}')
+        } catch {
+          // 書けなくても、40秒たてばエディターは送れない状態になる。
+        }
+      }
+      try {
+        await io.saveLink(null)
+      } catch {
+        // 消せなくても、印を「終わった」にしたので送れない。
+      }
     },
 
     // 道具を使うたびに、会話の記録を書き直す（メインの会話だけ）。
@@ -1161,21 +1316,25 @@ export function createNotedock(opts: { version?: string } = {}) {
       }
     }
     if (!vaultId) return { text: superseded ? `${MSG_NEWER}。` : MSG_PRESS }
-    // 画面のあるチャットだけが話し相手になる。
-    if (await hasScreen()) {
-      // 画面なしで始まり、session.attach なしで画面が付いたチャット：見回りも始める（話し相手になっても送れない、を防ぐ）。
-      screenArrived()
-      await io.claimChat(vaultDirOf(b.host, vaultId), await mySession(), b.host.os)
-    }
+    // 画面なしで始まり、session.attach なしで画面が付いたチャット：見回りも始める（結び付いても送れない、を防ぐ）。
+    if (await hasScreen()) screenArrived()
     const running = await io.findRunning(b.host, vaultId)
     if (!running) return { text: MSG_PRESS }
     const info = await io.readServerInfo(b.host, vaultId)
     const ticket = info?.ticket ?? running.ticket
     if (!ticket) return { text: MSG_PRESS }
+    // アプリの画面があるチャットだけが、エディターのチャット欄の送り先になる。リンクに、このチャットの番号を付ける。
+    const app = await hasApp()
+    const chat = app && takesLink(running.version) ? await ensureLink() : null
     const path = notePathFrom(args, b.root, b.host.os)
-    const url = editorUrl({ port: running.port, today: false, note: path || undefined, ticket })
+    const url = editorUrl({ port: running.port, today: false, note: path || undefined, ticket, link: chat })
+    const where = chat
+      ? 'このリンクで開いたエディターのチャット欄から送った文は、このチャットに届きます。'
+      : !app
+        ? 'このチャットはターミナルだけで開いているので、エディターのチャット欄からこのチャットへは送れません（送れるのは、Claudeアプリなど画面のあるチャットから開いたときです）。'
+        : ''
     return {
-      text: `${path ? `${path} を開くには` : 'NoteDockを開くには'}、次のリンクを押してください。Chromeで開くことがあります。リンクは一度しか使えません。使えるのは長くて10分で、先に「ノートを開く」などで開くと使えなくなります。\n${url}`,
+      text: `${path ? `${path} を開くには` : 'NoteDockを開くには'}、次のリンクを押してください。Chromeで開くことがあります。リンクは一度しか使えません。使えるのは長くて10分で、先に「ノートを開く」などで開くと使えなくなります。${where}\n${url}`,
     }
   }
 }

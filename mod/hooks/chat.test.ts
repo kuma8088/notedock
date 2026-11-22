@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { chatFile, describeNote, hideKeys, quoteForPrompt, TYPED_ORIGINS } from './chat'
+import { chatFile, describeNote, hideKeys, linkDir, quoteForPrompt, titleFrom, TYPED_ORIGINS } from './chat'
 import { createNotedock, ioFor, wire } from './register'
 import { VERSION } from './release'
 
@@ -17,6 +17,8 @@ type Opt = {
   serverRan?: boolean // Vault別フォルダーがある（サーバーが一度動いた）
   files?: Map<string, string> // 2つのチャットで同じファイルを見るとき
   session?: string
+  state?: Map<string, unknown> // $.state（Modを読み込み直しても残る）。同じチャットの読み込み直しを作るときに渡す
+  serverVersion?: string // 動いているサーバーのバージョン（既定はこのModと同じ）
 }
 
 function world(o: Opt = {}) {
@@ -39,7 +41,7 @@ function world(o: Opt = {}) {
   const sends: { text: string; rest: Record<string, unknown>; resolve: (r: any) => void; reject: (e: any) => void }[] = []
   const fills: { text: string; mode?: string }[] = []
   const timers: { at: number; ms: number; fn: () => void; repeat: boolean; dead: boolean }[] = []
-  const w = { surfaces: o.surfaces ?? ['desktop'], messages: [] as any[], onMessages: null as null | (() => void), afterRead: null as null | ((p: string) => void) }
+  const w = { surfaces: o.surfaces ?? ['desktop'], messages: [] as any[], onMessages: null as null | (() => void), afterRead: null as null | ((p: string) => void), onWrite: null as null | ((p: string) => Promise<void>) }
   const openedFile = [STATE, 'opened.json'].join(sep)
   files.set(openedFile, JSON.stringify({ ...JSON.parse(files.get(openedFile) ?? '{}'), [KEY]: { at: 1 } }))
 
@@ -73,7 +75,17 @@ function world(o: Opt = {}) {
   const env: Record<string, string> = win
     ? { OS: 'Windows_NT', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local', USERPROFILE: HOME, SystemRoot: 'C:\\Windows' }
     : { HOME }
+  const state = o.state ?? new Map<string, unknown>()
+  const debugLines: string[] = []
   const $: any = {
+    ui: { log: (text: string, opt?: { to?: string }) => { if (opt?.to === 'debug') debugLines.push(text) } },
+    state: {
+      get: async (ref: { key: string }) => ({ value: state.get(ref.key), version: 0 }),
+      set: async (ref: { key: string }, value: unknown) => {
+        state.set(ref.key, value)
+        return { isSet: true, version: 1 }
+      },
+    },
     env: { get: async (n: string) => env[n] },
     session: {
       root: async () => ROOT,
@@ -92,6 +104,8 @@ function world(o: Opt = {}) {
         return v
       },
       write: async (p: string, s: string) => {
+        const hook = w.onWrite
+        if (hook) await hook(p)
         files.set(p, s)
       },
       exists: async (p: string) => files.has(p) || dirs.has(p),
@@ -124,7 +138,7 @@ function world(o: Opt = {}) {
     },
   }
 
-  const running = { port: 8801, vaultId: VID, ticket: 'KEY1', version: VERSION, pid: 1 }
+  const running = { port: 8801, vaultId: VID, ticket: 'KEY1', version: o.serverVersion ?? VERSION, pid: 1 }
   const io = ioFor($, {
     installedBinary: async () => 'BIN',
     ensureBinary: async () => ({ bin: 'BIN' }),
@@ -137,28 +151,62 @@ function world(o: Opt = {}) {
     registerTools: async () => {},
   })
   const nd = createNotedock()
-  const json = (name: string) => (files.has(f(name)) ? JSON.parse(files.get(f(name))!) : null)
+  // このチャットの結び付けのフォルダー（link.json があるところ）。まだ無ければ null。
+  const myLink = (): string | null => {
+    const head = `${VDIR}${sep}chats${sep}`
+    const found = [...files.keys()].filter(k => k.startsWith(head) && k.endsWith(`${sep}link.json`))
+    const mine = found.find(k => k.slice(head.length).split(sep)[0] === mineHash.value)
+    return mine ? mine.slice(0, -`${sep}link.json`.length) : null
+  }
+  const mineHash = { value: '' }
+  const inLink = (name: string) => {
+    const dir = myLink()
+    return dir ? `${dir}${sep}${name}` : ''
+  }
+  const json = (name: string) => {
+    const p = inLink(name)
+    return p && files.has(p) ? JSON.parse(files.get(p)!) : null
+  }
 
   return {
-    $, nd, io, files, dirs, sends, fills, w, advance, f, json, VDIR, ROOT,
+    $, nd, io, files, dirs, sends, fills, w, advance, f, json, VDIR, ROOT, state, sep, debugLines,
     now: () => t,
     // 始めて、見張りとチャット欄の見回りが動くところまで進める。
     start: async () => {
       await nd.sessionStart(io)
       await advance(3000)
     },
+    // エディターを開く（/note）。このチャットの番号が作られ、結び付けのフォルダーができる。返すのは /note の返事。
+    open: async () => {
+      const r = await nd.note('')
+      const raw = /[#&]s=([A-Za-z0-9_-]{43})/.exec(r.text)?.[1] ?? ''
+      mineHash.value = String(state.get('chatLink') ?? '')
+      return { ...r, raw }
+    },
+    linkDir: myLink,
+    inLink,
     say: (text: string, kind = 'composer') => nd.promptSubmit({ text, origin: { kind } }),
-    editor: (state: Record<string, unknown>) => files.set(f('current-note.json'), JSON.stringify(state)),
-    owner: () => json('chat-owner.json'),
+    // このチャットに結び付いたエディターが書く状態（サーバーが state.json に書く）。
+    editor: (st: Record<string, unknown>) => files.set(inLink('state.json'), JSON.stringify(st)),
+    share: (on: boolean) => files.set(inLink('share.json'), JSON.stringify({ on })),
+    link: () => json('link.json'),
   }
 }
 
-// ---- 今のModの register.test.ts から写したテスト（チャット欄・ノートを添える） ----
+// ---- 開いているノートを添える（このチャットに結び付いたエディターの状態だけ） ----
+
+// 開いて、結び付けのフォルダーと切り替えを用意したところまで進める。
+async function opened(o: Opt = {}) {
+  const x = world(o)
+  await x.start()
+  const r = await x.open()
+  expect(r.raw).toMatch(/^[A-Za-z0-9_-]{43}$/)
+  return x
+}
 
 test('開いているノートを次の発言に添える', async () => {
-  const x = world()
-  await x.start()
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+  const x = await opened()
+  x.share(true)
   x.editor({ path: 'Home.md', dirty: true, selection: '選択', updatedAt: x.now() - 100 })
   const note = await x.say('こんにちは')
   expect(note).toContain('Home.md')
@@ -166,34 +214,20 @@ test('開いているノートを次の発言に添える', async () => {
   expect(note).toContain('まだ保存していない変更')
 })
 
-test('別のフォルダーのノートは場所も添える', async () => {
-  const x = world()
-  await x.start()
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+test('別のフォルダーのノートは場所も添える。今のプロジェクトのノートは相対パスのまま', async () => {
+  const x = await opened()
+  x.share(true)
   x.editor({ path: 'Home.md', root: '/tmp/copy', updatedAt: x.now() - 100 })
   expect(await x.say('こんにちは')).toContain('/tmp/copy/Home.md')
-})
-
-test('今のプロジェクトのノートは相対パスのまま添える', async () => {
-  const x = world()
-  await x.start()
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
   x.editor({ path: 'Home.md', root: '/V/notes', updatedAt: x.now() - 100 })
   expect(await x.say('こんにちは')).toContain('ノート: Home.md')
 })
 
-test('閉じたノートは添えない', async () => {
-  const x = world()
-  await x.start()
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+test('閉じたノートと古い情報は添えない', async () => {
+  const x = await opened()
+  x.share(true)
   x.editor({ path: null, updatedAt: x.now() - 100 })
   expect(await x.say('こんにちは')).toBe(null)
-})
-
-test('古い情報は添えない', async () => {
-  const x = world()
-  await x.start()
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
   x.editor({ path: 'Home.md', updatedAt: x.now() - 31 * MIN })
   expect(await x.say('こんにちは')).toBe(null)
 })
@@ -206,19 +240,52 @@ test('入力欄へ入れる文字と、発言に添える選択の文字に上�
 })
 
 test('シンボリックリンクの先が同じなら、今のプロジェクトのノートとして添える', async () => {
-  const x = world({ root: '/link/notes', real: { '/link/notes': '/real/notes' } })
-  await x.start()
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+  const x = await opened({ root: '/link/notes', real: { '/link/notes': '/real/notes' } })
+  x.share(true)
   x.editor({ path: 'Home.md', root: '/real/notes', updatedAt: x.now() - 100 })
   expect(await x.say('こんにちは')).toContain('ノート: Home.md')
 })
 
-// ---- 送る・返事・会話の記録・引用（今のModの449〜529行・599〜644行と同じ動き） ----
+test('切り替えが無い・オフなら添えない。オンなら添える', async () => {
+  const x = await opened()
+  x.editor({ path: 'Home.md', updatedAt: x.now() - 100 })
+  expect(await x.say('こんにちは')).toBe(null)
+  x.share(false)
+  expect(await x.say('こんにちは')).toBe(null)
+  x.share(true)
+  expect(await x.say('こんにちは')).toBe('エディターで開いているノート: Home.md')
+})
 
-test('話し相手は、エディターから送られた文を本人の発言として送り、その番の返事を chat-reply.json に書く', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
+test('本人が打った発言にだけ添える。別のセッションからのメッセージ・タスクの知らせ・定期の起動・Modの文には添えない', async () => {
+  expect([...TYPED_ORIGINS].sort()).toEqual(['bridge', 'composer', 'sdk'])
+  const x = await opened()
+  x.share(true)
+  x.editor({ path: 'Home.md', updatedAt: x.now() - 100 })
+  for (const kind of ['task-notification', 'scheduled-trigger', 'plugin', 'session-message', 'teammate', '']) {
+    expect(await x.nd.promptSubmit({ text: '知らせ', origin: { kind } })).toBe(null)
+  }
+  expect(await x.nd.promptSubmit({ text: '知らせ' })).toBe(null)
+  expect(await x.say('こんにちは')).toBe('エディターで開いているノート: Home.md')
+})
+
+test('エディターを開いていない（番号が無い）チャットには、ほかのチャットのエディターのノートを添えない', async () => {
+  const files = new Map<string, string>()
+  const a = world({ files })
+  await a.start()
+  await a.open()
+  a.share(true)
+  a.editor({ path: 'A.md', updatedAt: a.now() - 100 })
+  // 同じフォルダーの、エディターを開いていない別のチャット。
+  const b = world({ files })
+  await b.start()
+  expect(await b.say('こんにちは')).toBe(null)
+  expect(await a.say('こんにちは')).toBe('エディターで開いているノート: A.md')
+})
+
+// ---- 送る・返事・会話の記録・引用 ----
+
+test('結び付いたエディターから送られた文を本人の発言として送り、その番の返事を reply.json に書く', async () => {
+  const x = await opened()
   x.editor({ path: 'a.md', updatedAt: x.now(), sendChat: { text: '表を足して', at: x.now() } })
   const sentAt = x.now()
   await x.advance(1500)
@@ -228,41 +295,30 @@ test('話し相手は、エディターから送られた文を本人の発言�
   x.sends[0].resolve({})
   await x.nd.turnStart({ text: '表を足して', turnId: 'c1' })
   await x.nd.turnComplete({ turnId: 'c1', answer: '足しました。', reason: 'done' })
-  const reply = x.json('chat-reply.json')
+  const reply = x.json('reply.json')
   expect(reply.for).toBe(sentAt)
   expect(reply.text).toBe('足しました。')
   expect(reply.reason).toBe('done')
-  // 同じ文はもう送らない。
   await x.advance(3000)
   expect(x.sends.length).toBe(1)
 })
 
-// 実機（Task 10 F4）：Modが自分で送る文には、Mod自身の prompt.submit フックが呼ばれない（呼んだプラグインのフックは通らない）。
-// そこで、切り替えがオンなら、開いているノートの案内を送る文の末尾に足す。
 test('切り替えがオンなら、エディターから送る文の末尾に、開いているノートの案内を足す', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+  const x = await opened()
+  x.share(true)
   const sentAt = x.now()
   x.editor({ path: 'Home.md', updatedAt: x.now(), sendChat: { text: '表を足して', at: sentAt } })
   await x.advance(1500)
-  expect(x.sends.length).toBe(1)
   expect(x.sends[0].text).toBe('表を足して\n\n（エディターで開いているノート: Home.md）')
-  expect(x.sends[0].rest).toEqual({ asUser: true })
-  // 足した文のまま番が始まっても、その番の返事をエディターへ渡す。
   x.sends[0].resolve({})
   await x.nd.turnStart({ text: x.sends[0].text, turnId: 'c1' })
   await x.nd.turnComplete({ turnId: 'c1', answer: 'Home.mdです。', reason: 'done' })
-  expect(x.json('chat-reply.json').for).toBe(sentAt)
-  expect(x.json('chat-reply.json').text).toBe('Home.mdです。')
+  expect(x.json('reply.json').for).toBe(sentAt)
 })
 
 test('足す案内には、保存していない変更と選んでいる文字も入れ、選んだ文字には上限を付ける', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+  const x = await opened()
+  x.share(true)
   x.editor({ path: 'Home.md', dirty: true, selection: '一行目\n二行目', updatedAt: x.now(), sendChat: { text: 'ここを直して', at: x.now() } })
   await x.advance(1500)
   expect(x.sends[0].text).toBe('ここを直して\n\n（エディターで開いているノート: Home.md。まだ保存していない変更があります）\n選んでいる文字:\n> 一行目\n> 二行目')
@@ -270,18 +326,16 @@ test('足す案内には、保存していない変更と選んでいる文字�
   await x.advance(1500)
   const long = x.sends[1].text
   expect(long.startsWith(`${'z'.repeat(4000)}\n\n（エディターで開いているノート: Home.md）`)).toBe(true)
-  expect(long.length).toBeLessThan(8100) // 送る文4000字＋選んだ文字4000字＋案内の行
+  expect(long.length).toBeLessThan(8100)
   expect((long.match(/y/g) ?? []).length).toBe(4000)
 })
 
 test('切り替えがオフ、またはノートが閉じている・古いときは、送る文をそのまま送る', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: false }))
+  const x = await opened()
+  x.share(false)
   x.editor({ path: 'Home.md', updatedAt: x.now(), sendChat: { text: 'オフ', at: x.now() } })
   await x.advance(1500)
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+  x.share(true)
   x.editor({ path: null, updatedAt: x.now(), sendChat: { text: '閉じた', at: x.now() + 1 } })
   await x.advance(1500)
   x.editor({ path: 'Home.md', updatedAt: x.now() - 31 * MIN, sendChat: { text: '古い', at: x.now() + 2 } })
@@ -289,94 +343,92 @@ test('切り替えがオフ、またはノートが閉じている・古いと�
   expect(x.sends.map(s => s.text)).toEqual(['オフ', '閉じた', '古い'])
 })
 
-test('案内を足して送ったあとにModを読み込み直しても、その番の返事をエディターへ渡す', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+test('Modを読み込み直しても、$.state から番号を戻し、同じエディターとやり取りを続ける（返事も渡す）', async () => {
+  const x = await opened()
+  x.share(true)
   const sentAt = x.now()
   x.editor({ path: 'Home.md', updatedAt: x.now(), sendChat: { text: '表を足して', at: sentAt } })
   await x.advance(1500)
   const text = x.sends[0].text
-  // 読み込み直すと、送った文の目印は消える。エディターが書いた送る文（案内なし）と照らし合わせる。
-  const again = createNotedock()
-  await again.sessionStart(x.io)
-  await x.advance(3000)
-  expect(x.sends.length).toBe(1)
-  await again.turnStart({ text, turnId: 'c2' })
-  await again.turnComplete({ turnId: 'c2', answer: '足しました。', reason: 'done' })
-  expect(x.json('chat-reply.json').for).toBe(sentAt)
-  // 案内の付いていない、似た別の文の番は、その返事にしない。
-  const y = world()
+  const dir = x.linkDir()
+  // 読み込み直した Mod（前の Mod の見回りは止まる）。同じファイルと同じ $.state を見る。
+  const y = world({ files: x.files, state: x.state })
   await y.start()
-  await y.say('はじめ')
-  y.editor({ path: 'Home.md', updatedAt: y.now(), sendChat: { text: '表を', at: y.now() } })
+  expect(y.sends.length).toBe(0) // 送り済みの文は送り直さない
+  await y.nd.turnStart({ text, turnId: 'c2' })
+  await y.nd.turnComplete({ turnId: 'c2', answer: '足しました。', reason: 'done' })
+  expect(x.json('reply.json').for).toBe(sentAt)
+  // 読み込み直したあとの /note も、同じ番号のリンクを出す。
+  const r = await y.open()
+  expect(r.raw).toMatch(/^[A-Za-z0-9_-]{43}$/)
+  expect(y.linkDir()).toBe(dir)
+  y.editor({ updatedAt: y.now(), sendChat: { text: '次', at: y.now() + 5 } })
   await y.advance(1500)
-  const later = createNotedock()
-  await later.sessionStart(y.io)
-  await y.advance(3000)
-  await later.turnStart({ text: '表を足して', turnId: 'c3' })
-  await later.turnComplete({ turnId: 'c3', answer: '別の返事', reason: 'done' })
-  expect(y.json('chat-reply.json')).toBe(null)
+  expect(y.sends.map(s => s.text)).toEqual(['次'])
 })
 
 test('送る文に案内を足しても、prompt.submit のフックで同じ案内をもう一度足さない', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+  const x = await opened()
+  x.share(true)
   x.editor({ path: 'Home.md', updatedAt: x.now(), sendChat: { text: '表を足して', at: x.now() } })
   await x.advance(1500)
-  expect(await x.nd.promptSubmit({ text: x.sends[0].text, origin: { kind: 'plugin' } })).toBe(null)
-  // 本人が打った文には、今までどおり添える。
+  expect(await x.nd.promptSubmit({ text: x.sends[0].text, origin: { kind: 'composer' } })).toBe(null)
   expect(await x.say('別の質問')).toBe('エディターで開いているノート: Home.md')
 })
 
-test('送った文が drop されたら、送れなかったことを chat-reply.json に書く', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
+test('送った文が drop されたら、または例外なら、送れなかったことを reply.json に書く', async () => {
+  const x = await opened()
   const at = x.now()
   x.editor({ sendChat: { text: 'こんにちは', at } })
   await x.advance(1500)
   x.sends[0].resolve({ drop: '止められました' })
   await x.advance(0)
-  expect(x.json('chat-reply.json')).toEqual({ for: at, text: 'チャットへ送れませんでした。（止められました）', failed: true, at: x.now() })
+  expect(x.json('reply.json')).toEqual({ for: at, text: 'チャットへ送れませんでした。（止められました）', failed: true, at: x.now() })
+  const at2 = x.now()
+  x.editor({ sendChat: { text: 'もう一度', at: at2 } })
+  await x.advance(1500)
+  x.sends[1].reject(new Error('切れました'))
+  await x.advance(0)
+  expect(x.json('reply.json')).toEqual({ for: at2, text: 'チャットへ送れませんでした。（切れました）', failed: true, at: x.now() })
 })
 
-test('引用を入れるのは話し相手だけ。読み込んだときに残っていた古い頼みは使わない', async () => {
-  const x = world()
-  x.editor({ askChat: { text: '古い', at: 5 } })
-  await x.start()
-  await x.say('はじめ')
-  await x.advance(1500)
-  expect(x.fills.length).toBe(0)
+test('引用を入れる。開いたときに残っていた古い頼みは使わない', async () => {
+  const x = await opened()
   x.editor({ askChat: { text: '一行目\n二行目', at: x.now() } })
   await x.advance(1500)
   expect(x.fills).toEqual([{ text: '> 一行目\n> 二行目\n', mode: 'insert' }])
+  // 読み込み直したあと、残っていた頼みはもう済んだものとみなす。
+  const again = createNotedock()
+  await again.sessionStart(x.io)
+  await x.advance(3000)
+  expect(x.fills.length).toBe(1)
 })
 
-test('話し相手は会話の記録を chat-log.json に書き、10秒ごとに印の時刻を書き直す', async () => {
-  const x = world()
-  await x.start()
+test('会話の記録を log.json に書き、10秒ごとに link.json の時刻を書き直す。名前は最初の本人の発言から付ける', async () => {
+  const x = await opened()
   x.w.messages = [
+    { role: 'user', text: 'The notedock plugin sent a message: NoteDockを開いてください。ブラウザパネルで、preview_start に http://localhost:8801 を渡して開き…' },
     { role: 'user', text: '<system-reminder>見せない</system-reminder>表を足して' },
     { role: 'assistant', text: '足しました。' },
   ]
   await x.say('表を足して')
-  const claimed = x.owner().at
+  const first = x.link().at
   await x.advance(3000)
-  const log = x.json('chat-log.json')
+  const log = x.json('log.json')
   expect(log.project).toBe('notes')
-  expect(log.items).toEqual([
+  expect(log.title).toBe('notes ·「表を足して」')
+  expect(log.items.slice(-2)).toEqual([
     { kind: 'user', text: '表を足して' },
     { kind: 'assistant', text: '足しました。' },
   ])
   expect(log.working).toBe(0)
   await x.advance(11_000)
-  expect(x.owner().session).toBe('sess-1')
-  expect(x.owner().at).toBeGreaterThan(claimed)
-  expect(x.now() - x.owner().at).toBeLessThanOrEqual(11_000)
+  expect(x.link().at).toBeGreaterThan(first)
+  expect(x.now() - x.link().at).toBeLessThanOrEqual(11_000)
+  expect(x.link().title).toBe('notes ·「表を足して」')
+  expect(titleFrom([], 'notes')).toBe('notes')
+  expect(titleFrom([{ kind: 'user', text: 'NoteDockの使い方' }], 'p')).toBe('p ·「NoteDockの使い方」')
+  expect(titleFrom([{ kind: 'user', text: 'あ'.repeat(30) }], 'p')).toBe(`p ·「${'あ'.repeat(24)}…」`)
 })
 
 test('Vault別フォルダーがない（サーバーが一度も動いていない）あいだは、チャット欄のファイルを書かない', async () => {
@@ -388,237 +440,209 @@ test('Vault別フォルダーがない（サーバーが一度も動いていな
   expect([...x.files.keys()].filter(k => k.startsWith(x.VDIR))).toEqual([])
 })
 
-// ---- このタスクで足したテスト ----
+// ---- 結び付け（エディターを開いた会話ごと） ----
 
-test('チャットが始まっただけでは相手にならない（前の相手がいなくても）', async () => {
+test('エディターを開くまでは、どのエディターとも結び付かない（発言しても、前の版の印が残っていても）', async () => {
   const x = world()
+  x.files.set(x.f('current-note.json'), JSON.stringify({ sendChat: { text: '前の版の送る文', at: 2_000_000 }, askChat: { text: '引用', at: 2_000_000 } }))
+  x.files.set(x.f('chat-owner.json'), JSON.stringify({ session: 'sess-1', at: 2_000_000 }))
   await x.start()
+  await x.say('こんにちは')
   await x.advance(60_000)
-  expect(x.owner()).toBe(null)
-
-  // 前の相手の印が古くなっていても、引き継がない。
-  const y = world()
-  y.files.set(y.f('chat-owner.json'), JSON.stringify({ session: 'old', at: 1 }))
-  await y.start()
-  await y.advance(60_000)
-  expect(y.owner()).toEqual({ session: 'old', at: 1 })
-})
-
-test('本人が発言すると相手になる。task-notification では相手にならない', async () => {
-  expect([...TYPED_ORIGINS].sort()).toEqual(['bridge', 'composer', 'sdk'])
-  const x = world()
-  await x.start()
-  await x.say('通知', 'task-notification')
-  await x.say('定期', 'scheduled-trigger')
-  expect(x.owner()).toBe(null)
-  await x.say('こんにちは', 'composer')
-  expect(x.owner()).toEqual({ session: 'sess-1', at: x.now(), since: x.now() })
-})
-
-test('準備が終わる前に本人が発言しても、準備が終わったら相手になる（印には発言した時刻を残す）', async () => {
-  const x = world()
-  await x.nd.sessionStart(x.io)
-  const said = x.now()
-  expect(await x.say('こんにちは')).toBe(null) // 準備中なのでノートは添えられない
-  expect(x.owner()).toBe(null)
-  await x.advance(3000)
-  expect(x.owner().session).toBe('sess-1')
-  expect(x.owner().since).toBe(said)
-
-  // 準備中に来たのが本人の発言でなければ、相手にならない。
-  const y = world()
-  await y.nd.sessionStart(y.io)
-  await y.say('通知', 'task-notification')
-  await y.advance(3000)
-  expect(y.owner()).toBe(null)
-})
-
-test('準備中に発言したあと、ほかのチャットで本人が発言していたら、準備が終わっても相手を取らない', async () => {
-  const files = new Map<string, string>()
-  const b = world({ files, session: 'sess-b' })
-  await b.start()
-  const a = world({ files, session: 'sess-a' })
-  await a.nd.sessionStart(a.io)
-  await a.say('Aで先に話す')
-  await b.advance(1000)
-  await b.say('Bであとから話す')
-  await a.advance(3000)
-  expect(a.owner().session).toBe('sess-b')
-
-  // 前の相手が外れていた、または前の相手の発言がこちらより前なら、相手になる。
-  const files2 = new Map<string, string>()
-  const c = world({ files: files2, session: 'sess-c' })
-  c.files.set(c.f('chat-owner.json'), JSON.stringify({ session: 'old', at: c.now() + 50_000, since: c.now() - 1 }))
-  await c.nd.sessionStart(c.io)
-  await c.say('こんにちは')
-  await c.advance(3000)
-  expect(c.owner().session).toBe('sess-c')
-})
-
-test('サーバーがまだ一度も動いていないチャットで発言しても、あとで動いたら相手になる', async () => {
-  const x = world({ serverRan: false })
-  await x.nd.sessionStart(x.io)
-  await x.say('こんにちは')
-  await x.advance(15_000)
-  expect(x.owner()).toBe(null)
-  x.dirs.add(x.VDIR) // 押して、サーバーが動き、Vault別フォルダーができた
-  await x.advance(3000)
-  expect(x.owner()?.session).toBe('sess-1')
-})
-
-test('画面のないチャットと分かったら、準備中の発言は忘れる（あとで画面に出しても相手を取らない）', async () => {
-  const x = world({ surfaces: [] })
-  await x.nd.sessionStart(x.io)
-  await x.say('こんにちは')
-  await x.advance(12_000)
-  x.w.surfaces = ['desktop']
-  await x.nd.attach()
-  await x.advance(3000)
-  expect(x.owner()).toBe(null)
-})
-
-test('準備中の発言：前の版の印（since なし）、外れた印、印なしなら相手になる', async () => {
-  for (const before of [
-    { session: 'old-mod', at: 9_999_999_999 }, // 前の版のModが10秒ごとに書き直している印
-    { session: '', at: 0 }, // 外れた印
-    null,
-  ]) {
-    const x = world()
-    if (before) x.files.set(x.f('chat-owner.json'), JSON.stringify(before))
-    await x.nd.sessionStart(x.io)
-    await x.say('こんにちは')
-    await x.advance(3000)
-    expect(x.owner()?.session).toBe('sess-1')
-  }
-})
-
-test('準備中の発言：チャットの番号がまだ分からなければ、覚えたまま次の見回りでやり直す', async () => {
-  const x = world({ session: '' })
-  await x.nd.sessionStart(x.io)
-  await x.say('こんにちは')
-  await x.advance(3000)
-  expect(x.owner()).toBe(null)
-  x.$.session.id = async () => 'sess-1'
-  await x.advance(3000)
-  expect(x.owner()?.session).toBe('sess-1')
-})
-
-test('準備中の発言：session.start より先に届いても、覚えて、準備が終わったら相手になる', async () => {
-  const x = world()
-  expect(await x.say('こんにちは')).toBe(null)
-  await x.nd.sessionStart(x.io)
-  await x.advance(3000)
-  expect(x.owner()?.session).toBe('sess-1')
-})
-
-test('準備中の発言で相手になったあと、ほかのチャットへ移った相手を、あとから取り返さない', async () => {
-  const files = new Map<string, string>()
-  const a = world({ files, session: 'sess-a' })
-  await a.nd.sessionStart(a.io)
-  await a.say('準備中に話す')
-  await a.advance(3000)
-  await a.say('準備のあとに話す')
-  expect(a.owner().session).toBe('sess-a')
-  const b = world({ files, session: 'sess-b' })
-  await b.start()
-  await b.advance(60_000)
-  await b.say('Bで話す')
-  await a.advance(15_000)
-  expect(a.owner().session).toBe('sess-b')
-})
-
-test('印の時刻を書き直しても、相手になった時刻（since）は変えない', async () => {
-  const x = world()
-  await x.start()
-  await x.say('こんにちは')
-  const since = x.owner().since
-  await x.advance(25_000)
-  expect(x.owner().at).toBeGreaterThan(since)
-  expect(x.owner().since).toBe(since)
-})
-
-test('/note を打つと相手になる。画面のないチャットではならない', async () => {
-  const x = world()
-  await x.start()
-  await x.nd.note('')
-  expect(x.owner()?.session).toBe('sess-1')
-
-  const y = world({ surfaces: [] })
-  await y.start()
-  await y.advance(12_000)
-  await y.nd.note('')
-  await y.say('こんにちは')
-  expect(y.owner()).toBe(null)
-})
-
-test('相手でないチャットは、エディターから送られた文を送らない', async () => {
-  const x = world()
-  await x.start()
-  x.files.set(x.f('chat-owner.json'), JSON.stringify({ session: 'other', at: x.now() }))
-  x.editor({ sendChat: { text: 'こんにちは', at: x.now() }, askChat: { text: '引用', at: x.now() } })
-  await x.advance(3000)
   expect(x.sends.length).toBe(0)
   expect(x.fills.length).toBe(0)
-  expect(x.json('chat-log.json')).toBe(null)
-  expect(x.owner().session).toBe('other')
+  expect([...x.files.keys()].some(k => k.includes(`${x.sep}chats${x.sep}`))).toBe(false)
 })
 
-test('別のVaultのチャットは、このVaultの chat-owner.json に触らない', async () => {
+test('/note で結び付けのフォルダーを作り、リンクには一度だけの合図を s= で付ける。合図そのものはどのファイルにも書かない', async () => {
+  const x = world()
+  await x.start()
+  const r = await x.open()
+  expect(r.text).toContain(`http://localhost:8801/#c=KEY1&s=${r.raw}`)
+  expect(r.text).toContain('このチャットに届きます')
+  const folder = x.state.get('chatLink') as string
+  expect(folder).toMatch(/^[0-9a-f]{64}$/)
+  expect(x.linkDir()).toBe(linkDir('darwin', x.VDIR, folder))
+  expect(x.now() - x.link().at).toBeLessThanOrEqual(0)
+  // link.json には合図のハッシュと期限だけ（サーバーが引き換えに使う）。
+  expect(x.link().binds).toEqual([{ h: await x.io.hashLink(r.raw), until: x.now() + 15 * MIN }])
+  for (const [, text] of x.files) expect(text).not.toContain(r.raw)
+  // 開き直すと、同じフォルダーに新しい合図を足す（前の合図も期限まで使える。5つまで）。
+  const again = await x.open()
+  expect(again.raw).not.toBe(r.raw)
+  expect(x.linkDir()).toBe(linkDir('darwin', x.VDIR, folder))
+  expect(x.link().binds.length).toBe(2)
+  for (let i = 0; i < 6; i++) await x.open()
+  expect(x.link().binds.length).toBe(5)
+  // 期限が過ぎた合図は、印を書き直すときに外す。
+  await x.advance(16 * MIN)
+  expect(x.link().binds).toEqual([])
+})
+
+test('動いているサーバーがこのModより古ければ、リンクに合図を付けない（古い画面は #c= だけの形しか読めない）', async () => {
+  const x = world({ serverVersion: '0.0.1' })
+  await x.start()
+  const r = await x.nd.note('')
+  expect(r.text).toContain('#c=KEY1')
+  expect(r.text).not.toContain('s=')
+  expect(r.text).not.toContain('このチャットに届きます')
+})
+
+test('番号は推測できない43文字（32バイトの乱数）で、毎回違う。ハッシュは SHA-256 の16進', async () => {
+  const x = world()
+  const a = x.io.randomLink()
+  const b = x.io.randomLink()
+  expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/)
+  expect(b).toMatch(/^[A-Za-z0-9_-]{43}$/)
+  expect(a).not.toBe(b)
+  expect(await x.io.hashLink('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+})
+
+test('2つのチャットがそれぞれエディターを開いたら、それぞれのエディターの文は、それぞれのチャットにだけ届く', async () => {
   const files = new Map<string, string>()
-  const a = world({ files, vid: 'aaaaaaaaaaaaaaaa', root: '/V/a', session: 'sess-a' })
-  const b = world({ files, vid: 'bbbbbbbbbbbbbbbb', root: '/V/b', session: 'sess-b' })
+  const a = world({ files, session: 'sess-a' })
+  const b = world({ files, session: 'sess-b' })
   await a.start()
   await b.start()
-  await a.say('Aで話す')
-  const ownerA = files.get(a.f('chat-owner.json'))
-  await b.say('Bで話す')
-  await b.nd.note('')
-  await b.advance(15_000)
-  expect(files.get(a.f('chat-owner.json'))).toBe(ownerA)
-  expect(b.owner()?.session).toBe('sess-b')
-  await b.nd.sessionEnd('other')
-  expect(files.get(a.f('chat-owner.json'))).toBe(ownerA)
+  const ra = await a.open()
+  const rb = await b.open()
+  expect(ra.raw).not.toBe(rb.raw)
+  expect(a.linkDir()).not.toBe(b.linkDir())
+  a.editor({ sendChat: { text: 'Aへ', at: a.now() } })
+  await a.advance(1500)
+  await b.advance(1500)
+  expect(a.sends.map(s => s.text)).toEqual(['Aへ'])
+  expect(b.sends.length).toBe(0)
+  b.editor({ sendChat: { text: 'Bへ', at: b.now() }, askChat: { text: 'B引用', at: b.now() } })
+  await a.advance(1500)
+  await b.advance(1500)
+  expect(a.sends.map(s => s.text)).toEqual(['Aへ'])
+  expect(b.sends.map(s => s.text)).toEqual(['Bへ'])
+  expect(a.fills.length).toBe(0)
+  expect(b.fills.length).toBe(1)
+  // 返事も、それぞれの結び付けのフォルダーに書く。
+  a.sends[0].resolve({})
+  b.sends[0].resolve({})
+  await a.nd.turnStart({ text: 'Aへ', turnId: 'ta' })
+  await a.nd.turnComplete({ turnId: 'ta', answer: 'Aの返事', reason: 'done' })
+  await b.nd.turnStart({ text: 'Bへ', turnId: 'tb' })
+  await b.nd.turnComplete({ turnId: 'tb', answer: 'Bの返事', reason: 'done' })
+  expect(a.json('reply.json').text).toBe('Aの返事')
+  expect(b.json('reply.json').text).toBe('Bの返事')
+  // 片方の番が、もう片方の返事にならない。
+  await b.nd.turnStart({ text: 'Aへ', turnId: 'tx' })
+  await b.nd.turnComplete({ turnId: 'tx', answer: '混ざった', reason: 'done' })
+  expect(a.json('reply.json').text).toBe('Aの返事')
 })
 
-test('share-note.json がなければ、ノートを添えない', async () => {
-  const x = world()
+test('ターミナルだけのチャットは、送り先にならない。/note の返事でそう伝え、リンクに番号を付けない', async () => {
+  const x = world({ surfaces: ['terminal'] })
   await x.start()
-  x.editor({ path: 'Home.md', updatedAt: x.now() - 100 })
+  const r = await x.open()
+  expect(r.raw).toBe('')
+  expect(r.text).toContain('#c=KEY1')
+  expect(r.text).not.toContain('s=')
+  expect(r.text).toContain('ターミナルだけで開いているので')
+  expect(x.linkDir()).toBe(null)
+  expect([...x.files.keys()].some(k => k.includes(`${x.sep}chats${x.sep}`))).toBe(false)
   expect(await x.say('こんにちは')).toBe(null)
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: false }))
-  expect(await x.say('こんにちは')).toBe(null)
-})
-
-test('share-note.json が on: true なら、ノートを添える', async () => {
-  const x = world()
-  await x.start()
-  x.editor({ path: 'Home.md', updatedAt: x.now() - 100 })
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
-  expect(await x.say('こんにちは')).toBe('エディターで開いているノート: Home.md')
-  // 画面のないチャットでは添えない。
-  const y = world({ surfaces: [] })
+  // ターミナルとアプリの両方に出ているチャットは、送り先になる。
+  const y = world({ surfaces: ['terminal', 'desktop'] })
   await y.start()
-  await y.advance(12_000)
-  y.editor({ path: 'Home.md', updatedAt: y.now() - 100 })
-  y.files.set(y.f('share-note.json'), JSON.stringify({ on: true }))
-  expect(await y.say('こんにちは')).toBe(null)
+  expect((await y.open()).raw).toMatch(/^[A-Za-z0-9_-]{43}$/)
 })
 
-test('チャットが終わると相手を外す。/clear では外さない', async () => {
-  const x = world()
-  await x.start()
-  await x.say('こんにちは')
-  await x.nd.sessionEnd('clear')
-  expect(x.owner().session).toBe('sess-1')
+test('開いたあとにターミナルだけになったら、送らず、送れなかったことを返し、link.json も書き直さない。画面が戻っても遅れて送らない', async () => {
+  const x = await opened()
+  const at = x.link().at
+  x.w.surfaces = ['terminal']
+  const sentAt = x.now()
+  x.editor({ sendChat: { text: 'こんにちは', at: sentAt } })
+  await x.advance(30_000)
+  expect(x.sends.length).toBe(0)
+  expect(x.link().at).toBe(at)
+  expect(x.json('reply.json')).toEqual({ for: sentAt, text: 'チャットへ送れませんでした。（このチャットの画面が開いていません）', failed: true, at: expect.any(Number) })
+  x.w.surfaces = ['desktop']
+  await x.advance(3000)
+  expect(x.sends.length).toBe(0)
+})
+
+test('書かれてから2分より時間がたった送る文は、送らずに、送れなかったことを返す', async () => {
+  const x = await opened()
+  const old = x.now() - 3 * MIN
+  x.editor({ sendChat: { text: '古い文', at: old } })
+  await x.advance(1500)
+  expect(x.sends.length).toBe(0)
+  expect(x.json('reply.json').for).toBe(old)
+  expect(x.json('reply.json').failed).toBe(true)
+})
+
+test('印を書いているあいだにチャットが終わっても、印を生き返らせず、$.state にも戻さない', async () => {
+  const x = await opened()
+  let ended = false
+  x.w.onWrite = async p => {
+    if (ended || !p.endsWith('link.json')) return
+    ended = true
+    x.w.onWrite = null
+    await x.nd.sessionEnd('other') // 見回りの書き込みの途中で終わる
+  }
+  await x.advance(11_000)
+  expect(ended).toBe(true)
+  expect(x.link()).toEqual({ at: 0, closed: true, reason: 'other' })
+  expect(x.state.get('chatLink')).toBe(null)
+})
+
+test('Modを読み込み直しても、まだ使っていない合図は link.json に残す', async () => {
+  const x = await opened()
+  const code = (await x.open()).raw
+  const h = await x.io.hashLink(code)
+  const y = world({ files: x.files, state: x.state })
+  await y.start()
+  await y.advance(11_000)
+  expect(x.link().binds.some((b: { h: string }) => b.h === h)).toBe(true)
+})
+
+test('チャットが終わったあとに、途中だった見回りが印を生き返らせない', async () => {
+  const x = await opened()
   await x.nd.sessionEnd('other')
-  expect(x.owner()).toEqual({ session: '', at: 0 })
+  await x.advance(30_000)
+  expect(x.link()).toEqual({ at: 0, closed: true, reason: 'other' })
+})
 
-  // ほかのチャットが相手なら、終わっても書き換えない。
-  const y = world()
-  await y.start()
-  y.files.set(y.f('chat-owner.json'), JSON.stringify({ session: 'other', at: y.now() }))
-  await y.nd.sessionEnd('other')
-  expect(y.owner().session).toBe('other')
+test('/clear では結び付けを残す（名前は新しくする）。チャットが終わると link.json を終わりにし、番号を捨てる', async () => {
+  const x = await opened()
+  const raw = x.state.get('chatLink')
+  await x.nd.sessionEnd('clear')
+  expect(x.state.get('chatLink')).toBe(raw)
+  x.editor({ sendChat: { text: 'clear のあと', at: x.now() } })
+  await x.advance(1500)
+  expect(x.sends.map(s => s.text)).toEqual(['clear のあと'])
+  await x.nd.sessionEnd('other')
+  expect(x.link()).toEqual({ at: 0, closed: true, reason: 'other' })
+  expect(x.json('log.json')).toEqual({}) // 会話の抜粋も消す
+  expect(x.state.get('chatLink')).toBe(null)
+  x.editor({ sendChat: { text: '終わったあと', at: x.now() + 10 } })
+  await x.advance(3000)
+  expect(x.sends.length).toBe(1)
+  // 次に開くときは新しい結び付けのフォルダー。
+  await x.open()
+  expect(x.state.get('chatLink')).not.toBe(raw)
+})
+
+test('別のVaultのチャットは、このVaultの結び付けのフォルダーに触らない', async () => {
+  const files = new Map<string, string>()
+  const a = world({ files, vid: 'aaaaaaaaaaaaaaaa', root: '/V/a' })
+  const b = world({ files, vid: 'bbbbbbbbbbbbbbbb', root: '/V/b' })
+  await a.start()
+  await b.start()
+  await a.open()
+  await b.open()
+  expect(a.linkDir()!.startsWith(a.VDIR)).toBe(true)
+  expect(b.linkDir()!.startsWith(b.VDIR)).toBe(true)
+  const before = [...files.keys()].filter(k => k.startsWith(a.VDIR)).map(k => [k, files.get(k)])
+  await b.advance(15_000)
+  await b.nd.sessionEnd('other')
+  expect([...files.keys()].filter(k => k.startsWith(a.VDIR)).map(k => [k, files.get(k)])).toEqual(before)
 })
 
 test('Windowsの場所でも、別のフォルダーのノートを見分け、project はフォルダーの名前だけ', async () => {
@@ -626,93 +650,34 @@ test('Windowsの場所でも、別のフォルダーのノートを見分け、p
   expect(describeNote({ path: 'sub/Home.md', root: 'C:\\Users\\u\\Other', updatedAt: 900 }, 1000, 'C:\\Users\\u\\Notes', 'win32')).toBe(
     'エディターで開いているノート: C:\\Users\\u\\Other\\sub\\Home.md',
   )
-  // Macでは大文字と小文字を区別する。
   expect(describeNote({ path: 'Home.md', root: '/v/NOTES', updatedAt: 900 }, 1000, '/v/notes', 'darwin')).toBe('エディターで開いているノート: /v/NOTES/Home.md')
 
-  const x = world({ win: true })
-  await x.start()
-  x.files.set(x.f('share-note.json'), JSON.stringify({ on: true }))
+  const x = await opened({ win: true })
+  expect(x.linkDir()!.startsWith(`${x.VDIR}\\chats\\`)).toBe(true)
+  x.share(true)
   x.editor({ path: 'Home.md', root: 'C:\\Users\\u\\Other', updatedAt: x.now() - 100 })
   expect(await x.say('こんにちは')).toContain('C:\\Users\\u\\Other\\Home.md')
   x.editor({ path: 'Home.md', root: 'c:\\users\\u\\notes', updatedAt: x.now() - 100 })
   expect(await x.say('こんにちは')).toBe('エディターで開いているノート: Home.md')
   await x.advance(3000)
-  expect(x.owner().session).toBe('sess-1')
-  expect(x.json('chat-log.json').project).toBe('Notes')
+  expect(x.json('log.json').project).toBe('Notes')
 })
 
-
-// ---- レビュー指摘の修正（Fix round 1） ----
-
-test('会話の記録に、エディターを開く鍵（#c=）を書かない', async () => {
-  const x = world()
-  await x.start()
+test('会話の記録に、エディターを開く鍵（#c=）と結び付けの合図（s=）を書かない', async () => {
+  const x = await opened()
+  const raw = (await x.open()).raw
   x.w.messages = [
-    { role: 'user', text: 'The notedock plugin sent a message: navigate で http://localhost:8801/?chat=1#c=SECRETKEY123 へ移ってください。' },
-    { role: 'assistant', text: '[開く](http://localhost:8801/#c=KEY2) と "http://localhost:8801/#c=KEY3" と <http://localhost:8801/#c=KEY4>' },
+    { role: 'user', text: `The notedock plugin sent a message: navigate で http://localhost:8801/?chat=1#c=SECRETKEY123&s=${raw} へ移ってください。` },
+    { role: 'assistant', text: `[開く](http://localhost:8801/#c=KEY2) と "http://localhost:8801/#c=KEY3" と <http://localhost:8801/#s=${raw}>` },
   ]
   await x.say('こんにちは')
   await x.advance(3000)
-  const log = x.files.get(x.f('chat-log.json'))!
+  const log = x.files.get(x.inLink('log.json'))!
   expect(log).toBeDefined()
   expect(log).not.toContain('#c=')
-  for (const key of ['SECRETKEY123', 'KEY2', 'KEY3', 'KEY4']) expect(log).not.toContain(key)
+  expect(log).not.toContain(raw)
+  for (const key of ['SECRETKEY123', 'KEY2', 'KEY3']) expect(log).not.toContain(key)
   expect(log).toContain('http://localhost:8801/?chat=1')
-})
-
-test('送る直前に話し相手でなくなっていたら、送らない', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
-  x.editor({ sendChat: { text: 'こんにちは', at: x.now() } })
-  // 見回りの途中（会話を読むとき）に、ほかのチャットが印を移した。
-  x.w.onMessages = () => x.files.set(x.f('chat-owner.json'), JSON.stringify({ session: 'other', at: x.now() }))
-  await x.advance(1500)
-  expect(x.sends.length).toBe(0)
-  expect(x.owner().session).toBe('other')
-})
-
-test('印を書き直す直前に、ほかのチャットへ移っていたら、上書きしない', async () => {
-  const x = world()
-  await x.start()
-  const ownerFile = x.f('chat-owner.json')
-  x.files.set(ownerFile, JSON.stringify({ session: 'sess-1', at: x.now() - 20_000 }))
-  let moved = false
-  x.w.afterRead = p => {
-    if (p === ownerFile && !moved) {
-      moved = true
-      x.files.set(ownerFile, JSON.stringify({ session: 'other', at: x.now() }))
-    }
-  }
-  await x.advance(1500)
-  expect(x.owner().session).toBe('other')
-})
-
-test('自分の印が古くなっていれば（スリープ明けなど）、見回りで書き直す。ほかのチャットの古い印は引き継がない', async () => {
-  const x = world()
-  await x.start()
-  x.files.set(x.f('chat-owner.json'), JSON.stringify({ session: 'sess-1', at: 1 }))
-  await x.advance(1500)
-  expect(x.owner().session).toBe('sess-1')
-  expect(x.now() - x.owner().at).toBeLessThanOrEqual(1500)
-
-  const y = world()
-  await y.start()
-  y.files.set(y.f('chat-owner.json'), JSON.stringify({ session: 'other', at: 1 }))
-  await y.advance(15_000)
-  expect(y.owner()).toEqual({ session: 'other', at: 1 })
-})
-
-test('送るのに失敗したら（例外）、送れなかったことを chat-reply.json に書く', async () => {
-  const x = world()
-  await x.start()
-  await x.say('はじめ')
-  const at = x.now()
-  x.editor({ sendChat: { text: 'こんにちは', at } })
-  await x.advance(1500)
-  x.sends[0].reject(new Error('切れました'))
-  await x.advance(0)
-  expect(x.json('chat-reply.json')).toEqual({ for: at, text: 'チャットへ送れませんでした。（切れました）', failed: true, at: x.now() })
 })
 
 test('画面なしで始まり、session.attach なしで画面が付いたチャットでも、/note のあとは見回りが動く', async () => {
@@ -720,20 +685,30 @@ test('画面なしで始まり、session.attach なしで画面が付いたチ�
   await x.start()
   await x.advance(12_000)
   x.w.surfaces = ['desktop']
-  await x.nd.note('')
-  expect(x.owner()?.session).toBe('sess-1')
+  const r = await x.open()
+  expect(r.raw).toMatch(/^[A-Za-z0-9_-]{43}$/)
   await x.advance(3000)
   x.editor({ sendChat: { text: 'こんにちは', at: x.now() } })
   await x.advance(1500)
   expect(x.sends.map(s => s.text)).toEqual(['こんにちは'])
 })
 
+test('画面のないチャットでは、/note でも番号を作らない', async () => {
+  const x = world({ surfaces: [] })
+  await x.start()
+  await x.advance(12_000)
+  const r = await x.open()
+  expect(r.raw).toBe('')
+  expect([...x.files.keys()].some(k => k.includes(`${x.sep}chats${x.sep}`))).toBe(false)
+})
+
 test('Windowsでは、別のフォルダーの場所の / も \\ にそろえてつなぐ。ファイルの場所はOSを渡して作る', () => {
   expect(describeNote({ path: 'sub/Home.md', root: 'C:/Users/u/Other', updatedAt: 900 }, 1000, 'C:\\Users\\u\\Notes', 'win32')).toBe(
     'エディターで開いているノート: C:\\Users\\u\\Other\\sub\\Home.md',
   )
-  expect(chatFile('win32', 'C:\\S\\vaults\\v', 'chat-owner.json')).toBe('C:\\S\\vaults\\v\\chat-owner.json')
-  expect(chatFile('darwin', '/S/vaults/v', 'chat-owner.json')).toBe('/S/vaults/v/chat-owner.json')
+  expect(chatFile('win32', 'C:\\S\\vaults\\v', 'link.json')).toBe('C:\\S\\vaults\\v\\link.json')
+  expect(chatFile('darwin', '/S/vaults/v', 'link.json')).toBe('/S/vaults/v/link.json')
+  expect(linkDir('win32', 'C:\\S\\vaults\\v', 'ab')).toBe('C:\\S\\vaults\\v\\chats\\ab')
 })
 
 test('フックのつなぎ：prompt.submit で添える文を context に足し、session.end に reason を渡す', async () => {
@@ -760,10 +735,29 @@ test('フックのつなぎ：prompt.submit で添える文を context に足し
   expect(ends).toEqual(['clear', 'logout'])
 })
 
-test('鍵を消すとき、鍵のすぐあとに続く文は残す', () => {
-  // 鍵は base64url（A-Z a-z 0-9 _ -）だけでできている。そのほかの文字が来たら、そこで鍵は終わる。
+test('鍵と番号を消すとき、すぐあとに続く文は残す', () => {
   expect(hideKeys('http://localhost:8801/#c=AbC-_9xyzです。次へ')).toBe('http://localhost:8801/です。次へ')
   expect(hideKeys('[開く](http://localhost:8801/#c=KEY2)を押す')).toBe('[開く](http://localhost:8801/)を押す')
   expect(hideKeys('a #c=K1、b #c=K2。')).toBe('a 、b 。')
+  const s = 'S'.repeat(43)
+  expect(hideKeys(`http://localhost:8801/#c=K1&s=${s})です`)).toBe('http://localhost:8801/)です')
+  expect(hideKeys(`http://localhost:8801/#s=${s}。`)).toBe('http://localhost:8801/。')
   expect(hideKeys('鍵なし')).toBe('鍵なし')
+})
+
+test('チャットが終わった理由を、デバッグのログと「終わった」の印に残す（決まった言葉だけ）。/clear なら結び付けを残す', async () => {
+  const x = await opened()
+  await x.nd.sessionEnd('clear')
+  expect(x.debugLines).toEqual(['notedock: session.end reason=clear'])
+  expect(x.link().closed).toBeUndefined()
+  await x.nd.sessionEnd('prompt_input_exit')
+  expect(x.debugLines[1]).toBe('notedock: session.end reason=prompt_input_exit')
+  expect(x.link()).toEqual({ at: 0, closed: true, reason: 'prompt_input_exit' })
+  const y = await opened()
+  await y.nd.sessionEnd('/Users/someone の会話' as any)
+  expect(y.debugLines).toEqual(['notedock: session.end reason=unknown'])
+  expect(y.link().reason).toBe('unknown')
+  const z = await opened()
+  await z.nd.sessionEnd(undefined)
+  expect(z.link().reason).toBe('unknown')
 })
