@@ -4,7 +4,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Band } from '../types'
-import { chatFile, describeNote, hexOf, hideKeys, isSentText, linkDir, MAX_TEXT, newLinkText, noteForSend, quoteForPrompt, shareIsOn, titleFrom, TYPED_ORIGINS, withNote, type EditorState } from './chat'
+import { chatFile, coversSelection, describeNote, hexOf, hideKeys, isSentText, lineMention, linkDir, MAX_TEXT, newLinkText, noteForSend, quoteForPrompt, readMentions, shareIsOn, titleFrom, TYPED_ORIGINS, withNote, type EditorState } from './chat'
 import { summarizeTranscript } from './chat-log'
 import { compareVersions, ensureBinary, installedBinary, onlyNewerInstalled, removeOldVersions } from './install'
 import { editorUrl, openPrompt, retryPrompt } from './open'
@@ -67,6 +67,7 @@ export type Io = {
   after: (ms: number, fn: () => void) => Timer
   every: (ms: number, fn: () => void) => Timer
   read: (path: string) => Promise<string>
+  realPath: (path: string) => Promise<string> // たどった先の場所（シンボリックリンクを解いたもの）。無ければ throw
   write: (path: string, text: string) => Promise<void>
   root: () => Promise<string>
   surfaces: () => Promise<readonly string[]>
@@ -117,6 +118,11 @@ export function ioFor($: Host, over: Partial<Io> = {}): Io {
     after: (ms, fn) => $.clock.after(ms, fn),
     every: (ms, fn) => $.clock.every(ms, fn),
     read: path => $.fs.read(path),
+    realPath: async path => {
+      const found = await $.fs.stat(path, { resolve: true })
+      if (typeof found?.realPath !== 'string') throw new Error('no real path')
+      return found.realPath
+    },
     write: (path, text) => $.fs.write(path, text),
     root: () => $.session.root(),
     surfaces: () => $.session.surfaces(),
@@ -1037,8 +1043,12 @@ export function createNotedock(opts: { version?: string } = {}) {
       const at = state.sendChat.at
       // Modが送る文には、Mod自身の prompt.submit フックが呼ばれない（呼んだプラグインのフックは通らず、context も渡せない）。
       // そこで、切り替えがオンなら、開いているノートの短い案内を文の末尾に足す（打った文と選んだ文字の上限はそれぞれ守る）。
-      const note = (await io.shareIsOn(dir, base.host.os)) ? noteForSend(state, t, base.root, base.host.os) : null
-      const text = withNote(typed, note)
+      // 打った文の「@場所#L12-18」は、エンジンが読まない（Modが送る文のため）ので、Modが保存したファイルから読んで添える。
+      // 共有の切り替えには関係なく、本人が @ で指したときだけ。
+      const mentions = await readMentions(typed, state, base.root, base.host.os, io.read, io.realPath).catch(() => ({ text: null, attached: [] }))
+      // 選んでいる行を @ で指して添えたときは、案内から選んでいる文字を省く（同じ行が2回届かないように）。場所と保存の様子は残す。
+      const note = (await io.shareIsOn(dir, base.host.os)) ? noteForSend(state, t, base.root, base.host.os, !coversSelection(mentions.attached, state)) : null
+      const text = withNote(withNote(typed, mentions.text), note)
       pending = { text, at }
       // Claudeが作業中なら、終わってから送られる。
       let p: Promise<any>
@@ -1240,7 +1250,19 @@ export function createNotedock(opts: { version?: string } = {}) {
       if (pending && isSentText(String(e.text ?? ''), pending.text)) return null
       if (!(await io.shareIsOn(dir, base.host.os))) return null
       const state = (await readJson(cf(dir, 'state.json'))) as EditorState | null
-      return state ? describeNote(state, await now(), base.root, base.host.os) : null
+      // 選んでいる行の @ を見て選んでいる文字を省くのは、入力欄（composer）で打った文だけ（候補から @ を入れられるのはそこだけ）。
+      const typed = e.origin?.kind === 'composer' ? String(e.text ?? '') : ''
+      return state ? describeNote(state, await now(), base.root, base.host.os, typed) : null
+    },
+
+    // ターミナル版の入力欄で @ から打っているとき、このチャットに結び付いたエディターで選んでいる行を、候補の1行として返す。
+    // 選ぶと「@場所#L12-18」が入り、エンジンがその行を読んでClaudeに渡す。共有の切り替え（share.json）には関係なく出す。
+    async autocomplete(e: { token?: string }): Promise<{ text: string; label: string; description: string } | null> {
+      if (!io || typeof e.token !== 'string' || !e.token.startsWith('@')) return null
+      const dir = await chatReady()
+      if (!dir || base?.kind !== 'ok') return null
+      const state = (await readJson(cf(dir, 'state.json'))) as EditorState | null
+      return state ? lineMention(state, await now(), base.root, base.host.os, e.token) : null
     },
 
     // チャットが終わったら、結び付けの印を「終わった」にし、番号を捨てる（エディターは送れない状態になる）。
@@ -1376,6 +1398,14 @@ export function wire(on: Parameters<Register>[0], nd: ReturnType<typeof createNo
   on('prompt.submit', async ($, e, next) => {
     const note = await nd.promptSubmit(e).catch(() => null)
     return next(note ? { ...e, context: [...(e.context ?? []), note] } : e)
+  })
+
+  // ターミナル版の入力欄の @ の候補に「選んでいる行：○○.md の12〜18行目」を足す。エンジンの候補の下に並ぶ。
+  // デスクトップアプリの入力欄では、このフックは呼ばれない（2026-11 に実機で確かめた）。窓のチャット欄の @ はエディターの画面が出す。
+  on('prompt.autocomplete', { token: /^@/ }, async ($, e, next) => {
+    const got = await next(e)
+    const row = await nd.autocomplete(e).catch(() => null)
+    return row ? { suggestions: [row, ...got.suggestions] } : got
   })
 
   on('session.end', async ($, e, next) => {

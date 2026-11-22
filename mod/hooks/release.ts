@@ -1,10 +1,10 @@
 // このファイルは scripts/write-release.mjs が作る。手で直さない。
 import type { Target } from './target'
-export const VERSION = "0.1.1"
-export const BASE_URL = "https://github.com/kuma8088/notedock/releases/download/server-v0.1.1/"
+export const VERSION = "0.1.2"
+export const BASE_URL = "https://github.com/kuma8088/notedock/releases/download/server-v0.1.2/"
 export const ASSETS: Partial<Record<Target, { file: string; size: number; sha256: string }>> = {
-  "aarch64-apple-darwin": { file: "notedock-server-aarch64-apple-darwin", size: 76812386, sha256: "f5688f91c9b0ec84ead3ff2903c6a97bf896c4d962d89ddbf3a20bb07f52f913" },
-  "x86_64-apple-darwin": { file: "notedock-server-x86_64-apple-darwin", size: 89107929, sha256: "0b2726eb359d97f98d37436b891336c9f789ed0b5d04ae6d45d4a672736bd123" },
-  "aarch64-pc-windows-msvc": { file: "notedock-server-aarch64-pc-windows-msvc.exe", size: 82111868, sha256: "cff82ac5262247e081354dd3907ea35217d57151b4f43220f3060a8bb2784361" },
-  "x86_64-pc-windows-msvc": { file: "notedock-server-x86_64-pc-windows-msvc.exe", size: 88978299, sha256: "306939bc6f4cfb0d8c73fd6e41b71f4683c490e6b96fc9155550d06f3a6ae026" },
+  "aarch64-apple-darwin": { file: "notedock-server-aarch64-apple-darwin", size: 76812386, sha256: "77a08f6e4b7b428b51380ed89cd4b0e89d3fac7e1ac5b2cadb69d2db56b26566" },
+  "x86_64-apple-darwin": { file: "notedock-server-x86_64-apple-darwin", size: 89118047, sha256: "50ca5e919ae87a999321f9cb3ac4f722030bac342a98d92e92a9a6aa651d5c57" },
+  "aarch64-pc-windows-msvc": { file: "notedock-server-aarch64-pc-windows-msvc.exe", size: 82121986, sha256: "23bc1c85c14f1c88dcc8894a5e295b1bb2350f84ee5b9264e777af9594080251" },
+  "x86_64-pc-windows-msvc": { file: "notedock-server-x86_64-pc-windows-msvc.exe", size: 88988417, sha256: "725090f397d65bcc224a0b5811a4d6aa3ee5b1129481b04e947aa3de5da4c8bb" },
 }
