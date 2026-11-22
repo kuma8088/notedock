@@ -934,46 +934,62 @@ test('窓のチャット欄で @場所#L を打って送ると、保存したフ
   expect(x.json('reply.json').for).toBe(sentAt)
 })
 
-test('窓のチャット欄：選んでいる行を @ で指して添えたら、案内から選んでいる文字を省く。場所と保存の様子は残す', async () => {
+test('窓のチャット欄：選んでいる行をすべて含む @ の行を添えたら、案内から選んでいる文字を省く。場所は残す', async () => {
   const x = await opened()
   x.share(true)
   x.files.set(`${x.ROOT}/memo.md`, Array.from({ length: 20 }, (_, i) => `行${i + 1}`).join('\n'))
-  x.editor({ path: 'memo.md', root: x.ROOT, dirty: true, selection: '行12\n行13', lines: { from: 12, to: 13 }, updatedAt: x.now(), sendChat: { text: '@memo.md#L12-13 を直して', at: x.now() } })
+  x.editor({ path: 'memo.md', root: x.ROOT, selection: '行12\n行13', lines: { from: 12, to: 13 }, updatedAt: x.now(), sendChat: { text: '@memo.md#L11-13 を直して', at: x.now() } })
   await x.advance(1500)
   const text = x.sends[0]?.text ?? ''
   expect((text.match(/行12/g) ?? []).length).toBe(1)
-  expect(text).toContain('（エディターで開いているノート: memo.md。まだ保存していない変更があります）')
+  expect(text.endsWith('\n\n（エディターで開いているノート: memo.md）')).toBe(true)
   expect(text).not.toContain('選んでいる文字')
-  expect(isSentText(text, '@memo.md#L12-13 を直して')).toBe(true)
+  expect(isSentText(text, '@memo.md#L11-13 を直して')).toBe(true)
 })
 
-test('窓のチャット欄：@ の行が読めない・別の行・別のノートなら、選んでいる文字は省かない。@ がなければ今までどおり', async () => {
+test('窓のチャット欄：一部だけ重なる・別の行・別のノート・読めない・保存していない変更があるときは、選んでいる文字を省かない', async () => {
   const x = await opened()
   x.share(true)
   x.files.set(`${x.ROOT}/memo.md`, Array.from({ length: 20 }, (_, i) => `行${i + 1}`).join('\n'))
   x.files.set(`${x.ROOT}/other.md`, 'a\nb\n')
-  const sel = { path: 'memo.md', root: x.ROOT, selection: '行12', lines: { from: 12, to: 12 } }
-  const texts = ['@nai.md#L12 を見て', '@memo.md#L1-2 を見て', '@other.md#L1 を見て', 'ここを直して']
-  for (let i = 0; i < texts.length; i += 1) {
-    x.editor({ ...sel, updatedAt: x.now(), sendChat: { text: texts[i], at: x.now() + 10 + i } })
+  const sel = { path: 'memo.md', root: x.ROOT, selection: '行12\n行13', lines: { from: 12, to: 13 } }
+  const cases: [Record<string, unknown>, string][] = [
+    [sel, '@memo.md#L12 を見て'],
+    [sel, '@memo.md#L1-2 を見て'],
+    [sel, '@other.md#L1 を見て'],
+    [{ ...sel, path: 'gone.md' }, '@gone.md#L12-13 を見て'],
+    [{ ...sel, dirty: true }, '@memo.md#L12-13 を見て'],
+    [sel, 'ここを直して'],
+  ]
+  for (let i = 0; i < cases.length; i += 1) {
+    const [st, text] = cases[i]!
+    x.editor({ ...st, updatedAt: x.now(), sendChat: { text, at: x.now() + i } })
     await x.advance(1500)
   }
   const sent = x.sends.map(s => s.text)
-  for (const s of sent) expect(s).toContain('選んでいる文字:\n> 行12')
-  expect(sent.at(-1)).toBe('ここを直して\n\n（エディターで開いているノート: memo.md）\n選んでいる文字:\n> 行12')
+  expect(sent.length).toBe(cases.length)
+  for (const s of sent) expect(s).toContain('選んでいる文字:\n> 行12\n> 行13')
+  expect(sent[0]).toContain(`${MENTION_HEAD}\n@memo.md#L12\n`)
+  expect(sent[3]).toContain('@gone.md#L12-13: 読めませんでした')
+  expect(sent.at(-1)).toBe('ここを直して\n\n（エディターで開いているノート: memo.md）\n選んでいる文字:\n> 行12\n> 行13')
 })
 
-test('ターミナル版：打った文の @場所#L が選んでいる行を指していれば、添える文から選んでいる文字を省く', async () => {
+test('ターミナル版：入力欄で打った文の @場所#L が選んでいる行をすべて含めば、添える文から選んでいる文字を省く', async () => {
   const x = await opened()
   x.share(true)
   x.editor({ path: 'Home.md', selection: '選択', lines: { from: 3, to: 4 }, updatedAt: x.now() - 100 })
   const skipped = await x.say('@Home.md#L3-4 を直して')
   expect(skipped).toContain('Home.md')
   expect(skipped).not.toContain('選択')
+  expect(await x.say('@Home.md#L3 を直して')).toContain('選択')
   expect(await x.say('@Home.md#L9 を直して')).toContain('選択')
-  expect(await x.say('@Other.md#L3 を直して')).toContain('選択')
+  expect(await x.say('@Other.md#L3-4 を直して')).toContain('選択')
+  expect(await x.say('@Home.md#L3-4 を直して', 'bridge')).toContain('選択')
   expect(await x.say('こんにちは')).toContain('選択')
-  expect(pointsAtSelection('メールは a@Home.md#L3 です', 'Home.md', { from: 3, to: 3 })).toBe(false)
+  x.editor({ path: 'Home.md', dirty: true, selection: '選択', lines: { from: 3, to: 4 }, updatedAt: x.now() - 100 })
+  expect(await x.say('@Home.md#L3-4 を直して')).toContain('選択')
+  expect(pointsAtSelection('メールは a@Home.md#L3-4 です', 'Home.md', { from: 3, to: 4 })).toBe(false)
+  expect(pointsAtSelection('@Home.md#L3-4', 'Home.md', null)).toBe(false)
 })
 
 test('会話のフォルダーと Vault が違うときは、@場所（ノート全体）の本当の場所を添える。同じなら添えない', async () => {
@@ -994,8 +1010,13 @@ test('添える塊は、名前や囲みも含めて上限の中に収める', ()
   const long = 'y'.repeat(300)
   const text = Array.from({ length: 400 }, () => long).join('\n')
   const where = `/${'d'.repeat(3000)}/a.md`
+  // 1行300字×400行の @ が5つ。2つ目からは上限に入らない
   const read = Array.from({ length: 5 }, (_, i) => ({ ref: { path: 'a.md', from: 1 + i, to: 400 }, where, text }))
   const block = mentionBlock(read)!
-  expect(block.length).toBeLessThanOrEqual(20000)
+  expect(block.length).toBeLessThanOrEqual(20000 + 5 * (where.length + 40))
   expect(block).toContain('長いのでここで切りました')
+  // 上限で入らなかった @ も、断りの1行は必ず入れる
+  for (let i = 0; i < 5; i += 1) expect(block).toContain(`@${where}#L${1 + i}-400`)
+  const failed = mentionBlock([...read.slice(0, 2), { ref: { path: 'b.md', from: 1, to: 1 }, where: 'b.md', text: null }])!
+  expect(failed).toContain('@b.md#L1: 読めませんでした')
 })

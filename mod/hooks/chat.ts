@@ -111,13 +111,14 @@ export function lineMention(state: EditorState, now: number, root: string, os: O
 }
 
 // 本人が打った発言に、prompt.submit のフックで context として添える文。
-// typed は本人が打った文。選んでいる行を @場所#L で指していれば、選んでいる文字は添えない（同じ行が2回届かないように）。
+// typed は本人が入力欄で打った文。選んでいる行をすべて含む @場所#L があれば、選んでいる文字は添えない（同じ行が2回届かないように）。
+// 保存していない変更があるときは、エンジンが読む保存したファイルと中身が違うことがあるので、省かない。
 export function describeNote(state: EditorState, now: number, root: string, os: Os, typed = ''): string | null {
   const info = noteInfo(state, now, root, os)
   if (!info) return null
   const lines = [`エディターで開いているノート: ${info.where}`]
   if (info.dirty) lines.push('このノートにはまだ保存していない変更があります。')
-  if (info.selection && !pointsAtSelection(typed, info.where, state.lines)) lines.push(`選んでいる文字:\n${info.selection}`)
+  if (info.selection && (info.dirty || !pointsAtSelection(typed, info.where, state.lines))) lines.push(`選んでいる文字:\n${info.selection}`)
   return lines.join('\n')
 }
 
@@ -134,10 +135,11 @@ export function noteForSend(state: EditorState, now: number, root: string, os: O
   return info.selection && withSelection ? `${head}\n選んでいる文字:\n${quoteForPrompt(info.selection).trimEnd()}` : head
 }
 
-// 選んでいる行と、@ で指した行が重なるか。選んでいる行が分からない（古いエディター）ときは、同じノートなら重なるとみなす。
-function overlaps(lines: EditorState['lines'], from: number, to: number): boolean {
-  if (!lines || !Number.isInteger(lines.from) || !Number.isInteger(lines.to)) return true
-  return from <= lines.to && to >= lines.from
+// @ で指した行が、選んでいる行をすべて含むか。一部だけ重なるときは含まない（省くと、選んだ行の残りが届かない）。
+// 選んでいる行が分からない（古いエディター）ときも、含まないとみなす。
+function covers(lines: EditorState['lines'], from: number, to: number): boolean {
+  if (!lines || !Number.isInteger(lines.from) || !Number.isInteger(lines.to)) return false
+  return from <= lines.from && to >= lines.to
 }
 
 // ターミナル版の入力欄で打った文に、開いているノートの選んでいる行を指す @場所#L があるか。
@@ -148,7 +150,7 @@ export function pointsAtSelection(typed: string, where: string, lines: EditorSta
   for (const m of typed.matchAll(re)) {
     const from = Number(m[2])
     const to = m[3] === undefined ? from : Number(m[3])
-    if (m[1] === where && overlaps(lines, from, to)) return true
+    if (m[1] === where && covers(lines, from, to)) return true
   }
   return false
 }
@@ -205,23 +207,25 @@ function blockOf(read: MentionRead[]): Mentions {
   const parts: string[] = []
   const attached: LineRef[] = []
   let used = MENTION_HEAD.length + 1
-  const add = (part: string) => {
-    if (used + part.length + 2 > MAX_MENTION_TEXT) return false
+  // 読めなかった・長すぎたなどの断りの1行は、上限を超えても入れる（指したことに Claude が気づけるように）。
+  // 断りは1つの @ に1行で、@ は MAX_MENTIONS までなので、超える分は小さい。
+  const add = (part: string, always = false) => {
+    if (!always && used + part.length + 2 > MAX_MENTION_TEXT) return false
     used += part.length + 2
     parts.push(part)
     return true
   }
-  const skip = (name: string) => add(`${name}: 長すぎるので添えませんでした`)
+  const skip = (name: string) => add(`${name}: 長すぎるので添えませんでした`, true)
   for (const { ref, where, text } of read) {
     const name = `@${where}#L${ref.from === ref.to ? ref.from : `${ref.from}-${ref.to}`}`
     if (text === null) {
-      add(`${name}: 読めませんでした`)
+      add(`${name}: 読めませんでした`, true)
       continue
     }
     const lines = text.replace(/\r\n?/g, '\n').split('\n')
     if (lines.length && lines[lines.length - 1] === '') lines.pop()
     if (ref.from > lines.length) {
-      add(`${name}: このファイルは${lines.length}行までです`)
+      add(`${name}: このファイルは${lines.length}行までです`, true)
       continue
     }
     const last = Math.min(ref.to, lines.length, ref.from + MAX_MENTION_LINES - 1)
@@ -319,9 +323,11 @@ export async function mentionsForSend(...args: Parameters<typeof readMentions>):
   return (await readMentions(...args)).text
 }
 
-// @ で指して実際に添えた行に、開いているノートの選んでいる行が入っているか（入っていれば、選んでいる文字は添えない）。
+// @ で指して実際に添えた行に、開いているノートの選んでいる行がすべて入っているか（入っていれば、選んでいる文字は添えない）。
+// 保存していない変更があるときは、添えた行（保存したファイル）と選んでいる文字が違うことがあるので、省かない。
 export function coversSelection(attached: LineRef[], state: EditorState): boolean {
-  return attached.some(ref => ref.path === state.path && overlaps(state.lines, ref.from, ref.to))
+  if (state.dirty) return false
+  return attached.some(ref => ref.path === state.path && covers(state.lines, ref.from, ref.to))
 }
 
 // 番の文が、エディターから送った文かどうか。sent は送った文そのもの（案内付き）か、

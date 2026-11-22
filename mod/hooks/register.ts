@@ -1250,7 +1250,9 @@ export function createNotedock(opts: { version?: string } = {}) {
       if (pending && isSentText(String(e.text ?? ''), pending.text)) return null
       if (!(await io.shareIsOn(dir, base.host.os))) return null
       const state = (await readJson(cf(dir, 'state.json'))) as EditorState | null
-      return state ? describeNote(state, await now(), base.root, base.host.os, String(e.text ?? '')) : null
+      // 選んでいる行の @ を見て選んでいる文字を省くのは、入力欄（composer）で打った文だけ（候補から @ を入れられるのはそこだけ）。
+      const typed = e.origin?.kind === 'composer' ? String(e.text ?? '') : ''
+      return state ? describeNote(state, await now(), base.root, base.host.os, typed) : null
     },
 
     // ターミナル版の入力欄で @ から打っているとき、このチャットに結び付いたエディターで選んでいる行を、候補の1行として返す。
