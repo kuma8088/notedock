@@ -1307,7 +1307,7 @@ function setupChatBox() {
   const setExpanded = (open) => {
     log.hidden = !open
     expand.setAttribute('aria-expanded', String(open))
-    // 文字のボタンは幅が狭いと2行に折り返すので、向きの変わる矢印のアイコンにする。何が起きるかは説明と読み上げのラベルで伝える。
+    // 文字のボタンは幅が狭いと2行に折り返すので、山形のアイコンにする（drawExpand）。
     drawExpand()
     storage.set('chat-expanded', open)
     if (open) {
