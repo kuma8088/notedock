@@ -8,7 +8,6 @@ import {
   foldGutter,
   foldKeymap,
   foldable,
-  foldedRanges,
   indentUnit,
   syntaxHighlighting,
   syntaxTree,
@@ -31,6 +30,7 @@ import { copyText } from './copy.mjs'
 import { keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
 import { absolutePath, ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
+import { foldedLines, foldsChanged } from './folds.mjs'
 import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
@@ -895,16 +895,12 @@ function onUpdate(update) {
     scheduleState()
     syncToolbar()
   }
-  if (update.transactions.some((tr) => tr.effects.some((e) => e.is(foldEffect)))) rememberFolds()
+  if (foldsChanged(update.transactions)) rememberFolds()
 }
 
 function rememberFolds() {
   if (!view || !currentPath) return
-  const lines = []
-  foldedRanges(view.state).between(0, view.state.doc.length, (from) => {
-    lines.push(view.state.doc.lineAt(from).number)
-  })
-  storage.set(`folds:${vaultName}:${currentPath}`, lines)
+  storage.set(`folds:${vaultName}:${currentPath}`, foldedLines(view.state))
 }
 
 function restoreFolds(path) {
