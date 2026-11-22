@@ -244,12 +244,20 @@ export class WikiLinkWidget extends WidgetType {
   }
 }
 
+// 箇条書きの記号。段（level、いちばん外が1）ごとに「• → ◦ → ▪」を繰り返す。見せ方だけで、ファイルの「-」は変えない。
+const BULLET_SYMBOLS = ['•', '◦', '▪']
+
 export class BulletWidget extends WidgetType {
-  eq() {
-    return true
+  constructor(level = 1) {
+    super()
+    this.level = level
+    this.symbol = BULLET_SYMBOLS[(Math.max(level, 1) - 1) % BULLET_SYMBOLS.length]
+  }
+  eq(other) {
+    return other.symbol === this.symbol
   }
   toDOM() {
-    return element('span', { class: 'cm-bullet', 'aria-hidden': 'true' }, ['•'])
+    return element('span', { class: `cm-bullet cm-bullet-${BULLET_SYMBOLS.indexOf(this.symbol) + 1}`, 'aria-hidden': 'true' }, [this.symbol])
   }
 }
 

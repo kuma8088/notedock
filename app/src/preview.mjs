@@ -275,7 +275,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
             return undefined
           }
           if (item?.parent?.name === 'BulletList') {
-            if (!lineTouched(from)) add(from, to, Decoration.replace({ widget: new BulletWidget() }))
+            if (!lineTouched(from)) add(from, to, Decoration.replace({ widget: new BulletWidget(listDepth(item)) }))
           } else {
             add(from, to, Decoration.mark({ class: 'cm-list-number' }))
           }
@@ -430,6 +430,15 @@ export function headingPlace(state, pos) {
   let block = syntaxTree(state).resolveInner(line.from, 1)
   while (block.parent && block.parent.name !== 'Document') block = block.parent
   return AFTER_BLOCK.has(block.name) ? ' cm-heading-after-block' : ''
+}
+
+// 箇条書き・番号付きの入れ子の深さ（いちばん外が1）。番号付きの下の箇条書きも1段深く数える（HTML の ol の中の ul と同じ）。
+function listDepth(item) {
+  let depth = 0
+  for (let node = item?.parent; node; node = node.parent) {
+    if (node.name === 'BulletList' || node.name === 'OrderedList') depth += 1
+  }
+  return depth
 }
 
 function addIndentGuides(state, add) {
