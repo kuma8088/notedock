@@ -225,7 +225,23 @@ const Tag = {
   ],
 }
 
-export const noteMarkdownExtensions = [GFM, Frontmatter, MathBlock, InlineMath, WikiLink, Highlight, ObsidianComment, Tag]
+// 段落のすぐ下の「-」1文字だけの行（後ろは空白だけ。引用の中の「> - 」も）は、見出しの下線にせず、そこで段落を終える。
+// その行は中身のない箇条書きとして読まれる。ひな形の「Q. 〜」の行の次に空の「- 」があると、
+// 標準の決まり（CommonMark）では「Q. 〜」が2段目の見出しになり、文字が大きく見えてしまうため。
+// 「--」「---」「=」「===」の下線は、今までどおり見出しにする。GitHub など標準どおりの表示とは、この1点だけ違う。
+const LONE_DASH = /^-[\t ]*$/
+const EmptyBulletNotUnderline = {
+  parseBlock: [
+    {
+      name: 'EmptyBulletNotUnderline',
+      parse: () => false,
+      // 4文字以上の字下げは下線にも箇条書きにもならない（段落の続き）ので、そのままにする。
+      endLeaf: (cx, line) => line.indent - line.baseIndent < 4 && LONE_DASH.test(line.text.slice(line.pos)),
+    },
+  ],
+}
+
+export const noteMarkdownExtensions = [GFM, Frontmatter, MathBlock, InlineMath, WikiLink, Highlight, ObsidianComment, Tag, EmptyBulletNotUnderline]
 
 export function noteMarkdown(codeLanguages) {
   return markdown({
