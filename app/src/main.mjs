@@ -40,6 +40,8 @@ import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
 import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
 import { createConnectionWatch, createVersionWatch } from './connection.mjs'
+import { linesFrom, selectedLines } from './lines.mjs'
+import { applyMention, headingTarget, mentionCandidates, mentionQuery, sectionsOf, unwritableCount } from './mention.mjs'
 import { beginTableCell, showMenu } from './widgets.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
@@ -62,7 +64,7 @@ function setRightOpen(open) {
 // 右の枠が操作中か（右の枠で使う）。左から ACTIVE で知らされる。
 let paneActive = false
 // 左の枠で使う。右の枠から OPENED と STATE で知らされた、右の枠のノートの様子。
-let rightState = { path: null, selection: '', dirty: false, headings: null }
+let rightState = { path: null, selection: '', dirty: false, headings: null, lines: null }
 // 右の枠の準備ができたら開いてもらうノート。分けた直後や、分けてすぐ右で開くときに使う。
 let rightWant = null
 // 右の枠が最後に知らせてきた、開いているノート。同じノートの OPENED は見出しの更新として扱う。
@@ -991,6 +993,220 @@ function readerView(parent, text) {
   return reader
 }
 
+// 窓のチャット欄の @ の候補。打っている語に合わせて一覧を出し、選んだら @場所#L12-18 か @場所 を入れる。
+// 選んでいる行と見出しの節の行は、Mod が送るときに保存したファイルから読んで文に添える。
+const MENTION_FRESH_MS = 5000
+function editorForMention() {
+  if (rightActive()) return { path: rightState.path, lines: rightState.lines, dirty: rightState.dirty }
+  if (!currentPath || !view) return { path: null, lines: null, dirty: false }
+  return { path: currentPath, lines: selectedLines(view.state), dirty: !CLEAN_STATES.has($('status').dataset.state) }
+}
+function noteIsDirty(path) {
+  if (!path) return false
+  if (path === rightState.path && rightState.dirty) return true
+  return path === currentPath && Boolean(view) && !CLEAN_STATES.has($('status').dataset.state)
+}
+function setupMentions(input) {
+  const list = $('chat-mentions')
+  const saved = new Map() // 場所 → { at, sections }。見出しの行は保存した中身から数える。
+  let items = []
+  let hidden = 0
+  let active = 0
+  let at = null
+  let seq = 0
+  let closed = 0 // 閉じた回数。閉じる前に出した読み込みの中身は覚えない
+  const hide = () => {
+    list.hidden = true
+    list.replaceChildren()
+    items = []
+    at = null
+    input.removeAttribute('aria-activedescendant')
+    input.setAttribute('aria-expanded', 'false')
+  }
+  const close = () => {
+    // 待っている読み込みの結果で、閉じた一覧を出し直さない。保存した中身も次に開くときに読み直す。
+    seq += 1
+    closed += 1
+    saved.clear()
+    hide()
+  }
+  const sectionsFor = async (path) => {
+    const mine = closed
+    const got = saved.get(path)
+    if (got && Date.now() - got.at < MENTION_FRESH_MS) return got.sections
+    try {
+      const data = await api.read(path)
+      const sections = sectionsOf(data?.text ?? '')
+      // 閉じたあとに届いた中身は覚えない（閉じるときに消したものを書き戻さない）。
+      if (mine === closed) saved.set(path, { at: Date.now(), sections })
+      return sections
+    } catch {
+      return null
+    }
+  }
+  const choose = (index) => {
+    const item = items[index]
+    // 打ち進めたあとでも合うよう、語の場所はその場で取り直す。
+    const here = mentionQuery(input.value, input.selectionStart ?? 0) ?? at
+    if (!item || !here) return
+    const next = applyMention(input.value, here, item.insert)
+    input.focus()
+    // 取り消し（Cmd+Z）で戻せるよう、打ったのと同じ形で入れる。使えなければ値を直接替える。
+    input.setSelectionRange(here.from, here.to)
+    const added = next.value.slice(here.from, next.value.length - (input.value.length - here.to))
+    // insertText が使えないときは input が起きないので、高さを合わせるために自分で知らせる。
+    if (!document.execCommand?.('insertText', false, added)) {
+      input.value = next.value
+      input.dispatchEvent(new Event('input'))
+    }
+    input.setSelectionRange(next.caret, next.caret)
+    close()
+  }
+  const mark = () => {
+    list.querySelectorAll('[role="option"]').forEach((row, index) => {
+      const on = index === active
+      row.setAttribute('aria-selected', String(on))
+      if (on) {
+        input.setAttribute('aria-activedescendant', row.id)
+        row.scrollIntoView({ block: 'nearest' })
+      }
+    })
+  }
+  // 一覧の高さは、入力欄の上（枠が上にあるときは下）に画面の中で残っている分まで。
+  const fit = () => {
+    const box = input.getBoundingClientRect()
+    const below = $('chat-panel').dataset.dock?.startsWith('top')
+    list.dataset.side = below ? 'below' : 'above'
+    const room = below ? innerHeight - box.bottom - 16 : box.top - 16
+    list.style.maxHeight = `${Math.max(80, Math.min(280, room))}px`
+  }
+  const render = () => {
+    if (!items.length && !hidden) {
+      // 見出しを待っているあいだは、読み込みを止めずに隠すだけにする。
+      hide()
+      return
+    }
+    // 場所に空白や # @ : \ があるノートは、@ のあとに1語で書けない（# は行の指定と紛れる）ので出さず、理由だけ添える。
+    const note = document.createElement('p')
+    note.className = 'chat-mention-hidden'
+    note.textContent = `場所に空白や # @ : \\ があるノート（${hidden}件）は、@ のあとに1語で書けないので出していません`
+    list.replaceChildren(
+      ...items.map((item, index) => {
+        const row = document.createElement('div')
+        row.id = `chat-mention-${index}`
+        row.setAttribute('role', 'option')
+        row.className = `chat-mention chat-mention-${item.kind}`
+        const label = document.createElement('span')
+        label.className = 'chat-mention-label'
+        label.textContent = item.label
+        row.append(label)
+        if (item.detail) {
+          const detail = document.createElement('span')
+          detail.className = item.warn ? 'chat-mention-detail chat-mention-warn' : 'chat-mention-detail'
+          detail.textContent = item.detail
+          row.append(detail)
+        }
+        // 押したときに入力欄から目が離れないよう、mousedown で選ぶ。
+        row.addEventListener('mousedown', (event) => {
+          event.preventDefault()
+          choose(index)
+        })
+        row.addEventListener('mousemove', () => {
+          if (active === index) return
+          active = index
+          mark()
+        })
+        return row
+      }),
+      ...(hidden ? [note] : []),
+    )
+    list.hidden = false
+    input.setAttribute('aria-expanded', 'true')
+    fit()
+    mark()
+  }
+  const refresh = async () => {
+    const mine = ++seq
+    const found = mentionQuery(input.value, input.selectionStart ?? 0)
+    if (!found || input.selectionStart !== input.selectionEnd) {
+      close()
+      return
+    }
+    const editor = editorForMention()
+    const target = headingTarget({ query: found.query, editor, notes })
+    const show = (sections) => {
+      const before = items[active]?.insert
+      at = found
+      items = mentionCandidates({
+        query: found.query,
+        editor,
+        notes,
+        headings: target && sections ? { path: target, sections, dirty: noteIsDirty(target) } : null,
+      })
+      hidden = unwritableCount(found.query, notes)
+      const keep = items.findIndex((item) => item.insert === before)
+      active = keep >= 0 ? keep : 0
+      render()
+    }
+    // 先にノートの候補を出し、見出しは読めたら足す。
+    const cached = target ? saved.get(target) : null
+    show(cached && Date.now() - cached.at < MENTION_FRESH_MS ? cached.sections : null)
+    if (!target || (cached && Date.now() - cached.at < MENTION_FRESH_MS)) return
+    const sections = await sectionsFor(target)
+    // 待っているあいだに打ち進めたり閉じたりしていたら、古い結果は捨てる。
+    if (mine !== seq) return
+    const again = mentionQuery(input.value, input.selectionStart ?? 0)
+    if (!again || again.from !== found.from || again.query !== found.query) return
+    show(sections)
+  }
+  // 一覧のスクロールバーを押しても、入力欄から目が離れて閉じないようにする。
+  list.addEventListener('mousedown', (event) => event.preventDefault())
+  input.setAttribute('aria-controls', 'chat-mentions')
+  input.setAttribute('aria-autocomplete', 'list')
+  input.setAttribute('aria-expanded', 'false')
+  // IME の変換中は何もしない。確定したら（compositionend のあとの input で）読み直す。
+  input.addEventListener('input', (event) => {
+    if (event.isComposing) return
+    refresh()
+  })
+  input.addEventListener('compositionend', () => refresh())
+  input.addEventListener('click', () => refresh())
+  input.addEventListener('blur', () => close())
+  // チャット欄のほかの keydown（Cmd+Enter で送る）より先に呼ばれるよう、先に付ける。
+  input.addEventListener('keydown', (event) => {
+    if (event.isComposing || event.keyCode === 229) return
+    if (list.hidden) {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'Home' || event.key === 'End') setTimeout(refresh)
+      return
+    }
+    const take = () => {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+    }
+    if (!items.length && event.key !== 'Escape') return
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      take()
+      active = (active + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length
+      mark()
+    } else if ((event.key === 'Enter' && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) || (event.key === 'Tab' && !event.shiftKey)) {
+      take()
+      choose(active)
+    } else if (event.key === 'Escape') {
+      take()
+      close()
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'Home' || event.key === 'End') {
+      setTimeout(refresh)
+    } else if (event.key === 'Enter') {
+      close()
+    }
+  })
+  return { close }
+}
+
+// 会話を広げる・たたむボタンのアイコン。会話の記録が開く向きを指す山形にする（枠が下にあれば上へ、上にあれば下へ開く）。
+const CHEVRON_UP = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 10 8 5.5 12.5 10"/></svg>'
+const CHEVRON_DOWN = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6 8 10.5 12.5 6"/></svg>'
+
 // チャット枠はいつも出す。前は ?chat=1 のときだけ出していたが、開き方によっては付かず、枠が消えていた（2026-11-08）。
 function setupChatBox() {
   const panel = $('chat-panel')
@@ -1002,6 +1218,27 @@ function setupChatBox() {
   const log = $('chat-log')
   const expand = $('chat-expand')
   const files = $('chat-files')
+  // 入力欄の高さを打った量に合わせる。上限（CSS の max-height）を超えたら、欄の中でスクロールする。
+  // @ の候補より先に付け、候補の一覧の位置を測るときには、もう新しい高さになっているようにする。
+  // 日本語の変換中も、変換中の文字の分だけ伸ばす（変換の窓が欄の外へずれないように、高さは変換中も合わせる）。
+  const sizeInput = () => {
+    input.style.height = 'auto'
+    const max = parseFloat(getComputedStyle(input).maxHeight) || Infinity
+    const want = input.scrollHeight + (input.offsetHeight - input.clientHeight)
+    input.style.height = `${Math.min(want, max)}px`
+    input.style.overflowY = want > max ? 'auto' : 'hidden'
+  }
+  input.addEventListener('input', sizeInput)
+  // 窓の高さが変わると上限（40vh）も変わるので、合わせ直す。
+  window.addEventListener('resize', sizeInput)
+  // 枠の幅が変わると折り返しが変わるので、幅が変わったときも合わせる（高さの変化では呼ばない）。
+  let inputWidth = 0
+  new ResizeObserver(() => {
+    if (input.clientWidth === inputWidth) return
+    inputWidth = input.clientWidth
+    sizeInput()
+  }).observe(input)
+  const mentions = setupMentions(input)
   let waiting = 0
   let timer = 0
   let lastFor = 0
@@ -1056,12 +1293,22 @@ function setupChatBox() {
     panel.dataset.dock = dock
     opener.dataset.dock = dock
     storage.set('chat-dock', dock)
+    drawExpand()
     document.body.classList.toggle('chat-on', !panel.hidden && dock.startsWith('bottom'))
+  }
+  // 読み上げのラベルは「会話」で固定し、開いているかは aria-expanded で伝える（ラベルも切り替えると二重に読まれる）。
+  // マウスを乗せたときの説明（title）は、押すと何が起きるかを書く。
+  const drawExpand = () => {
+    const open = !log.hidden
+    const top = panel.dataset.dock?.startsWith('top')
+    expand.innerHTML = open === Boolean(top) ? CHEVRON_UP : CHEVRON_DOWN
+    expand.title = open ? '会話をたたむ' : '会話を広げる'
   }
   const setExpanded = (open) => {
     log.hidden = !open
     expand.setAttribute('aria-expanded', String(open))
-    expand.textContent = open ? '会話をたたむ' : '会話を広げる'
+    // 文字のボタンは幅が狭いと2行に折り返すので、山形のアイコンにする（drawExpand）。
+    drawExpand()
     storage.set('chat-expanded', open)
     if (open) {
       markSeen()
@@ -1297,7 +1544,7 @@ function setupChatBox() {
   }
   $('chat-cancel').addEventListener('click', () => {
     stopWaiting()
-    say('待つのをやめました。返事は、会話を広げるかチャットのほうで見られます。')
+    say('待つのをやめました。返事は、会話を広げるか、チャットのほうで見られます。')
   })
   const poll = async () => {
     if (!waiting) return
@@ -1433,6 +1680,8 @@ function setupChatBox() {
     // このブラウザから送ったことを覚えておく。ほかのブラウザで送った文の返事は、読み込み直しても知らせない。
     tabFlags.set('chat-last-sent', at)
     input.value = ''
+    sizeInput()
+    mentions.close()
     images = []
     showImages()
     startWaiting(at)
@@ -1468,6 +1717,7 @@ function sendState(extra = {}) {
       type: MSG.STATE,
       path: open ? currentPath : null,
       selection: open ? view.state.sliceDoc(selection.from, selection.to).slice(0, 4000) : '',
+      lines: open ? selectedLines(view.state) : null,
       dirty: open && !CLEAN_STATES.has($('status').dataset.state),
       ...(extra.askChat ? { askChat: extra.askChat } : {}),
     })
@@ -1487,7 +1737,7 @@ function sendState(extra = {}) {
   const text = view.state.sliceDoc(selection.from, selection.to).slice(0, 4000)
   return request('/api/state', {
     method: 'PUT',
-    body: JSON.stringify({ path: currentPath, selection: text, dirty: !CLEAN_STATES.has($('status').dataset.state), ...extra }),
+    body: JSON.stringify({ path: currentPath, selection: text, lines: selectedLines(view.state), dirty: !CLEAN_STATES.has($('status').dataset.state), ...extra }),
   }).catch(() => null)
 }
 
@@ -1496,7 +1746,7 @@ function putRightState(extra = {}) {
   if ($('status').dataset.state === 'elsewhere') return Promise.resolve(null)
   return request('/api/state', {
     method: 'PUT',
-    body: JSON.stringify({ path: rightState.path, selection: rightState.selection, dirty: rightState.dirty, ...extra }),
+    body: JSON.stringify({ path: rightState.path, selection: rightState.selection, lines: rightState.lines, dirty: rightState.dirty, ...extra }),
   }).catch(() => null)
 }
 
@@ -2815,7 +3065,7 @@ async function closeSplit() {
   setRightOpen(false)
   rightWant = null
   rightShown = null
-  rightState = { path: null, selection: '', dirty: false, headings: null }
+  rightState = { path: null, selection: '', dirty: false, headings: null, lines: null }
   syncSplitButton()
 }
 
@@ -2880,6 +3130,7 @@ function receiveFromRight(data) {
     rightState.path = typeof data.path === 'string' ? data.path : null
     rightState.selection = typeof data.selection === 'string' ? data.selection : ''
     rightState.dirty = Boolean(data.dirty)
+    rightState.lines = linesFrom(data.lines)
     if (data.askChat) {
       // 右の枠で選んだ文字を、左の「チャットへ」と同じくチャットの入力欄へ送る。
       putRightState({ askChat: data.askChat })

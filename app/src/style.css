@@ -1159,6 +1159,7 @@ body[data-locked] #chat-open {
 #chat-title { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #chat-state { color: var(--muted); }
 #chat-head .spacer { flex: 1; }
+#chat-expand { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 30px; height: 26px; padding: 0; }
 #chat-grip { color: var(--muted); letter-spacing: -2px; }
 
 #chat-log {
@@ -1309,11 +1310,44 @@ body[data-locked] #chat-open {
 }
 
 #chat-box {
+  position: relative;
   display: flex;
   gap: 8px;
   align-items: flex-end;
   padding: 8px 10px 10px;
 }
+
+/* @ の候補。入力欄の上（枠が上にあるときは下）に、チャット枠と同じ幅で出す。長い場所は折り返し、切らない。 */
+#chat-mentions {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  z-index: 5;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+  padding: 4px;
+}
+#chat-mentions[hidden] { display: none; }
+#chat-mentions[data-side='above'] { bottom: calc(100% - 4px); }
+#chat-mentions[data-side='below'] { top: calc(100% - 6px); }
+.chat-mention {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.chat-mention[aria-selected='true'] { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.chat-mention-label { color: var(--text); }
+.chat-mention-selection .chat-mention-label { font-weight: 600; }
+.chat-mention-detail { color: var(--muted); font-size: 11.5px; }
+.chat-mention-warn { color: var(--warning); }
+.chat-mention-hidden { margin: 4px 8px 2px; color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
 
 #chat-add { font-size: 15px; padding: 3px 9px; }
 
@@ -1326,7 +1360,11 @@ body[data-locked] #chat-open {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 6px 8px;
-  max-height: 30vh;
+  box-sizing: border-box;
+  line-height: 1.5;
+  /* 打った量に合わせて伸びる（main.mjs の sizeInput）。ここまで伸びたら欄の中でスクロールする。 */
+  max-height: min(40vh, 300px);
+  overflow-y: hidden;
 }
 
 /* 入力欄もブラウザの青い線ではなく、枠と同じオレンジにそろえる（2026-11-08）。 */
