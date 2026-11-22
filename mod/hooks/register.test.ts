@@ -13,6 +13,8 @@ const VDIR = `${STATE}/vaults/${VID}`
 const BIN = `${STATE}/bin/0.1.0-dev/notedock-server`
 const TOKEN = 'TOKEN-secret-0000000000000000000000000000000'
 const MIN = 60_000
+const LINK2 = 'L2'.padEnd(43, 'x') // 1回目に開いたときの結び付けの合図（randomLink の1つ目は結び付けのフォルダーに使う）
+const LINK3 = 'L3'.padEnd(43, 'x')
 const MINE = '0.2.0'
 const OLD = '0.1.0'
 const NEWER = '0.3.0'
@@ -60,6 +62,8 @@ function world(o: Opt = {}) {
     root: o.root ?? ROOT, // $.session.root() が返すフォルダー（あとから変えられる）
     rootThrows: false,
     rootDelayMs: 0,
+    links: 0,
+    chatLink: null as string | null,
   }
   const writeServer = () =>
     files.set(`${VDIR}/server.json`, JSON.stringify({ port: srv.port, pid: srv.pid, root: ROOT, token: TOKEN, ticket: srv.ticket }))
@@ -227,7 +231,13 @@ function world(o: Opt = {}) {
     readServerInfo: (host, id) => readServerInfo($, host, id),
     setBand: async b => { bands.push(b) },
     ...(o.realTools ? {} : { registerTools: async () => { log.push('registerTools') } }),
-    claimChat: async dir => { log.push(`claimChat ${dir}`) },
+    // チャットの番号は決まった値にする（1つ目は LINK1）。$.state の代わりに w.chatLink に覚える。
+    randomLink: () => `L${++w.links}`.padEnd(43, 'x'),
+    hashLink: async raw => `hash-${raw.slice(0, 2)}`,
+    loadLink: async () => w.chatLink,
+    saveLink: async raw => {
+      w.chatLink = raw
+    },
     ...(o.refreshFails ? { saveRefresh: async () => { throw new Error('書けません') } } : {}),
   })
   const nd = createNotedock({ version: mine })
@@ -457,6 +467,29 @@ test('毎回鍵付きで頼む（2回目も）', async () => {
   expect(x.prompts[1].text).toContain('preview_start に http://localhost:8801 を渡して')
 })
 
+test('「ノートを開く」で頼むリンクに、一度だけの結び付けの合図（s=）を付ける。ターミナルだけのチャットでは付けない', async () => {
+  const x = world()
+  await x.start()
+  await pressAndSend(x)
+  expect(x.prompts[0].text).toContain(`#c=KEY1&s=${LINK2}`)
+  expect(x.w.chatLink).toBe('hash-L1') // 結び付けのフォルダーの名前を $.state に覚える（Modを読み込み直しても残す）
+  x.prompts[0].resolve({ text: x.prompts[0].text })
+  await x.nd.turnStart({ text: x.prompts[0].text, turnId: 't1' })
+  await x.nd.turnComplete({ turnId: 't1' })
+  await x.advance(0)
+  await pressAndSend(x)
+  expect(x.prompts[1].text).toContain(`&s=${LINK3}`) // 開くたびに新しい合図
+  expect(x.w.chatLink).toBe('hash-L1')
+  expect(x.w.links).toBe(3)
+
+  const y = world({ surfaces: ['terminal'] })
+  await y.start()
+  await pressAndSend(y)
+  expect(y.prompts[0].text).toContain('#c=KEY1')
+  expect(y.prompts[0].text).not.toContain('s=')
+  expect(y.w.links).toBe(0)
+})
+
 test('頼む前に open-pending.json を書き、取りかかったら期限を2分後に書き直す', async () => {
   const x = world()
   await x.start()
@@ -484,7 +517,7 @@ test('番が始まってから need-ticket が新しくなれば、鍵付きで1
   x.files.set(`${VDIR}/need-ticket.json`, JSON.stringify({ at: x.now() }))
   await x.advance(1500)
   expect(x.prompts.length).toBe(2)
-  expect(x.prompts[1].text).toBe('NoteDockが開けなかったので、navigate で http://localhost:8801/#c=KEY9 へ移ってください。ほかの作業はしないでください。')
+  expect(x.prompts[1].text).toBe(`NoteDockが開けなかったので、navigate で http://localhost:8801/#c=KEY9&s=${LINK3} へ移ってください。ほかの作業はしないでください。`)
   expect(x.json(`${VDIR}/open-pending.json`)).toEqual({ until: 0 })
   // 同じ窓の中で何度 need-ticket が来ても、もう頼まない。帯も案内に変えない。
   for (let i = 0; i < 3; i++) {
@@ -645,12 +678,14 @@ test('/note の場所は、Windowsの区切りでも Vault の中の場所に直
   expect(notePathFrom('', '/V/notes', 'darwin')).toBe('')
 
   const x = world({ opened: true, installed: true, running: true })
+  x.dirs.add(VDIR) // サーバーが一度動いて、Vault別フォルダーがある
   await x.start()
   await x.advance(6000)
   const r = await x.nd.note('/V/notes/daily/a b.md')
-  expect(r.text).toContain(`http://localhost:8801/?note=${encodeURIComponent('daily/a b.md')}#c=KEY1`)
+  expect(r.text).toContain(`http://localhost:8801/?note=${encodeURIComponent('daily/a b.md')}#c=KEY1&s=${LINK2}`)
   expect(r.text).toContain('Chrome')
-  expect(x.log).toContain(`claimChat ${vaultDirOf({ os: 'darwin', home: HOME, stateDir: STATE, target: 'aarch64-apple-darwin', systemRoot: null }, VID)}`)
+  expect(r.text).toContain('このチャットに届きます')
+  expect(x.log).toContain(`write ${vaultDirOf({ os: 'darwin', home: HOME, stateDir: STATE, target: 'aarch64-apple-darwin', systemRoot: null }, VID)}/chats/hash-L1/link.json`)
 })
 
 test('/note はサーバーが止まっていればボタンを案内し、画面のないチャットでは話し相手にならない', async () => {
@@ -660,7 +695,7 @@ test('/note はサーバーが止まっていればボタンを案内し、画�
   const r = await x.nd.note('Home.md')
   expect(r.text).toContain('入力欄の上の『ノートを開く』を押してください')
   expect(r.text).not.toContain('#c=')
-  expect(x.log.some(l => l.startsWith('claimChat'))).toBe(false)
+  expect(x.log.some(l => l.endsWith('/link.json'))).toBe(false)
   expect(x.log).not.toContain('startServer')
 })
 

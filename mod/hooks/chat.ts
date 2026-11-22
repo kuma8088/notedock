@@ -1,5 +1,5 @@
 // チャット欄の話し相手と、開いているノートを添える文。
-// ファイルはすべて、そのチャットのVault別フォルダーに置く（current-note.json・chat-owner.json・chat-reply.json・chat-log.json・share-note.json）。
+// ファイルはすべて、そのチャットの結び付けのフォルダー（Vault別フォルダーの chats/<番号のハッシュ>）に置く。
 // $ を受け取る関数は、register.ts の ioFor からだけ呼ぶ。判断は register.ts の createNotedock と、下の $ を使わない関数で行う。
 import { joinPath, rootKey, type Os } from './platform'
 
@@ -28,52 +28,44 @@ export function chatFile(os: Os, vaultDir: string, name: string): string {
 
 // エディターを開く鍵（URLの #c=…）を消す。会話の記録など、ファイルに残すものに鍵を書かないため。
 // 鍵は base64url（A-Z a-z 0-9 _ -）だけでできているので、#c= からその文字が続くところまでを消す（すぐあとに続く文は残す）。
+// チャットの番号（s=、43文字）も同じく消す（# のすぐあとでも、& のあとでも）。
 export function hideKeys(text: string): string {
-  return text.replace(/#c=[A-Za-z0-9_-]*/g, '')
+  return text.replace(/#c=[A-Za-z0-9_-]*/g, '').replace(/[#&]s=[A-Za-z0-9_-]{43}/g, '')
 }
 
-type Owner = { session?: string; at?: number }
-
-async function readOwner($: Host, vaultDir: string, os: Os): Promise<Owner | null> {
-  try {
-    return JSON.parse(await $.fs.read(chatFile(os, vaultDir, 'chat-owner.json'))) as Owner
-  } catch {
-    return null
-  }
+// このチャットの結び付けのフォルダー（Vault別フォルダーの chats/<番号のハッシュ>）。番号そのものはファイルにも場所にも書かない。
+// 中身: link.json（Modが書く。時刻と名前）、state.json と share.json（サーバーが書く）、reply.json と log.json（Modが書く）。
+export function linkDir(os: Os, vaultDir: string, hash: string): string {
+  return joinPath(os, vaultDir, 'chats', hash)
 }
 
-// このチャットを話し相手にする（印の時刻も書き直す）。
-// Vault別フォルダーは、サーバーが一度動いて本人だけの権限で作ってから使う。まだなければ何もしない。
-// os は brief の形に足したもの（ファイルの場所の区切りを決めるため）。
-// since は相手になったきっかけ（本人の発言か /note）の時刻。印の時刻を書き直すときは前の since を渡して残す。
-export async function claimChat($: Host, vaultDir: string, sessionId: string, os: Os, since?: number): Promise<void> {
+// 開いているノートを添えるのは、このチャットに結び付いたエディターの切り替えがオン（share.json が on: true）のときだけ。
+export async function shareIsOn($: Host, dir: string, os: Os): Promise<boolean> {
   try {
-    if (!sessionId || !(await $.fs.exists(vaultDir))) return
-    const at = await $.clock.now()
-    await $.fs.write(chatFile(os, vaultDir, 'chat-owner.json'), JSON.stringify({ session: sessionId, at, since: since || at }))
-  } catch {
-    // 書けなければ、前の相手のまま。
-  }
-}
-
-// このチャットが話し相手なら外す。ほかのチャットが相手なら触らない。
-export async function releaseChat($: Host, vaultDir: string, sessionId: string, os: Os): Promise<void> {
-  const owner = await readOwner($, vaultDir, os)
-  if (!sessionId || owner?.session !== sessionId) return
-  try {
-    await $.fs.write(chatFile(os, vaultDir, 'chat-owner.json'), JSON.stringify({ session: '', at: 0 }))
-  } catch {
-    // 書けなければ、40秒たてばエディターは「相手なし」と出す。
-  }
-}
-
-// 開いているノートを添えるのは、エディターの切り替えがオン（share-note.json が on: true）のときだけ。
-export async function shareIsOn($: Host, vaultDir: string, os: Os): Promise<boolean> {
-  try {
-    return JSON.parse(await $.fs.read(chatFile(os, vaultDir, 'share-note.json')))?.on === true
+    return JSON.parse(await $.fs.read(chatFile(os, dir, 'share.json')))?.on === true
   } catch {
     return false
   }
+}
+
+// 推測できない番号（32バイトの乱数を base64url にした43文字）と、そのハッシュ（SHA-256の16進）。
+export function newLinkText(bytes: Uint8Array): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+export function hexOf(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+// 会話の名前の代わり（Modからは会話のタイトルを読めないため）。最初の本人の発言の初めの部分を使う。
+// Modが送った「開いてください」の頼みは除く。
+export function titleFrom(items: readonly { kind: string; text: string }[], project: string): string {
+  const first = items.find(i => i.kind === 'user' && !/NoteDockを開いてください。ブラウザパネルで|NoteDockが開けなかったので、navigate で/.test(i.text))
+  const head = first ? first.text.replace(/\s+/g, ' ').trim() : ''
+  const short = head.length > 24 ? `${head.slice(0, 24)}…` : head
+  return short ? `${project} ·「${short}」` : project
 }
 
 type NoteInfo = { where: string; dirty: boolean; selection: string }
