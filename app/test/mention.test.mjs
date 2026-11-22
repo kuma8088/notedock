@@ -64,7 +64,8 @@ test('並びは 選んでいる行・開いているノート・ほかのノー�
     ['note', '@daily/plan-2.md'],
     ['heading', '@Home.md#L1-5'],
   ])
-  assert.equal(list[0].label, '選んでいる行：Home.md の12〜18行')
+  assert.equal(list[0].label, '選んでいる行：Home.md の12〜18行目')
+  assert.match(list[0].detail, /ファイルの行番号/)
 })
 
 test('打った文字で絞る。名前の頭が合うものが先', () => {
@@ -119,4 +120,16 @@ test('空白か # があって出さなかったノートを数える', () => {
 test('選んだら、打っていた語を入れ替えて、後ろに空白を置く', () => {
   assert.deepEqual(applyMention('見て @pl', { from: 3, to: 6 }, '@memo/plan.md'), { value: '見て @memo/plan.md ', caret: 17 })
   assert.deepEqual(applyMention('@pl です', { from: 0, to: 3 }, '@a.md'), { value: '@a.md です', caret: 6 })
+})
+
+test('先頭の YAML は、閉じの行の後ろに空白があっても見分ける。閉じがなければ見出しとして読む', () => {
+  const spaced = sectionsOf(['--- ', '# 中の行', '---  ', '# 本当の見出し', 'a'].join('\n'))
+  assert.deepEqual(spaced.map((s) => [s.text, s.line, s.to]), [['本当の見出し', 4, 5]])
+  const open = sectionsOf(['---', '# 見出し', 'a'].join('\n'))
+  assert.deepEqual(open.map((s) => s.text), ['見出し'])
+})
+
+test('見出しの候補にも、ファイルの行番号だと添える', () => {
+  const list = mentionCandidates({ query: 'm#', editor: { path: null }, notes: ['m.md'], headings: { path: 'm.md', sections: [{ level: 1, text: '上', line: 3, to: 5 }], dirty: false } })
+  assert.equal(list.at(-1).detail, 'm.md の3〜5行目（ファイルの行番号）')
 })

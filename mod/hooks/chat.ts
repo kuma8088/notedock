@@ -101,22 +101,23 @@ export function lineMention(state: EditorState, now: number, root: string, os: O
   if (token === text) return null
   const fits = token === '@' || text.startsWith(token) || MENTION_WORD.startsWith(token) || token.startsWith(MENTION_WORD)
   if (!fits) return null
-  const range = from === to ? `${from}行` : `${from}〜${to}行`
+  const range = from === to ? `${from}行目` : `${from}〜${to}行目`
   return {
     text,
     label: `選んでいる行：${state.path} の${range}`,
     // エンジンが読むのは保存したファイル。保存前の変更があると、行がずれることがある。
-    description: info.dirty ? 'NoteDock（保存前の変更があるので、行がずれることがある）' : 'NoteDock',
+    description: info.dirty ? 'NoteDock · ファイルの行番号（保存前の変更があるので、ずれることがあります）' : 'NoteDock · ファイルの行番号',
   }
 }
 
 // 本人が打った発言に、prompt.submit のフックで context として添える文。
-export function describeNote(state: EditorState, now: number, root: string, os: Os): string | null {
+// typed は本人が打った文。選んでいる行を @場所#L で指していれば、選んでいる文字は添えない（同じ行が2回届かないように）。
+export function describeNote(state: EditorState, now: number, root: string, os: Os, typed = ''): string | null {
   const info = noteInfo(state, now, root, os)
   if (!info) return null
   const lines = [`エディターで開いているノート: ${info.where}`]
   if (info.dirty) lines.push('このノートにはまだ保存していない変更があります。')
-  if (info.selection) lines.push(`選んでいる文字:\n${info.selection}`)
+  if (info.selection && !pointsAtSelection(typed, info.where, state.lines)) lines.push(`選んでいる文字:\n${info.selection}`)
   return lines.join('\n')
 }
 
@@ -124,11 +125,32 @@ export function describeNote(state: EditorState, now: number, root: string, os: 
 // Modが $.prompt.submit で送る文には、Mod自身の prompt.submit フックが呼ばれず、context も渡せないため、文そのものに足す。
 export const SEND_NOTE_HEAD = '（エディターで開いているノート: '
 
-export function noteForSend(state: EditorState, now: number, root: string, os: Os): string | null {
+// withSelection が false のとき（@ で指した行に、選んでいる行がもう入っているとき）は、場所だけを添える。
+// 場所と「保存していない変更があります」は残す（@ の行は保存したファイルから読むので、変更があることは伝える）。
+export function noteForSend(state: EditorState, now: number, root: string, os: Os, withSelection = true): string | null {
   const info = noteInfo(state, now, root, os)
   if (!info) return null
   const head = `${SEND_NOTE_HEAD}${info.where}${info.dirty ? '。まだ保存していない変更があります' : ''}）`
-  return info.selection ? `${head}\n選んでいる文字:\n${quoteForPrompt(info.selection).trimEnd()}` : head
+  return info.selection && withSelection ? `${head}\n選んでいる文字:\n${quoteForPrompt(info.selection).trimEnd()}` : head
+}
+
+// 選んでいる行と、@ で指した行が重なるか。選んでいる行が分からない（古いエディター）ときは、同じノートなら重なるとみなす。
+function overlaps(lines: EditorState['lines'], from: number, to: number): boolean {
+  if (!lines || !Number.isInteger(lines.from) || !Number.isInteger(lines.to)) return true
+  return from <= lines.to && to >= lines.from
+}
+
+// ターミナル版の入力欄で打った文に、開いているノートの選んでいる行を指す @場所#L があるか。
+// その @ はエンジンが読んで渡すので、選んでいる文字は添えない。where は候補が入れる場所と同じ形（noteInfo の where）。
+export function pointsAtSelection(typed: string, where: string, lines: EditorState['lines']): boolean {
+  if (!typed) return false
+  const re = /(?<![0-9A-Za-z._%+-])@([^\s@#]+)#L(\d+)(?:-(\d+))?(?![0-9A-Za-z_-])/g
+  for (const m of typed.matchAll(re)) {
+    const from = Number(m[2])
+    const to = m[3] === undefined ? from : Number(m[3])
+    if (m[1] === where && overlaps(lines, from, to)) return true
+  }
+  return false
 }
 
 // 送る文（打った文の上限を守ったもの）に案内を足す。案内が無ければそのまま。
@@ -141,7 +163,7 @@ export function withNote(text: string, note: string | null): string {
 export const MENTION_HEAD = '（@ で指した行。保存したファイルから読んだもの）'
 const MAX_MENTIONS = 5 // 1つの文で読む @ の数
 const MAX_MENTION_LINES = 400 // 1つの @ で読む行の数
-const MAX_MENTION_TEXT = 20000 // 添える行の文字の合計
+const MAX_MENTION_TEXT = 20000 // 添える塊の文字の合計（見出しと囲みも入れる）
 
 export type LineRef = { path: string; from: number; to: number }
 
@@ -173,60 +195,100 @@ export function safeVaultPath(path: string): boolean {
 }
 
 // 読んだ中身（読めなければ null）から、文に添える塊を作る。行には番号を付ける。
-export function mentionBlock(read: { ref: LineRef; where: string; text: string | null }[]): string | null {
-  if (!read.length) return null
+// MAX_MENTION_TEXT は、塊の見出し・名前・囲みも含めた文字の合計の上限（送る文全体の長さを抑えるため）。
+// attached は、行を実際に添えた指定（読めなかった・ファイルが短い・長すぎて添えなかったものは入れない）。
+type MentionRead = { ref: LineRef; where: string; text: string | null }
+export type Mentions = { text: string | null; attached: LineRef[] }
+
+function blockOf(read: MentionRead[]): Mentions {
+  if (!read.length) return { text: null, attached: [] }
   const parts: string[] = []
-  let used = 0
+  const attached: LineRef[] = []
+  let used = MENTION_HEAD.length + 1
+  const add = (part: string) => {
+    if (used + part.length + 2 > MAX_MENTION_TEXT) return false
+    used += part.length + 2
+    parts.push(part)
+    return true
+  }
+  const skip = (name: string) => add(`${name}: 長すぎるので添えませんでした`)
   for (const { ref, where, text } of read) {
     const name = `@${where}#L${ref.from === ref.to ? ref.from : `${ref.from}-${ref.to}`}`
     if (text === null) {
-      parts.push(`${name}: 読めませんでした`)
+      add(`${name}: 読めませんでした`)
       continue
     }
     const lines = text.replace(/\r\n?/g, '\n').split('\n')
     if (lines.length && lines[lines.length - 1] === '') lines.pop()
     if (ref.from > lines.length) {
-      parts.push(`${name}: このファイルは${lines.length}行までです`)
+      add(`${name}: このファイルは${lines.length}行までです`)
       continue
     }
     const last = Math.min(ref.to, lines.length, ref.from + MAX_MENTION_LINES - 1)
+    // 名前・切った理由・囲み（最大でこのくらい）の分を先に取っておく。
+    const room = MAX_MENTION_TEXT - used - name.length - 80
     const body: string[] = []
+    let size = 0
     for (let n = ref.from; n <= last; n += 1) {
       const line = `${n}\t${lines[n - 1]}`
-      if (used + line.length > MAX_MENTION_TEXT) break
-      used += line.length + 1
+      if (size + line.length + 1 > room) break
+      size += line.length + 1
       body.push(line)
     }
     if (!body.length) {
-      parts.push(`${name}: 長すぎるので添えませんでした`)
+      skip(name)
       continue
     }
     const shown = ref.from + body.length - 1
     const cut = shown < Math.min(ref.to, lines.length) ? `（${shown}行目まで。長いのでここで切りました）` : shown < ref.to ? `（このファイルは${lines.length}行までです）` : ''
     const longest = Math.max(2, ...body.map(line => (line.match(/`+/g) ?? []).reduce((a, b) => Math.max(a, b.length), 0)))
     const fence = '`'.repeat(longest + 1)
-    parts.push(`${name}${cut}\n${fence}\n${body.join('\n')}\n${fence}`)
+    if (add(`${name}${cut}\n${fence}\n${body.join('\n')}\n${fence}`)) attached.push({ path: ref.path, from: ref.from, to: shown })
+    else skip(name)
   }
-  return `${MENTION_HEAD}\n${parts.join('\n\n')}`
+  return { text: parts.length ? `${MENTION_HEAD}\n${parts.join('\n\n')}` : null, attached }
+}
+
+export function mentionBlock(read: MentionRead[]): string | null {
+  return blockOf(read).text
+}
+
+// 打った文の「@場所」（行の指定なし。ノート全体）。エンジンは Modが送る文の @ を読まないので、Claude は会話のフォルダーから探す。
+// エディターの Vault が会話のフォルダーと違うときだけ、Vault の中の本当の場所を添える（同じなら、そのままで見つかる）。
+export const PLACES_HEAD = '（@ で指したノートの場所）'
+
+export function noteRefsIn(text: string, dropTail = false): string[] {
+  const found: string[] = []
+  const re = /(?<![0-9A-Za-z._%+-])@([^\s@#]+?\.md)(?![0-9A-Za-z_\-#/])/gi
+  for (const m of text.matchAll(re)) {
+    if (dropTail && (m.index ?? 0) + m[0].length === text.length) continue
+    if (!safeVaultPath(m[1]) || found.includes(m[1])) continue
+    found.push(m[1])
+    if (found.length >= MAX_MENTIONS) break
+  }
+  return found
 }
 
 // 打った文の @ の行を読んで、添える塊を作る。read はファイルを読む関数（読めなければ throw）。
 // 読むのはエディターの Vault（state.root、無ければ会話のフォルダー）の中。塊に書く場所は、会話のフォルダーと同じなら Vault から見た場所。
 // real は、たどった先の場所を返す関数（読めなければ throw）。シンボリックリンクで Vault の外へ出る場所は読まない。
 // 打った文が上限（MAX_TEXT）で切られていたら、末尾で切れたかもしれない指定は読まない（別の行を読まないため）。
-export async function mentionsForSend(
+export async function readMentions(
   typed: string,
   state: EditorState,
   root: string,
   os: Os,
   read: (path: string) => Promise<string>,
   real: (path: string) => Promise<string>,
-): Promise<string | null> {
-  const refs = lineRefsIn(typed, typed.length >= MAX_TEXT)
-  if (!refs.length) return null
+): Promise<Mentions> {
+  const cutTail = typed.length >= MAX_TEXT
+  const refs = lineRefsIn(typed, cutTail)
   const vault = typeof state.root === 'string' && state.root ? state.root : root
   const other = rootKey(vault, os) !== rootKey(root, os)
   const win = (p: string) => (os === 'win32' ? p.replace(/\//g, '\\') : p)
+  const places = other ? noteRefsIn(typed, cutTail).map(path => `@${path}: ${joinPath(os, win(vault), win(path))}`) : []
+  const placeText = places.length ? `${PLACES_HEAD}\n${places.join('\n')}` : null
+  if (!refs.length) return { text: placeText, attached: [] }
   const read2 = await Promise.all(
     refs.map(async ref => {
       const file = joinPath(os, win(vault), win(ref.path))
@@ -248,7 +310,17 @@ export async function mentionsForSend(
       return { ref, where: other ? file : ref.path, text }
     }),
   )
-  return mentionBlock(read2)
+  const got = blockOf(read2)
+  return { text: [got.text, placeText].filter(Boolean).join('\n\n') || null, attached: got.attached }
+}
+
+export async function mentionsForSend(...args: Parameters<typeof readMentions>): Promise<string | null> {
+  return (await readMentions(...args)).text
+}
+
+// @ で指して実際に添えた行に、開いているノートの選んでいる行が入っているか（入っていれば、選んでいる文字は添えない）。
+export function coversSelection(attached: LineRef[], state: EditorState): boolean {
+  return attached.some(ref => ref.path === state.path && overlaps(state.lines, ref.from, ref.to))
 }
 
 // 番の文が、エディターから送った文かどうか。sent は送った文そのもの（案内付き）か、
@@ -259,7 +331,7 @@ export function isSentText(turnText: string, sent: string): boolean {
   if (a === b) return true
   if (b === '' || !a.startsWith(b)) return false
   const rest = a.slice(b.length).trimStart()
-  return rest.startsWith(SEND_NOTE_HEAD) || rest.startsWith(MENTION_HEAD)
+  return rest.startsWith(SEND_NOTE_HEAD) || rest.startsWith(MENTION_HEAD) || rest.startsWith(PLACES_HEAD)
 }
 
 export function quoteForPrompt(text: string): string {

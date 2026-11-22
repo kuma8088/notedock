@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { chatFile, describeNote, hideKeys, isSentText, lineMention, lineRefsIn, linkDir, MENTION_HEAD, mentionBlock, mentionsForSend, quoteForPrompt, safeVaultPath, titleFrom, TYPED_ORIGINS } from './chat'
+import { chatFile, describeNote, hideKeys, isSentText, lineMention, lineRefsIn, linkDir, MENTION_HEAD, mentionBlock, mentionsForSend, quoteForPrompt, safeVaultPath, titleFrom, TYPED_ORIGINS, pointsAtSelection, noteRefsIn, PLACES_HEAD } from './chat'
 import { createNotedock, ioFor, wire } from './register'
 import { VERSION } from './release'
 
@@ -769,8 +769,8 @@ test('@ を打つと、選んでいる行の候補を出す。選ぶと @場所#
   x.editor({ path: 'notes/Home.md', selection: '本文', lines: { from: 12, to: 18 }, updatedAt: x.now() - 100 })
   expect(await x.nd.autocomplete({ token: '@' })).toEqual({
     text: '@notes/Home.md#L12-18',
-    label: '選んでいる行：notes/Home.md の12〜18行',
-    description: 'NoteDock',
+    label: '選んでいる行：notes/Home.md の12〜18行目',
+    description: 'NoteDock · ファイルの行番号',
   })
   // 共有の切り替えがオフでも出す（本人が選んだときだけ渡るため）
   x.share(false)
@@ -781,8 +781,8 @@ test('@ を打つと、選んでいる行の候補を出す。選ぶと @場所#
 test('1行だけなら #L12、保存していない変更があれば添え書きに出す', () => {
   const row = lineMention({ path: 'Home.md', lines: { from: 3, to: 3 }, dirty: true, updatedAt: 900 }, 1000, '/V/notes', 'darwin', '@')
   expect(row?.text).toBe('@Home.md#L3')
-  expect(row?.label).toBe('選んでいる行：Home.md の3行')
-  expect(row?.description).toContain('行がずれる')
+  expect(row?.label).toBe('選んでいる行：Home.md の3行目')
+  expect(row?.description).toContain('ずれることがあります')
 })
 
 test('出さないとき：行を選んでいない・古い・別の語を打っている・もう選んだあと・場所に空白や # がある・@ 以外', async () => {
@@ -932,4 +932,70 @@ test('窓のチャット欄で @場所#L を打って送ると、保存したフ
   await x.nd.turnStart({ text: x.sends[0].text, turnId: 'm1' })
   await x.nd.turnComplete({ turnId: 'm1', answer: '直しました。', reason: 'done' })
   expect(x.json('reply.json').for).toBe(sentAt)
+})
+
+test('窓のチャット欄：選んでいる行を @ で指して添えたら、案内から選んでいる文字を省く。場所と保存の様子は残す', async () => {
+  const x = await opened()
+  x.share(true)
+  x.files.set(`${x.ROOT}/memo.md`, Array.from({ length: 20 }, (_, i) => `行${i + 1}`).join('\n'))
+  x.editor({ path: 'memo.md', root: x.ROOT, dirty: true, selection: '行12\n行13', lines: { from: 12, to: 13 }, updatedAt: x.now(), sendChat: { text: '@memo.md#L12-13 を直して', at: x.now() } })
+  await x.advance(1500)
+  const text = x.sends[0].text
+  expect((text.match(/行12/g) ?? []).length).toBe(1)
+  expect(text).toContain('（エディターで開いているノート: memo.md。まだ保存していない変更があります）')
+  expect(text).not.toContain('選んでいる文字')
+  expect(isSentText(text, '@memo.md#L12-13 を直して')).toBe(true)
+})
+
+test('窓のチャット欄：@ の行が読めない・別の行・別のノートなら、選んでいる文字は省かない。@ がなければ今までどおり', async () => {
+  const x = await opened()
+  x.share(true)
+  x.files.set(`${x.ROOT}/memo.md`, Array.from({ length: 20 }, (_, i) => `行${i + 1}`).join('\n'))
+  x.files.set(`${x.ROOT}/other.md`, 'a\nb\n')
+  const sel = { path: 'memo.md', root: x.ROOT, selection: '行12', lines: { from: 12, to: 12 } }
+  const texts = ['@nai.md#L12 を見て', '@memo.md#L1-2 を見て', '@other.md#L1 を見て', 'ここを直して']
+  for (let i = 0; i < texts.length; i += 1) {
+    x.editor({ ...sel, updatedAt: x.now(), sendChat: { text: texts[i], at: x.now() + 10 + i } })
+    await x.advance(1500)
+  }
+  const sent = x.sends.map(s => s.text)
+  for (const s of sent) expect(s).toContain('選んでいる文字:\n> 行12')
+  expect(sent.at(-1)).toBe('ここを直して\n\n（エディターで開いているノート: memo.md）\n選んでいる文字:\n> 行12')
+})
+
+test('ターミナル版：打った文の @場所#L が選んでいる行を指していれば、添える文から選んでいる文字を省く', async () => {
+  const x = await opened()
+  x.share(true)
+  x.editor({ path: 'Home.md', selection: '選択', lines: { from: 3, to: 4 }, updatedAt: x.now() - 100 })
+  const skipped = await x.say('@Home.md#L3-4 を直して')
+  expect(skipped).toContain('Home.md')
+  expect(skipped).not.toContain('選択')
+  expect(await x.say('@Home.md#L9 を直して')).toContain('選択')
+  expect(await x.say('@Other.md#L3 を直して')).toContain('選択')
+  expect(await x.say('こんにちは')).toContain('選択')
+  expect(pointsAtSelection('メールは a@Home.md#L3 です', 'Home.md', { from: 3, to: 3 })).toBe(false)
+})
+
+test('会話のフォルダーと Vault が違うときは、@場所（ノート全体）の本当の場所を添える。同じなら添えない', async () => {
+  const read = async () => 'a\n'
+  const real = async (p: string) => p
+  const other = await mentionsForSend('@x/a.md と @b.md を比べて', { root: '/V/test' }, '/V/notes', 'darwin', read, real)
+  expect(other).toBe(`${PLACES_HEAD}\n@x/a.md: /V/test/x/a.md\n@b.md: /V/test/b.md`)
+  expect(await mentionsForSend('@x/a.md と @b.md を比べて', { root: '/V/notes' }, '/V/notes', 'darwin', read, real)).toBe(null)
+  const both = await mentionsForSend('@x/a.md#L1 と @b.md', { root: '/V/test' }, '/V/notes', 'darwin', read, real)
+  expect(both!.startsWith(MENTION_HEAD)).toBe(true)
+  expect(both).toContain(`\n\n${PLACES_HEAD}\n@b.md: /V/test/b.md`)
+  expect(both).not.toContain('@x/a.md: ')
+  expect(noteRefsIn('@../a.md @.git/x.md @a.mdx @c.md。')).toEqual(['c.md'])
+  expect(isSentText(`見て @b.md\n\n${other}`, '見て @b.md')).toBe(true)
+})
+
+test('添える塊は、名前や囲みも含めて上限の中に収める', () => {
+  const long = 'y'.repeat(300)
+  const text = Array.from({ length: 400 }, () => long).join('\n')
+  const where = `/${'d'.repeat(3000)}/a.md`
+  const read = Array.from({ length: 5 }, (_, i) => ({ ref: { path: 'a.md', from: 1 + i, to: 400 }, where, text }))
+  const block = mentionBlock(read)!
+  expect(block.length).toBeLessThanOrEqual(20000)
+  expect(block).toContain('長いのでここで切りました')
 })

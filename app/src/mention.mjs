@@ -32,7 +32,7 @@ export function lineToken(path, from, to) {
 }
 
 function rangeText(from, to) {
-  return from === to ? `${from}行` : `${from}〜${to}行`
+  return from === to ? `${from}行目` : `${from}〜${to}行目`
 }
 
 // 保存した本文から見出しを拾う（# で始まる見出しだけ。コードの囲みと先頭の YAML は除く）。
@@ -43,8 +43,9 @@ export function sectionsOf(text) {
   const found = []
   let fence = null
   let i = 0
-  if (lines[0] === '---') {
-    const end = lines.indexOf('---', 1)
+  // 先頭の YAML は、エディターと同じ決まりで見分ける（1行目と閉じの行が、後ろの空白を除いて --- だけ）。
+  if (lines[0]?.trimEnd() === '---') {
+    const end = lines.findIndex((line, n) => n > 0 && line.trimEnd() === '---')
     if (end > 0) i = end + 1
   }
   for (; i < lines.length; i += 1) {
@@ -105,6 +106,8 @@ export function noteForName(notes, name) {
 export function mentionCandidates({ query, editor, notes, headings }) {
   const out = []
   const dirtyNote = '保存していない変更があるので、行がずれることがあります'
+  // 閲覧の表示では見出しや空の行の分だけ、目で数えた行と番号がずれて見えるので、ファイルの行番号だと添える。
+  const fileLines = 'ファイルの行番号です'
   const hash = query.indexOf('#')
   const namePart = hash < 0 ? query : query.slice(0, hash)
   const headPart = hash < 0 ? '' : query.slice(hash + 1)
@@ -119,7 +122,7 @@ export function mentionCandidates({ query, editor, notes, headings }) {
         out.push({
           kind: 'selection',
           label: `${SELECTION_WORD}：${current} の${rangeText(lines.from, lines.to)}`,
-          detail: editor.dirty ? dirtyNote : '',
+          detail: editor.dirty ? `${fileLines}。${dirtyNote}` : fileLines,
           warn: Boolean(editor.dirty),
           insert: token,
         })
@@ -150,7 +153,7 @@ export function mentionCandidates({ query, editor, notes, headings }) {
         kind: 'heading',
         label: `${nameOf(headings.path)}#${section.text}`,
         // 見出しの行は保存した中身から数えるので、ずれない。入らないのは保存していない変更のほう。
-        detail: [`${headings.path} の${rangeText(section.line, section.to)}`, headings.dirty ? '保存した中身の行です（保存していない変更は入りません）' : ''].filter(Boolean).join(' · '),
+        detail: [`${headings.path} の${rangeText(section.line, section.to)}（ファイルの行番号）`, headings.dirty ? '保存した中身の行です（保存していない変更は入りません）' : ''].filter(Boolean).join(' · '),
         warn: Boolean(headings.dirty),
         insert: lineToken(headings.path, section.line, section.to),
       })
