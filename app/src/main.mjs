@@ -1203,9 +1203,9 @@ function setupMentions(input) {
   return { close }
 }
 
-// 会話を広げる・たたむボタンのアイコン。広げるは外向きの矢印、たたむは内向きの矢印。
-const EXPAND_ICON_OPEN = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2.5h4v4M13.5 2.5 9 7M6.5 13.5h-4v-4M2.5 13.5 7 9"/></svg>'
-const EXPAND_ICON_CLOSE = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5h-4v-4M9.5 6.5 14 2M2.5 9.5h4v4M6.5 9.5 2 14"/></svg>'
+// 会話を広げる・たたむボタンのアイコン。会話の記録が開く向きを指す山形にする（枠が下にあれば上へ、上にあれば下へ開く）。
+const CHEVRON_UP = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 10 8 5.5 12.5 10"/></svg>'
+const CHEVRON_DOWN = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6 8 10.5 12.5 6"/></svg>'
 
 // チャット枠はいつも出す。前は ?chat=1 のときだけ出していたが、開き方によっては付かず、枠が消えていた（2026-11-08）。
 function setupChatBox() {
@@ -1229,6 +1229,8 @@ function setupChatBox() {
     input.style.overflowY = want > max ? 'auto' : 'hidden'
   }
   input.addEventListener('input', sizeInput)
+  // 窓の高さが変わると上限（40vh）も変わるので、合わせ直す。
+  window.addEventListener('resize', sizeInput)
   // 枠の幅が変わると折り返しが変わるので、幅が変わったときも合わせる（高さの変化では呼ばない）。
   let inputWidth = 0
   new ResizeObserver(() => {
@@ -1291,16 +1293,22 @@ function setupChatBox() {
     panel.dataset.dock = dock
     opener.dataset.dock = dock
     storage.set('chat-dock', dock)
+    drawExpand()
     document.body.classList.toggle('chat-on', !panel.hidden && dock.startsWith('bottom'))
+  }
+  // 読み上げのラベルは「会話」で固定し、開いているかは aria-expanded で伝える（ラベルも切り替えると二重に読まれる）。
+  // マウスを乗せたときの説明（title）は、押すと何が起きるかを書く。
+  const drawExpand = () => {
+    const open = !log.hidden
+    const top = panel.dataset.dock?.startsWith('top')
+    expand.innerHTML = open === Boolean(top) ? CHEVRON_UP : CHEVRON_DOWN
+    expand.title = open ? '会話をたたむ' : '会話を広げる'
   }
   const setExpanded = (open) => {
     log.hidden = !open
     expand.setAttribute('aria-expanded', String(open))
     // 文字のボタンは幅が狭いと2行に折り返すので、向きの変わる矢印のアイコンにする。何が起きるかは説明と読み上げのラベルで伝える。
-    const label = open ? '会話をたたむ' : '会話を広げる'
-    expand.innerHTML = open ? EXPAND_ICON_CLOSE : EXPAND_ICON_OPEN
-    expand.title = label
-    expand.setAttribute('aria-label', label)
+    drawExpand()
     storage.set('chat-expanded', open)
     if (open) {
       markSeen()
@@ -1536,7 +1544,7 @@ function setupChatBox() {
   }
   $('chat-cancel').addEventListener('click', () => {
     stopWaiting()
-    say('待つのをやめました。返事は、上の矢印のボタンで会話を広げるか、チャットのほうで見られます。')
+    say('待つのをやめました。返事は、会話を広げるか、チャットのほうで見られます。')
   })
   const poll = async () => {
     if (!waiting) return
