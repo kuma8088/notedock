@@ -259,6 +259,10 @@ export class BulletWidget extends WidgetType {
   toDOM() {
     return element('span', { class: `cm-bullet cm-bullet-${BULLET_SYMBOLS.indexOf(this.symbol) + 1}`, 'aria-hidden': 'true' }, [this.symbol])
   }
+  // 押したときに子を開閉できるよう、押した操作だけはエディターにも渡す（main.mjs の mousedown）。
+  ignoreEvent(event) {
+    return event.type !== 'mousedown'
+  }
 }
 
 export class LineBreakWidget extends WidgetType {
