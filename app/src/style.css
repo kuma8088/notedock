@@ -147,6 +147,12 @@ dialog button {
   background: var(--hover);
 }
 
+/* ノートの場所と「パスをコピー」を1組にする。広い画面では帯の中にそのまま並び、狭い画面では2段目にいっしょに出る。 */
+#path-row { display: contents; }
+#copy-path { flex: none; white-space: nowrap; }
+body[data-pane='right'] #copy-path { display: none !important; }
+#copy-path:disabled { opacity: 0.35; cursor: default; }
+
 #note-path {
   font-weight: 600;
   overflow: hidden;
@@ -214,7 +220,7 @@ dialog button {
 
 /* 右の枠（?pane=right）では、上の帯にノートの場所、保存の状態、表示の切り替え、閉じるボタンだけを出す。
    右端の一覧、チャット、貼り付けの案内も出さない。書式のボタンは、編集のときに右の中に出す。 */
-body[data-pane='right'] #bar > :not(#note-path, #status, .spacer, #modes, #pane-close),
+body[data-pane='right'] #bar > :not(#path-row, #status, .spacer, #modes, #pane-close),
 body[data-pane='right'] #side,
 body[data-pane='right'] #outline,
 body[data-pane='right'] #side-resize,
@@ -912,7 +918,9 @@ dialog::backdrop { background: rgb(0 0 0 / 30%); }
 
 /* 右の枠は全体の半分ほどの幅なので、自分の幅で狭い画面の見た目にならないようにする。 */
 @media (max-width: 640px) {
-  body:not([data-pane='right']) #note-path { max-width: 100%; order: 3; flex-basis: 100%; }
+  /* ノートの場所は2段目に出し、「パスをコピー」はその右に並べる（段を増やさない）。 */
+  body:not([data-pane='right']) #path-row { display: flex; align-items: center; gap: 8px; order: 3; flex: 1 1 100%; min-width: 0; }
+  body:not([data-pane='right']) #note-path { max-width: none; flex: 1 1 0; }
   body:not([data-pane='right']) #layout > #side-resize { display: none !important; }
   body:not([data-pane='right']) #side,
   body:not([data-pane='right']) #outline {
