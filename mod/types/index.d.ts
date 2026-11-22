@@ -10,6 +10,10 @@ export type Band =
 
 declare module 'claude-code' {
   interface PluginState {
-    notedock: { band: Band }
+    notedock: {
+      band: Band
+      // このチャットとエディターを結び付ける番号（推測できない43文字）。Modを読み込み直しても残す。null は、まだ作っていない・チャットが終わった。
+      chatLink: string | null
+    }
   }
 }

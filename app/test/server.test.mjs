@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, before, describe, test } from 'node:test'
 
-import { createApp } from '../server/app.mjs'
+import { CHAT_HEADER, CHAT_LIVE_MS, chatHashOf, createApp } from '../server/app.mjs'
 import { createBackups } from '../server/backups.mjs'
 import { vaultIdOf } from '../server/config.mjs'
 import { hashText, readNote, writeNote } from '../server/notes.mjs'
@@ -230,15 +230,25 @@ test('別のVault用に開いたタブからの操作は、書く前に断る', 
 })
 
 test('状態のファイルにVaultの場所を入れ、チャットへ送る文字を消さない', async () => {
+  // Modが結び付けの印を書いたチャットのフォルダーと、開くリンクの合図（テスト用の固定の43文字）。合図を鍵と引き換えて使う。
+  const code = 'T'.repeat(43)
+  const dir = path.join(backupDir, 'vault', 'chats', 'f'.repeat(64))
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'link.json'), JSON.stringify({ at: Date.now(), binds: [{ h: chatHashOf(code), until: Date.now() + 60_000 }] }))
+  const { cred: link } = await (await fetch(`${base}/api/chat-bind`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-note-editor': '1' },
+    body: JSON.stringify({ bind: code }),
+  })).json()
   const send = (body) =>
     fetch(`${base}/api/state`, {
       method: 'PUT',
-      headers: { 'content-type': 'application/json', 'x-note-editor': '1' },
+      headers: { 'content-type': 'application/json', 'x-note-editor': '1', [CHAT_HEADER]: link },
       body: JSON.stringify(body),
     })
   await send({ path: 'a.md', askChat: { text: '質問', at: 5 } })
   await send({ path: 'a.md', selection: '' })
-  const state = await (await fetch(`${base}/api/state`)).json()
+  const state = await (await fetch(`${base}/api/state`, { headers: { [CHAT_HEADER]: link } })).json()
   assert.equal(state.root, root)
   assert.deepEqual(state.askChat, { text: '質問', at: 5 })
 })
@@ -305,6 +315,32 @@ test('たどりきれないVaultでは、/api/notes に truncated が付き、�
 test('画面は、どの読み込みにも参照元を付けない（Mermaidの<image>なども含む）', () => {
   const html = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8')
   assert.match(html, /<meta name="referrer" content="no-referrer">/)
+})
+
+
+test('起動したとき、7日より古い結び付けのフォルダーと、そこを指すタブの鍵の目録、前の版のチャット欄のファイルを片付ける', async () => {
+  const vdir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'prune-vault-')))
+  const oldDir = path.join(vdir, 'chats', '1'.repeat(64))
+  const newDir = path.join(vdir, 'chats', '2'.repeat(64))
+  for (const d of [oldDir, newDir]) {
+    fs.mkdirSync(d, { recursive: true })
+    fs.writeFileSync(path.join(d, 'link.json'), '{}')
+  }
+  const past = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000)
+  fs.utimesSync(path.join(oldDir, 'link.json'), past, past)
+  fs.mkdirSync(path.join(vdir, 'chat-tabs'), { recursive: true })
+  fs.writeFileSync(path.join(vdir, 'chat-tabs', 'old.json'), JSON.stringify({ chat: '1'.repeat(64) }))
+  fs.writeFileSync(path.join(vdir, 'chat-tabs', 'new.json'), JSON.stringify({ chat: '2'.repeat(64) }))
+  for (const name of ['chat-owner.json', 'current-note.json', 'chat-reply.json', 'chat-log.json', 'share-note.json']) fs.writeFileSync(path.join(vdir, name), '{}')
+  const s = await createApp({ root, backupDir: vdir, stateDir: vdir, vaultDir: vdir, noToken: true }).listen(0)
+  try {
+    assert.equal(fs.existsSync(oldDir), false)
+    assert.equal(fs.existsSync(newDir), true)
+    assert.deepEqual(fs.readdirSync(path.join(vdir, 'chat-tabs')), ['new.json'])
+    for (const name of ['chat-owner.json', 'current-note.json', 'chat-reply.json', 'chat-log.json', 'share-note.json']) assert.equal(fs.existsSync(path.join(vdir, name)), false, name)
+  } finally {
+    await new Promise((r) => { s.closeAllConnections(); s.close(r) })
+  }
 })
 
 // ここから：Modとのやり取り用の入口（合言葉あり）。Vault別フォルダーは一時フォルダーだけを使う。
@@ -403,22 +439,159 @@ describe('Modとのやり取り', () => {
     assert.equal(fs.existsSync(path.join(mdir, 'need-ticket.json')), false)
   })
 
-  test('share は合言葉がなければ401、最初は on: false', async () => {
+  // ---- チャット欄の結び付け ----
+  // Modの代わりに、結び付けのフォルダー（chats/<名前>）と印（link.json）を書く。画面は合図を鍵と引き換えてから使う。
+  const FOLDER_A = 'a'.repeat(64)
+  const FOLDER_B = 'b'.repeat(64)
+  const chatDir = (folder) => path.join(mdir, 'chats', folder)
+  const linkInfo = (folder) => JSON.parse(fs.readFileSync(path.join(chatDir(folder), 'link.json'), 'utf8'))
+  const register = (folder, info = {}) => {
+    fs.mkdirSync(chatDir(folder), { recursive: true })
+    fs.writeFileSync(path.join(chatDir(folder), 'link.json'), JSON.stringify({ at: Date.now(), title: 'notes ·「表を足して」', binds: [], ...info }))
+  }
+  let codeSeq = 0
+  const newCode = () => `C${++codeSeq}`.padEnd(43, 'c')
+  // Modが開くリンクに付ける合図を、link.json に足す（ハッシュと期限だけ）。
+  const addCode = (folder, code, until = Date.now() + 60_000) => {
+    const info = linkInfo(folder)
+    fs.writeFileSync(path.join(chatDir(folder), 'link.json'), JSON.stringify({ ...info, binds: [...info.binds, { h: chatHashOf(code), until }] }))
+  }
+  const bind = (code, extra = headers) => call('POST', '/api/chat-bind', { bind: code }, extra)
+  const credFor = async (folder) => {
+    const code = newCode()
+    addCode(folder, code)
+    const res = await bind(code)
+    assert.equal(res.status, 200)
+    return (await res.json()).cred
+  }
+  const withLink = (cred) => ({ ...headers, [CHAT_HEADER]: cred })
+  const inChat = (folder, name) => JSON.parse(fs.readFileSync(path.join(chatDir(folder), name), 'utf8'))
+
+  test('結び付けの合図は、合言葉があり、Modが書いた期限内のものを1回だけ、このタブだけの鍵と引き換える', async () => {
+    register(FOLDER_A)
+    const code = newCode()
+    addCode(FOLDER_A, code)
+    assert.equal((await bind(code, { 'x-note-editor': '1' })).status, 401)
+    assert.equal((await bind(code, { ...headers, 'x-note-editor': undefined })).status, 403)
+    const res = await bind(code)
+    assert.equal(res.status, 200)
+    const { cred } = await res.json()
+    assert.match(cred, /^[A-Za-z0-9_-]{43}$/)
+    // 2回目は使えない。
+    assert.equal((await bind(code)).status, 404)
+    // 期限切れ・知らない合図・形の違う合図・終わったチャットの合図は使えない。
+    const late = newCode()
+    addCode(FOLDER_A, late, Date.now() - 1)
+    assert.equal((await bind(late)).status, 404)
+    assert.equal((await bind(newCode())).status, 404)
+    assert.equal((await bind('../../x')).status, 400)
+    const closed = newCode()
+    register(FOLDER_B, { at: 0, closed: true, binds: [{ h: chatHashOf(closed), until: Date.now() + 60_000 }] })
+    assert.equal((await bind(closed)).status, 404)
+    // 鍵そのものも合図そのものも、ファイルには書かない。
+    const all = []
+    const walk = (dir) => { for (const n of fs.readdirSync(dir)) { const p = path.join(dir, n); if (fs.statSync(p).isDirectory()) walk(p); else all.push(fs.readFileSync(p, 'utf8')) } }
+    walk(mdir)
+    for (const text of all) {
+      assert.ok(!text.includes(cred))
+      assert.ok(!text.includes(code))
+    }
+  })
+
+  test('share は合言葉がなければ401。結び付いていない画面は on: false で、書けない（409）', async () => {
     assert.equal((await call('GET', '/api/share', undefined, { 'x-note-editor': '1' })).status, 401)
     assert.equal((await call('PUT', '/api/share', { on: true }, { 'x-note-editor': '1' })).status, 401)
     const res = await call('GET', '/api/share')
     assert.equal(res.status, 200)
     assert.deepEqual(await res.json(), { on: false })
+    assert.equal((await call('PUT', '/api/share', { on: true })).status, 409)
+    // 形は合っていても、引き換えていない鍵は結び付いていない。
+    assert.equal((await call('PUT', '/api/share', { on: true }, withLink('Z'.repeat(43)))).status, 409)
+    assert.equal(fs.existsSync(path.join(mdir, 'share-note.json')), false)
   })
 
-  test('share を on にすると share-note.json に書く', async () => {
-    const res = await call('PUT', '/api/share', { on: true })
+  test('share は、結び付いたチャットごとに覚える', async () => {
+    register(FOLDER_A)
+    register(FOLDER_B)
+    const a = await credFor(FOLDER_A)
+    const b = await credFor(FOLDER_B)
+    const res = await call('PUT', '/api/share', { on: true }, withLink(a))
     assert.equal(res.status, 200)
-    assert.deepEqual(readJson('share-note.json'), { on: true })
-    assert.deepEqual(await (await call('GET', '/api/share')).json(), { on: true })
-    assert.equal((await call('PUT', '/api/share', { on: 'yes' })).status, 400)
-    await call('PUT', '/api/share', { on: false })
-    assert.deepEqual(readJson('share-note.json'), { on: false })
+    assert.deepEqual(inChat(FOLDER_A, 'share.json'), { on: true })
+    assert.deepEqual(await (await call('GET', '/api/share', undefined, withLink(a))).json(), { on: true })
+    assert.deepEqual(await (await call('GET', '/api/share', undefined, withLink(b))).json(), { on: false })
+    assert.equal((await call('PUT', '/api/share', { on: 'yes' }, withLink(a))).status, 400)
+    await call('PUT', '/api/share', { on: false }, withLink(a))
+    assert.deepEqual(inChat(FOLDER_A, 'share.json'), { on: false })
+  })
+
+  test('送る文と引用は、結び付いたチャットのフォルダーにだけ書く。結び付いていない画面からは409で断り、どこにも書かない', async () => {
+    fs.rmSync(path.join(mdir, 'chats'), { recursive: true, force: true })
+    register(FOLDER_A)
+    register(FOLDER_B)
+    const a = await credFor(FOLDER_A)
+    const b = await credFor(FOLDER_B)
+    const at = Date.now()
+    assert.equal((await call('PUT', '/api/state', { path: 'a.md', sendChat: { text: 'Aへ', at } }, withLink(a))).status, 200)
+    assert.equal((await call('PUT', '/api/state', { path: 'b.md', askChat: { text: 'B引用', at } }, withLink(b))).status, 200)
+    assert.deepEqual(inChat(FOLDER_A, 'state.json').sendChat, { text: 'Aへ', at })
+    assert.equal(inChat(FOLDER_A, 'state.json').askChat, undefined)
+    assert.equal(inChat(FOLDER_A, 'state.json').path, 'a.md')
+    assert.deepEqual(inChat(FOLDER_B, 'state.json').askChat, { text: 'B引用', at })
+    assert.equal(inChat(FOLDER_B, 'state.json').sendChat, undefined)
+    // 鍵なし・引き換えていない鍵・形の違う鍵・フォルダーの名前・まだ使っていない合図では、送れない。
+    const unused = newCode()
+    addCode(FOLDER_A, unused)
+    for (const extra of [headers, withLink('Z'.repeat(43)), withLink('../../x'), withLink(FOLDER_A), withLink(unused)]) {
+      const res = await call('PUT', '/api/state', { sendChat: { text: '外から', at: at + 1 } }, extra)
+      assert.equal(res.status, 409)
+      assert.deepEqual(await res.json(), { error: 'no-chat' })
+    }
+    // 送る文の無い状態は受け付けるが、どのチャットにも渡さない。
+    const plain = await call('PUT', '/api/state', { path: 'c.md' })
+    assert.equal(plain.status, 200)
+    assert.deepEqual(await plain.json(), { ok: true, linked: false })
+    assert.equal(fs.existsSync(path.join(mdir, 'current-note.json')), false)
+    assert.equal(inChat(FOLDER_A, 'state.json').sendChat.text, 'Aへ')
+  })
+
+  test('結び付いたチャットがもう無い（印が古い・終わった）ときは、送る文を409で断る', async () => {
+    register(FOLDER_A)
+    const a = await credFor(FOLDER_A)
+    register(FOLDER_A, { at: Date.now() - CHAT_LIVE_MS - 1000 })
+    const res = await call('PUT', '/api/state', { sendChat: { text: '遅い', at: Date.now() } }, withLink(a))
+    assert.equal(res.status, 409)
+    assert.deepEqual(await res.json(), { error: 'chat-gone' })
+    register(FOLDER_A, { at: 0, closed: true })
+    assert.equal((await call('PUT', '/api/state', { askChat: { text: '終わった', at: Date.now() } }, withLink(a))).status, 409)
+    const got = await (await call('GET', '/api/chat-reply', undefined, withLink(a))).json()
+    assert.equal(got.partner, 'gone')
+  })
+
+  test('chat-reply と chat-log は、結び付いたチャットのものだけを返す。相手の様子と名前も返す', async () => {
+    register(FOLDER_A)
+    register(FOLDER_B, { title: 'Bの会話' })
+    const a = await credFor(FOLDER_A)
+    const b = await credFor(FOLDER_B)
+    fs.writeFileSync(path.join(chatDir(FOLDER_A), 'reply.json'), JSON.stringify({ for: 5, text: 'Aの返事' }))
+    fs.writeFileSync(path.join(chatDir(FOLDER_A), 'log.json'), JSON.stringify({ items: [{ kind: 'user', text: 'A' }], at: 1 }))
+    fs.rmSync(path.join(chatDir(FOLDER_B), 'log.json'), { force: true })
+    fs.rmSync(path.join(chatDir(FOLDER_B), 'reply.json'), { force: true })
+    const ra = await (await call('GET', '/api/chat-reply', undefined, withLink(a))).json()
+    assert.equal(ra.text, 'Aの返事')
+    assert.equal(ra.partner, 'live')
+    assert.equal(ra.title, 'notes ·「表を足して」')
+    const rb = await (await call('GET', '/api/chat-reply', undefined, withLink(b))).json()
+    assert.equal(rb.text, undefined)
+    assert.equal(rb.partner, 'live')
+    assert.equal(rb.title, 'Bの会話')
+    assert.deepEqual(await (await call('GET', '/api/chat-reply')).json(), { partner: 'none', sent: 0 })
+    assert.deepEqual((await (await call('GET', '/api/chat-log', undefined, withLink(a))).json()).items, [{ kind: 'user', text: 'A' }])
+    assert.deepEqual(await (await call('GET', '/api/chat-log', undefined, withLink(b))).json(), {})
+    assert.deepEqual(await (await call('GET', '/api/chat-log')).json(), {})
+    assert.deepEqual(await (await call('GET', '/api/state')).json(), {})
+    // 鍵があっても、合言葉が無ければ読めない。
+    assert.equal((await call('GET', '/api/chat-log', undefined, { 'x-note-editor': '1', [CHAT_HEADER]: a })).status, 401)
   })
 
   test('settings を読むと、今の中身と errors を返す', async () => {

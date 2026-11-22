@@ -4,7 +4,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 
-import { createApp } from '../server/app.mjs'
+import { CHAT_HEADER, chatHashOf, createApp } from '../server/app.mjs'
+
+const LINK = 'L'.repeat(43)
 import { canonicalRoot, defaultStateDir, isRefusedRoot, vaultDirOf, vaultIdOf } from '../server/config.mjs'
 
 test('defaultStateDir はOSごとの場所を返す', () => {
@@ -61,7 +63,7 @@ test('createApp は stateDir と vaultDir が必須', () => {
   assert.throws(() => createApp({ root: os.tmpdir(), port: 0, backupDir: os.tmpdir(), stateDir: os.tmpdir() }), /vaultDir/)
 })
 
-test('同名で場所の違う2つのVaultは current-note.json が別になる', async () => {
+test('同名で場所の違う2つのVaultは、開いているノートの状態のファイルが別になる', async () => {
   const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'two-')))
   const stateDir = path.join(tmp, 'state')
   const servers = []
@@ -72,21 +74,31 @@ test('同名で場所の違う2つのVaultは current-note.json が別になる'
       fs.mkdirSync(root, { recursive: true })
       const vaultDir = vaultDirOf(stateDir, vaultIdOf(canonicalRoot(root)))
       fs.mkdirSync(vaultDir, { recursive: true })
-      dirs.push(vaultDir)
+      // Modの代わりに、このVaultのチャットとの結び付けの印を書き、合図を鍵と引き換える（同じ合図でも、Vaultが違えば別のフォルダー）。
+      const chatDir = path.join(vaultDir, 'chats', 'f'.repeat(64))
+      fs.mkdirSync(chatDir, { recursive: true })
+      fs.writeFileSync(path.join(chatDir, 'link.json'), JSON.stringify({ at: Date.now(), binds: [{ h: chatHashOf(LINK), until: Date.now() + 60_000 }] }))
+      dirs.push(chatDir)
       const server = await createApp({ root, port: 0, backupDir: path.join(tmp, 'bak'), stateDir, vaultDir, noToken: true }).listen(0)
       servers.push(server)
+      const { cred } = await (await fetch(`http://127.0.0.1:${server.address().port}/api/chat-bind`, {
+        method: 'POST',
+        headers: { 'x-note-editor': '1', 'content-type': 'application/json' },
+        body: JSON.stringify({ bind: LINK }),
+      })).json()
       const res = await fetch(`http://127.0.0.1:${server.address().port}/api/state`, {
         method: 'PUT',
-        headers: { 'x-note-editor': '1', 'content-type': 'application/json' },
+        headers: { 'x-note-editor': '1', 'content-type': 'application/json', [CHAT_HEADER]: cred },
         body: JSON.stringify({ path: `${side}.md`, title: side }),
       })
       assert.equal(res.status, 200)
     }
     assert.notEqual(dirs[0], dirs[1])
-    const [a, b] = dirs.map((d) => JSON.parse(fs.readFileSync(path.join(d, 'current-note.json'), 'utf8')))
+    const [a, b] = dirs.map((d) => JSON.parse(fs.readFileSync(path.join(d, 'state.json'), 'utf8')))
     assert.equal(a.path, 'A.md')
     assert.equal(b.path, 'B.md')
     assert.equal(fs.existsSync(path.join(stateDir, 'current-note.json')), false)
+    assert.equal(fs.existsSync(path.join(stateDir, 'chats')), false)
   } finally {
     for (const s of servers) await new Promise((r) => s.close(r))
   }

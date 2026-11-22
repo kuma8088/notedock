@@ -5,9 +5,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, before, test } from 'node:test'
 
-import { createApp } from '../server/app.mjs'
+import { chatHashOf, createApp } from '../server/app.mjs'
 import { VAULT_HEADER, vaultIdOf } from '../server/config.mjs'
-import { fileUrl, setFileKey, ticketFromHash, tokenFromHash } from '../src/access.mjs'
+import { bindChatCode, chatLinkFromHash, fileUrl, recalledChatLink, rememberChatLink, setFileKey, stashBindCode, stashedBindCode, ticketFromHash, tokenFromHash } from '../src/access.mjs'
 
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/
 const running = []
@@ -393,4 +393,71 @@ test('鍵の期限は、鍵を作り直すたびに数え直す', async () => {
   const fresh = readAccessFile(dir).ticket
   await new Promise((resolve) => setTimeout(resolve, 100))
   assert.equal(readAccessFile(dir).ticket, fresh, '作り直してから150msは同じ')
+})
+
+test('アドレスの # から、鍵（c=）とチャットの番号（s=）を & つなぎで読む。ほかの形は読まない', () => {
+  const k = 'K'.repeat(43)
+  const s = 'S'.repeat(42) + '_'
+  assert.equal(ticketFromHash(`#c=${k}`), k)
+  assert.equal(ticketFromHash(`#c=${k}&s=${s}`), k)
+  assert.equal(chatLinkFromHash(`#c=${k}&s=${s}`), s)
+  assert.equal(chatLinkFromHash(`#s=${s}`), s)
+  assert.equal(chatLinkFromHash(`#c=${k}`), null)
+  assert.equal(tokenFromHash(`#t=${k}`), k)
+  // 見出しへの移動・形の違う値・同じ名前が2つ・知らない名前があれば、どれも読まない。
+  for (const hash of ['', '#', '#見出し', `#c=${k}&s=short`, `#c=${k}&c=${k}`, `#c=${k}&x=${s}`, `#c=${k}&`, `#s=${s}/../x`]) {
+    assert.equal(ticketFromHash(hash), null, hash)
+    assert.equal(chatLinkFromHash(hash), null, hash)
+  }
+})
+
+test('チャットの番号はタブの中にだけ覚え、形の違う値は覚えない', () => {
+  const store = new Map()
+  const fake = { setItem: (k, v) => store.set(k, v), getItem: (k) => store.get(k) ?? null }
+  assert.equal(recalledChatLink(fake), '')
+  rememberChatLink(fake, 'bad')
+  assert.equal(recalledChatLink(fake), '')
+  const s = 'S'.repeat(43)
+  rememberChatLink(fake, s)
+  assert.equal(recalledChatLink(fake), s)
+  assert.equal(recalledChatLink(undefined), '')
+  assert.equal(recalledChatLink({ getItem: () => { throw new Error('使えない') } }), '')
+})
+
+// 実機（2026-11-22、VM）：Claudeはまず鍵の無い場所を開く（合言葉が無く401、開けない画面になる）。続く #c=…&s=… への移動で
+// 合言葉は取れるが、前の作りは開けない画面のあいだ問い合わせを送らず、合図を捨てていた。
+test('起動で合言葉が無く断られたあとでも、退避した合図で結び付く。読み込み直しても合図は残る。使えない合図は捨てる', async () => {
+  const store = new Map()
+  const tab = { setItem: (k, v) => store.set(k, v), getItem: (k) => store.get(k) ?? null, removeItem: (k) => store.delete(k) }
+  const folder = 'e'.repeat(64)
+  const dir = path.join(stateDir, 'chats', folder)
+  fs.mkdirSync(dir, { recursive: true })
+  const code = 'G'.repeat(43)
+  const used = 'U'.repeat(43)
+  fs.writeFileSync(path.join(dir, 'link.json'), JSON.stringify({ at: Date.now(), binds: [{ h: chatHashOf(code), until: Date.now() + 60_000 }] }))
+  const fetchImpl = (url, init) => fetch(base + url, init)
+  // アドレスの合図を、消す前にタブの中へ退避する。
+  stashBindCode(tab, code)
+  // 合言葉がまだ無い：401。合図は残す。
+  assert.equal(await bindChatCode({ store: tab, fetchImpl }), null)
+  assert.equal(stashedBindCode(tab), code)
+  // つながらないときも残す。
+  assert.equal(await bindChatCode({ store: tab, fetchImpl: async () => { throw new Error('切れた') }, token: access.token }), null)
+  assert.equal(stashedBindCode(tab), code)
+  // 読み込み直したあと（同じタブの中の退避から）、合言葉が取れていれば結び付く。
+  const cred = await bindChatCode({ store: tab, fetchImpl, token: access.token })
+  assert.match(cred, TOKEN_RE)
+  assert.equal(recalledChatLink(tab), cred)
+  assert.equal(stashedBindCode(tab), '')
+  // 使えない合図（使用済み・知らない合図）は捨てる。
+  stashBindCode(tab, code)
+  assert.equal(await bindChatCode({ store: tab, fetchImpl, token: access.token }), null)
+  assert.equal(stashedBindCode(tab), '')
+  stashBindCode(tab, used)
+  assert.equal(await bindChatCode({ store: tab, fetchImpl, token: access.token }), null)
+  assert.equal(stashedBindCode(tab), '')
+  assert.equal(recalledChatLink(tab), cred)
+  // 形の違う値は退避しない。
+  stashBindCode(tab, '../x')
+  assert.equal(stashedBindCode(tab), '')
 })
