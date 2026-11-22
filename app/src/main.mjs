@@ -1029,12 +1029,14 @@ function setupMentions(input) {
     hide()
   }
   const sectionsFor = async (path) => {
+    const mine = seq
     const got = saved.get(path)
     if (got && Date.now() - got.at < MENTION_FRESH_MS) return got.sections
     try {
       const data = await api.read(path)
       const sections = sectionsOf(data?.text ?? '')
-      saved.set(path, { at: Date.now(), sections })
+      // 閉じたあとに届いた中身は覚えない（閉じるときに消したものを書き戻さない）。
+      if (mine === seq) saved.set(path, { at: Date.now(), sections })
       return sections
     } catch {
       return null
@@ -1078,10 +1080,10 @@ function setupMentions(input) {
       hide()
       return
     }
-    // 場所に空白か # があるノートは、@ のあとに1語で書けない（# は行の指定と紛れる）ので出さず、理由だけ添える。
+    // 場所に空白や # @ : \ があるノートは、@ のあとに1語で書けない（# は行の指定と紛れる）ので出さず、理由だけ添える。
     const note = document.createElement('p')
     note.className = 'chat-mention-note'
-    note.textContent = `場所に空白か # があるノート（${hidden}件）は、@ のあとに1語で書けないので出していません`
+    note.textContent = `場所に空白や # @ : \\ があるノート（${hidden}件）は、@ のあとに1語で書けないので出していません`
     list.replaceChildren(
       ...items.map((item, index) => {
         const row = document.createElement('div')

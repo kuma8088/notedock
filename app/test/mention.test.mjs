@@ -3,10 +3,14 @@ import test from 'node:test'
 
 import { applyMention, headingTarget, unwritableCount, lineToken, mentionCandidates, mentionQuery, noteForName, sectionsOf, writablePath } from '../src/mention.mjs'
 
-test('@ の語は、文の頭か空白のあとだけ', () => {
+test('@ の語。英数字のあと（メールアドレスなど）では出さない。置き換えるのは @ からカーソルまで', () => {
   assert.deepEqual(mentionQuery('@', 1), { from: 0, to: 1, query: '' })
   assert.deepEqual(mentionQuery('見て @me', 6), { from: 3, to: 6, query: 'me' })
-  assert.deepEqual(mentionQuery('a @memo b', 5), { from: 2, to: 7, query: 'me' })
+  assert.deepEqual(mentionQuery('a @memo b', 5), { from: 2, to: 5, query: 'me' })
+  // 後ろに続く文は消さない
+  assert.deepEqual(mentionQuery('これを@直して', 4), { from: 3, to: 4, query: '' })
+  // 入れ終わった指定の中なら、その終わりまで
+  assert.deepEqual(mentionQuery('@a.md#L1-2 x', 3), { from: 0, to: 10, query: 'a.' })
   assert.equal(mentionQuery('mail@example', 12), null)
   assert.deepEqual(mentionQuery('これを@pl', 6), { from: 3, to: 6, query: 'pl' })
   assert.equal(mentionQuery('x.@a', 4), null)

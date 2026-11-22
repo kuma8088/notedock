@@ -14,10 +14,11 @@ export function mentionQuery(value, caret) {
   const at = value.lastIndexOf('@', caret - 1)
   if (at < word) return null
   if (at > 0 && /[0-9A-Za-z._%+-]/.test(value[at - 1])) return null
-  const start = at
-  let end = caret
-  while (end < value.length && !/\s/.test(value[end])) end += 1
-  return { from: start, to: end, query: value.slice(start + 1, caret) }
+  // 置き換えるのは @ からカーソルまで。カーソルが入れ終わった指定（@場所.md#L1-2）の中にあるときだけ、その終わりまで。
+  // 「これを@直して」の @ の直後で選んでも、後ろの文を消さない。
+  const done = /^@[^\s@#]+\.md(?:#L\d+(?:-\d+)?)?/i.exec(value.slice(at))
+  const to = done && at + done[0].length > caret ? at + done[0].length : caret
+  return { from: at, to, query: value.slice(at + 1, caret) }
 }
 
 // 空白や # のある場所は、@ の続きとして1語に書けない（# は行の指定と紛れる）ので候補に出さない。

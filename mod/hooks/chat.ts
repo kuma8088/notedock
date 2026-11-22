@@ -145,12 +145,14 @@ const MAX_MENTION_TEXT = 20000 // 添える行の文字の合計
 
 export type LineRef = { path: string; from: number; to: number }
 
-export function lineRefsIn(text: string): LineRef[] {
+// dropTail: 文が上限で切られたときは、文の終わりで終わる指定を捨てる（切れて別の行を指しているかもしれない）。
+export function lineRefsIn(text: string, dropTail = false): LineRef[] {
   const found: LineRef[] = []
   const seen = new Set<string>()
   // @ の前が英数字や . _ % + - のとき（メールアドレスなど）は拾わない。後ろは数字・英字・- 以外なら何が続いてもよい（「@a.md#L1を直して」）。
   const re = /(?<![0-9A-Za-z._%+-])@([^\s@#]+)#L(\d+)(?:-(\d+))?(?![0-9A-Za-z_-])/g
   for (const m of text.matchAll(re)) {
+    if (dropTail && (m.index ?? 0) + m[0].length === text.length) continue
     const path = m[1]
     const from = Number(m[2])
     const to = m[3] === undefined ? from : Number(m[3])
@@ -220,7 +222,7 @@ export async function mentionsForSend(
   read: (path: string) => Promise<string>,
   real: (path: string) => Promise<string>,
 ): Promise<string | null> {
-  const refs = lineRefsIn(typed.length >= MAX_TEXT ? typed.replace(/\S*$/, '') : typed)
+  const refs = lineRefsIn(typed, typed.length >= MAX_TEXT)
   if (!refs.length) return null
   const vault = typeof state.root === 'string' && state.root ? state.root : root
   const other = rootKey(vault, os) !== rootKey(root, os)
@@ -229,7 +231,12 @@ export async function mentionsForSend(
     refs.map(async ref => {
       const file = joinPath(os, win(vault), win(ref.path))
       const inside = await Promise.all([real(vault), real(file)]).then(
-        ([v, f]) => rootKey(f, os).startsWith(`${rootKey(v, os).replace(/[\\/]+$/, '')}${os === 'win32' ? '\\' : '/'}`),
+        ([v, f]) => {
+          // たどった先も、Vault の中の . で始まらない .md でなければ読まない（サーバーが断る場所と合わせる）。
+          const head = `${rootKey(v, os).replace(/[\\/]+$/, '')}${os === 'win32' ? '\\' : '/'}`
+          const key = rootKey(f, os)
+          return key.startsWith(head) && safeVaultPath(key.slice(head.length).replace(/\\/g, '/'))
+        },
         () => false,
       )
       const text = inside

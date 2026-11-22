@@ -897,10 +897,17 @@ test('読むのはエディターの Vault の中。会話のフォルダーが 
 test('シンボリックリンクで Vault の外へ出る場所は読まない。上限で切れた文の末尾の指定も読まない', async () => {
   const seen: string[] = []
   const read = async (p: string) => (seen.push(p), 'a\nb\n')
-  const real = async (p: string) => (p === '/V/notes/link.md' ? '/etc/secret.md' : p)
-  const out = await mentionsForSend('@link.md#L1 @ok.md#L1', { root: '/V/notes' }, '/V/notes', 'darwin', read, real)
+  const real = async (p: string) => (p === '/V/notes/link.md' ? '/etc/secret.md' : p === '/V/notes/in.md' ? '/V/notes/.git/config' : p)
+  const out = await mentionsForSend('@link.md#L1 @in.md#L1 @ok.md#L1', { root: '/V/notes' }, '/V/notes', 'darwin', read, real)
   expect(seen).toEqual(['/V/notes/ok.md'])
   expect(out).toContain('@link.md#L1: 読めませんでした')
+  expect(out).toContain('@in.md#L1: 読めませんでした')
+  // 空白のない長い文でも、前のほうの指定は残す
+  const long = `@ok.md#L3${'あ'.repeat(4000 - '@ok.md#L3'.length - '@ok.md#L1'.length)}@ok.md#L1`
+  expect(long.length).toBe(4000)
+  const kept = await mentionsForSend(long, { root: '/V/notes' }, '/V/notes', 'darwin', read, real)
+  expect(kept).toContain('@ok.md#L3')
+  expect(kept).not.toContain('@ok.md#L1\n')
   const cut = `${'あ'.repeat(4000 - '@ok.md#L1 @ok.md#L1'.length - 1)} @ok.md#L2 @ok.md#L1`
   expect(cut.length).toBe(4000)
   const got = await mentionsForSend(cut, { root: '/V/notes' }, '/V/notes', 'darwin', read, real)
