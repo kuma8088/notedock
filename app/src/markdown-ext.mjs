@@ -1,6 +1,7 @@
 import { commonmarkLanguage, markdown } from '@codemirror/lang-markdown'
 import { GFM } from '@lezer/markdown'
 
+import { AlphaList } from './alpha-list.mjs'
 import { parseWikiLink } from './links.mjs'
 
 const DOLLAR = 36
@@ -241,7 +242,7 @@ const EmptyBulletNotUnderline = {
   ],
 }
 
-export const noteMarkdownExtensions = [GFM, Frontmatter, MathBlock, InlineMath, WikiLink, Highlight, ObsidianComment, Tag, EmptyBulletNotUnderline]
+export const noteMarkdownExtensions = [GFM, Frontmatter, MathBlock, InlineMath, WikiLink, Highlight, ObsidianComment, Tag, EmptyBulletNotUnderline, AlphaList]
 
 export function noteMarkdown(codeLanguages) {
   return markdown({

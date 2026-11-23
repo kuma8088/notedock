@@ -1,78 +1,156 @@
-import { syntaxTree } from '@codemirror/language'
+import { insertNewlineContinueMarkup } from '@codemirror/lang-markdown'
+import { ensureSyntaxTree, foldNodeProp, syntaxTree } from '@codemirror/language'
 
 // 「a. 」「b. 」…（小文字1字＋ピリオド＋空白）で始まる行を、順序付きの項目として扱う。
 // Markdown の標準（CommonMark）には英字の番号付きリストがないので、ファイルには書いたとおり「a. 」が残り、
 // ほかのアプリ（Obsidian・GitHub など）ではただの文として表示される。この扱いはエディターの中だけ。
+//
+// 作り：Markdown の読み取り（lezer）を広げて、「a. 」を項目（AlphaItem、記号は AlphaMark）として木に入れる。
+// 前は木はそのままにして、行の文字を見て記号に色を付けるだけだった（飾りの方法）。それだと「a. 」の行は段落のままで、
+// 下に Tab で入れた「- 」「1. 」も同じ段落の続きと読まれ、子が箇条書き・番号付きにならなかった。
+// 木に入れると、子は普通の箇条書き・番号付きとして読まれ、記号・開閉・Enter の続き・ぶら下げ字下げが、
+// 今までの箇条書きの仕組みのままで効く。「a. 」の項目自体も、左の三角や記号の押下でたためる。
+// 番号付きの項目（ListItem）と同じく、子は記号のあとの本文の位置より右に字下げした行。
+//
 // 誤って拾わないための決まり：
 // - 行頭（引用の「>」と字下げのあと）だけ。文の途中の「a. 」は対象外。
 // - 小文字1字だけ。ひな形の「Q. 」や「A. 」などの大文字、「aa. 」は対象外。ピリオドの後に空白が要る。
-// - コード・数式・ノートの先頭のプロパティ・HTML・コメント・表の中は対象外。
-// - 「a. 」以外の文字は、すぐ上（深い段の行は飛ばす）に同じ段の項目が続いているか、1つ浅い段が箇条書き・番号・英字の項目のときだけ。
-//   これで、本文の行のすぐ下の「e. g. 」「i. e. 」のような行は拾わない。空行をはさむと続きとみなさない。
+// - コード・数式・ノートの先頭のプロパティ・HTML・コメント・表の中は、ほかの読み取りが先に取るので対象外。
+// - 「a. 」以外の文字は、すぐ上で同じ段の英字の項目が終わったとき（間に深い段の行があってもよい）か、
+//   すぐ上の行が1つ浅い段の箇条書き・番号・英字の項目のときだけ。空行をはさむと続きとみなさない。
+//   これで、本文の行のすぐ下の「e. g. 」「i. e. 」のような行は拾わない。
 
-const LINE = /^((?:[\t ]*>[\t ]?)*)([\t ]*)(.*)$/
 const ALPHA_MARK = /^([a-z])\.([\t ]+)/
-const LIST_MARK = /^(?:[-*+]|\d{1,9}[.)])(?:[\t ]|$)/
-const QUICK = /^(?:[\t ]*>[\t ]?)*[\t ]*[a-z]\.[\t ]/
-const EXCLUDED = new Set(['FencedCode', 'CodeBlock', 'Frontmatter', 'MathBlock', 'HTMLBlock', 'CommentBlock', 'ObsidianCommentBlock', 'Table'])
+const LIST_MARK = /^(?:[-*+]|\d{1,9}[.)]|[a-z]\.)(?:[\t ]|$)/
 
-function columns(indent, tabSize) {
+// 読み取りの途中の記録（読み取りごと）。英字の項目を始めたときの本文の位置→記号の位置と、
+// その行で終わった英字の項目の記号の位置。
+const progress = new WeakMap()
+function progressOf(cx) {
+  let p = progress.get(cx)
+  if (!p) progress.set(cx, (p = { bases: new Map(), closedAt: -1, closedCols: new Set() }))
+  return p
+}
+
+// 前の行の文字（引用の「>」と字下げを含む）。
+function previousLine(cx) {
+  if (cx.lineStart === 0) return null
+  const end = cx.lineStart - 1
+  const text = cx.input.read(Math.max(0, end - 2000), end)
+  return text.slice(text.lastIndexOf('\n') + 1)
+}
+
+function columnsOf(text, tabSize = 4) {
   let col = 0
-  for (const ch of indent) col = ch === '\t' ? col + tabSize - (col % tabSize) : col + 1
+  for (const ch of text) col = ch === '\t' ? col + tabSize - (col % tabSize) : col + 1
   return col
 }
 
-function parseLine(text, tabSize) {
-  const [, quote, indent, rest] = text.match(LINE)
-  return { quote: quote.replace(/[\t ]/g, ''), quoteText: quote, indent, cols: columns(indent, tabSize), rest }
+// 「a. 」以外の文字を項目にしてよいか。
+function mayContinue(cx, line) {
+  const prev = previousLine(cx)
+  if (prev === null || prev.replace(/[\t >]/g, '') === '') return false
+  const p = progressOf(cx)
+  if (p.closedAt === cx.lineStart && p.closedCols.has(line.indent)) return true
+  const parent = cx.parentType().name
+  if (parent !== 'ListItem' && parent !== 'AlphaItem') return false
+  const [, lead, rest] = prev.match(/^((?:[\t ]*>[\t ]?)*[\t ]*)(.*)$/)
+  return LIST_MARK.test(rest) && columnsOf(lead) < line.indent
 }
 
-function excluded(state, pos) {
-  for (let node = syntaxTree(state).resolveInner(pos, 1); node; node = node.parent) {
-    if (EXCLUDED.has(node.name)) return true
-  }
-  return false
+function alphaStart(cx, line) {
+  if (line.indent - line.baseIndent >= 4) return null
+  const mark = ALPHA_MARK.exec(line.text.slice(line.pos))
+  if (!mark) return null
+  if (mark[1] !== 'a' && !mayContinue(cx, line)) return null
+  return mark
 }
 
-// 上の行を見て、「a. 」以外の文字の項目が続きかどうかを決める。
-function continuesRun(state, lineNumber, me) {
-  for (let n = lineNumber - 1; n >= 1; n--) {
-    const other = parseLine(state.doc.line(n).text, state.tabSize)
-    if (other.quote !== me.quote || other.rest.trim() === '') return false
-    if (other.cols > me.cols) continue
-    if (other.cols === me.cols) {
-      const mark = other.rest.match(ALPHA_MARK)
-      if (!mark) return false
-      if (mark[1] === 'a') return true
-      continue
-    }
-    return LIST_MARK.test(other.rest) || ALPHA_MARK.test(other.rest)
+export const AlphaList = {
+  defineNodes: [
+    {
+      name: 'AlphaItem',
+      block: true,
+      // 続きの行かどうか。番号付きの項目と同じく、本文の位置より左の行（空行を除く）で終わる。
+      composite(cx, line, value) {
+        const p = progressOf(cx)
+        if (line.indent < line.baseIndent + value && line.next > -1) {
+          if (p.closedAt !== cx.lineStart) {
+            p.closedAt = cx.lineStart
+            p.closedCols = new Set()
+          }
+          const col = p.bases.get(line.baseIndent + value)
+          if (col !== undefined) p.closedCols.add(col)
+          return false
+        }
+        line.moveBaseColumn(line.baseIndent + value)
+        return true
+      },
+    },
+    { name: 'AlphaMark' },
+  ],
+  parseBlock: [
+    {
+      name: 'AlphaItem',
+      after: 'OrderedList',
+      parse(cx, line) {
+        const mark = alphaStart(cx, line)
+        if (!mark) return false
+        const start = cx.lineStart + line.pos
+        const markCol = line.indent
+        // 本文の位置。記号のあとの空白が5つ以上か、本文がないときは、記号＋空白1つの位置（番号付きと同じ決まり）。
+        const spaceCols = columnsOf(line.text.slice(0, line.pos) + line.text.slice(line.pos, line.pos + mark[0].length)) - (markCol + 2)
+        const empty = line.pos + mark[0].length >= line.text.length
+        const base = empty || spaceCols > 4 ? markCol + 3 : markCol + 2 + spaceCols
+        progressOf(cx).bases.set(base, markCol)
+        cx.startComposite('AlphaItem', line.pos, base - line.baseIndent)
+        cx.addElement(cx.elt('AlphaMark', start, start + 2))
+        line.moveBaseColumn(base)
+        return null
+      },
+      // 段落のすぐ下の行でも項目を始める（番号付きの「1. 」と同じ）。
+      endLeaf: (cx, line) => Boolean(alphaStart(cx, line)),
+    },
+  ],
+  // 番号付きの項目と同じく、1行目の終わりから項目の終わりまでをたためる。
+  props: [foldNodeProp.add({ AlphaItem: (tree, state) => ({ from: state.doc.lineAt(tree.from).to, to: tree.to }) })],
+}
+
+function itemFromMark(state, mark) {
+  const line = state.doc.lineAt(mark.from)
+  const before = line.text.slice(0, mark.from - line.from)
+  const quote = before.match(/^(?:[\t ]*>[\t ]?)*/)[0]
+  const indent = before.slice(quote.length)
+  const space = line.text.slice(mark.to - line.from).match(/^[\t ]*/)[0]
+  return {
+    line,
+    quote,
+    indent,
+    cols: columnsOf(indent, state.tabSize),
+    letter: state.doc.sliceString(mark.from, mark.from + 1),
+    markFrom: mark.from,
+    markTo: mark.to,
+    textFrom: mark.to + space.length,
+    empty: line.text.slice(mark.to - line.from).trim() === '',
+    node: mark.parent,
   }
-  return false
 }
 
 // その行が英字の項目なら、記号と本文の位置を返す。そうでなければ null。
 export function alphaItemAt(state, lineNumber) {
   const line = state.doc.line(lineNumber)
-  if (!QUICK.test(line.text)) return null
-  const parsed = parseLine(line.text, state.tabSize)
-  const mark = parsed.rest.match(ALPHA_MARK)
-  if (!mark) return null
-  const markFrom = line.from + parsed.quoteText.length + parsed.indent.length
-  if (excluded(state, markFrom)) return null
-  const letter = mark[1]
-  if (letter !== 'a' && !continuesRun(state, lineNumber, parsed)) return null
-  return {
-    line,
-    quote: parsed.quoteText,
-    indent: parsed.indent,
-    cols: parsed.cols,
-    letter,
-    markFrom,
-    markTo: markFrom + 2,
-    textFrom: markFrom + mark[0].length,
-    empty: parsed.rest.slice(mark[0].length).trim() === '',
-  }
+  if (!/[a-z]\./.test(line.text)) return null
+  let mark = null
+  syntaxTree(state).iterate({
+    from: line.from,
+    to: line.to,
+    enter(node) {
+      if (mark) return false
+      if (node.name === 'AlphaMark' && node.from >= line.from) mark = node.node
+      return undefined
+    },
+  })
+  return mark ? itemFromMark(state, mark) : null
 }
 
 const nextLetter = (letter) => String.fromCharCode(letter.charCodeAt(0) + 1)
@@ -94,37 +172,98 @@ export function alphaListEnter({ state, dispatch }) {
   // z の次は続けず、同じ字下げの普通の改行にする。
   const insert = item.letter === 'z' ? `\n${prefix}` : `\n${prefix}${nextLetter(item.letter)}. `
   const changes = [{ from: head, insert }]
-  if (item.letter !== 'z') changes.push(...renumberAfter(state, item, nextLetter(nextLetter(item.letter))))
+  if (item.letter !== 'z') changes.push(...renumberAfter(state, item.node, nextLetter(nextLetter(item.letter))))
   dispatch(state.update({ changes, selection: { anchor: head + insert.length }, scrollIntoView: true, userEvent: 'input' }))
   return true
 }
 
-// 同じ段の後ろの項目（深い段の行は飛ばす）の文字を、expected から順に振り直す。
-function renumberAfter(state, item, expected) {
+// 同じ段の後ろの英字の項目の文字を、expected から順に振り直す。
+function renumberAfter(state, node, expected) {
   const changes = []
-  const me = parseLine(item.line.text, state.tabSize)
-  for (let n = item.line.number + 1; n <= state.doc.lines && expected <= 'z'; n++) {
-    const line = state.doc.line(n)
-    const other = parseLine(line.text, state.tabSize)
-    if (other.quote !== me.quote || other.rest.trim() === '') break
-    if (other.cols > me.cols) continue
-    const mark = other.cols === me.cols ? other.rest.match(ALPHA_MARK) : null
+  for (let next = node.nextSibling; next && next.name === 'AlphaItem' && expected <= 'z'; next = next.nextSibling) {
+    const mark = next.getChild('AlphaMark')
     if (!mark) break
-    const at = line.from + other.quoteText.length + other.indent.length
-    if (mark[1] !== expected) changes.push({ from: at, to: at + 1, insert: expected })
+    if (state.doc.sliceString(mark.from, mark.from + 1) !== expected) changes.push({ from: mark.from, to: mark.from + 1, insert: expected })
     expected = nextLetter(expected)
   }
   return changes
 }
 
+// 英字の項目の下の子（箇条書き・番号付き）での Enter。
+// Markdown の標準の Enter（insertNewlineContinueMarkup）は、親の項目の字下げを、箇条書き・番号付きの項目だけから組み立てる。
+// 英字の項目は知らないので、そのまま使うと字下げが消える。そこで、上にある英字の記号を同じ長さの「1.」に置き換えた
+// 写しで標準の Enter を動かし、出てきた変更を本物に当てる。2文字どうしなので位置はずれない。
+// 空の子で Enter して英字の項目と同じ段に出たときは、「2. 」を次の文字にして、後ろの英字の項目を振り直す。
+export function alphaChildEnter({ state, dispatch }) {
+  const { ranges, main } = state.selection
+  if (state.readOnly || ranges.length !== 1 || !main.empty) return false
+  const tree = syntaxTree(state)
+  let inner = null
+  const marks = []
+  for (let node = tree.resolveInner(main.head, -1); node; node = node.parent) {
+    if (!inner && (node.name === 'ListItem' || node.name === 'AlphaItem')) inner = node
+    if (node.name === 'AlphaItem') {
+      const mark = node.getChild('AlphaMark')
+      if (mark) marks.push(mark)
+    }
+  }
+  if (!inner || inner.name !== 'ListItem' || !marks.length) return false
+  const swap = state.update({ changes: marks.map((mark) => ({ from: mark.from, to: mark.to, insert: '1.' })) }).state
+  ensureSyntaxTree(swap, Math.min(swap.doc.length, swap.doc.lineAt(main.head).to + 2000), 200)
+  let result = null
+  if (!insertNewlineContinueMarkup({ state: swap, dispatch: (tr) => { result = tr } }) || !result) return false
+  let overlaps = false
+  result.changes.iterChangedRanges((from, to) => {
+    if (marks.some((mark) => from < mark.to && to > mark.from)) overlaps = true
+  })
+  if (overlaps) return false
+  const tr = state.update({ changes: result.changes, selection: result.selection, scrollIntoView: true, userEvent: 'input' })
+  const fixed = asAlphaSibling(tr.state, result.changes, marks)
+  dispatch(fixed ? state.update({ changes: result.changes.compose(fixed.changes), selection: fixed.selection, scrollIntoView: true, userEvent: 'input' }) : tr)
+  return true
+}
+
+// 空の子で Enter して、英字の項目と同じ段に「2. 」が入ったときの直し。直すものがなければ null。
+function asAlphaSibling(state, changes, marks) {
+  const head = state.selection.main.head
+  const line = state.doc.lineAt(head)
+  const text = line.text
+  for (const old of marks) {
+    const from = changes.mapPos(old.from)
+    const oldLine = state.doc.lineAt(from)
+    const prefix = oldLine.text.slice(0, from - oldLine.from)
+    const match = text.slice(prefix.length).match(/^(\d+)\.([\t ]+)/)
+    if (!text.startsWith(prefix) || !match || line.number <= oldLine.number) continue
+    // 同じ段かどうかは、すぐ上に同じ段の項目があるか（前の英字の項目の次）で見る。
+    if (columnsOf(text.slice(0, prefix.length), state.tabSize) !== columnsOf(prefix, state.tabSize)) continue
+    const letter = state.doc.sliceString(from, from + 1)
+    const at = line.from + prefix.length
+    const next = nextLetter(letter)
+    const insert = `${next}.`
+    const fix = [{ from: at, to: at + match[1].length + 1, insert }]
+    const delta = insert.length - (match[1].length + 1)
+    // 後ろの英字の項目（同じ段）の文字を振り直す。直したあとの文書で読み直して数える。
+    const after = state.update({ changes: fix }).state
+    ensureSyntaxTree(after, Math.min(after.doc.length, line.to + 2000), 200)
+    const item = alphaItemAt(after, line.number)
+    const more = item ? renumberAfter(after, item.node, nextLetter(next)) : []
+    const first = state.changes(fix)
+    const rest = after.changes(more)
+    return { changes: first.compose(rest), selection: { anchor: head + delta } }
+  }
+  return null
+}
+
 // 範囲の中の英字の項目（見た目とぶら下げ字下げに使う）。
 export function alphaItemsIn(state, from = 0, to = state.doc.length) {
   const out = []
-  if (state.doc.lines > 20000) return out
-  const last = state.doc.lineAt(to).number
-  for (let n = state.doc.lineAt(from).number; n <= last; n++) {
-    const item = alphaItemAt(state, n)
-    if (item) out.push(item)
-  }
+  syntaxTree(state).iterate({
+    from,
+    to,
+    enter(node) {
+      if (node.name === 'AlphaMark') out.push(itemFromMark(state, node.node))
+      return undefined
+    },
+  })
   return out
 }

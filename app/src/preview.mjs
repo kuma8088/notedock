@@ -377,7 +377,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
   })
 
   addIndentGuides(state, add)
-  // 「a. 」「b. 」の英字の項目（alpha-list.mjs）。木には項目として出てこないので、行を見て番号と同じ色にする。
+  // 「a. 」「b. 」の英字の項目（alpha-list.mjs）。記号を番号と同じ色にし、字下げの線を付ける。
   for (const item of alphaItemsIn(state)) {
     add(item.markFrom, item.markTo, Decoration.mark({ class: 'cm-list-number' }))
     if (item.indent) add(item.line.from + item.quote.length, item.markFrom, Decoration.mark({ class: 'cm-indent-guide' }))
@@ -439,10 +439,11 @@ export function headingPlace(state, pos) {
 }
 
 // 箇条書き・番号付きの入れ子の深さ（いちばん外が1）。番号付きの下の箇条書きも1段深く数える（HTML の ol の中の ul と同じ）。
+// 英字の項目（「a. 」、alpha-list.mjs）は入れ物の木を持たないので、項目そのものを1段と数える。
 function listDepth(item) {
   let depth = 0
   for (let node = item?.parent; node; node = node.parent) {
-    if (node.name === 'BulletList' || node.name === 'OrderedList') depth += 1
+    if (node.name === 'BulletList' || node.name === 'OrderedList' || node.name === 'AlphaItem') depth += 1
   }
   return depth
 }

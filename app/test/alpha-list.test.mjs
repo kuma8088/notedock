@@ -126,3 +126,111 @@ test('記号は番号と同じ色にし、ぶら下げ字下げの対象にも�
   const starts = listItemStarts(make('> a. りんご\n本文'))
   assert.deepEqual(starts, [{ line: 0, indent: 2, lead: 2, text: 5 }])
 })
+
+
+// ここから：「a. 」の項目の下の子（2026-11-23 の本人の書き方に子を足した形）。
+import { foldable, syntaxTree, ensureSyntaxTree, foldEffect } from '@codemirror/language'
+import { insertNewlineContinueMarkup } from '@codemirror/lang-markdown'
+import { alphaChildEnter } from '../src/alpha-list.mjs'
+import { listMarkerFold } from '../src/folds.mjs'
+
+const NOTE = '1. aaa\n\t1. 1111\n\t\ta. aaaa\n'
+const nodeOnLine = (state, lineNumber, name) => {
+  const line = state.doc.line(lineNumber)
+  let found = null
+  syntaxTree(state).iterate({ from: line.from, to: line.to, enter(node) { if (!found && node.name === name && node.from >= line.from && node.from <= line.to) found = node.node } })
+  return found
+}
+// 本人の Enter の順番（main.mjs の editorKeys と同じ）。
+const enterChain = (target) => alphaListEnter(target) || alphaChildEnter(target) || insertNewlineContinueMarkup(target)
+
+test('「a. 」の下に Tab で入れた「- 」は箇条書き、「1. 」は番号付きとして読む', () => {
+  const bullet = make(NOTE + '\t\t\t- child\n')
+  assert.equal(nodeOnLine(bullet, 4, 'ListItem')?.parent.name, 'BulletList')
+  assert.equal(nodeOnLine(bullet, 4, 'ListItem')?.parent.parent.name, 'AlphaItem')
+  assert.ok(isItem(NOTE + '\t\t\t- child\n', 3), '「a. 」の項目のまま')
+  const ordered = make(NOTE + '\t\t\t1. child\n')
+  assert.equal(nodeOnLine(ordered, 4, 'ListItem')?.parent.name, 'OrderedList')
+})
+
+test('「a. 」の下の子の記号は箇条書きの記号（段は1つ深い）、番号は番号の色になり、ぶら下げ字下げの対象にもなる', () => {
+  const state = make(NOTE + '\t\t\t- child\n\t\t\t1. n\n')
+  const bullets = []
+  const numbers = []
+  buildDecorations(state, { mode: 'reading' }).between(0, state.doc.length, (from, to, deco) => {
+    if (deco.spec.widget?.level) bullets.push([state.doc.lineAt(from).number, deco.spec.widget.level])
+    if (deco.spec.class === 'cm-list-number') numbers.push(state.doc.sliceString(from, to))
+  })
+  assert.deepEqual(bullets, [[4, 4]], '1. → 1. → a. の下なので4段目（英字の項目も1段と数える）')
+  assert.deepEqual(numbers, ['1.', '1.', 'a.', '1.'])
+  assert.deepEqual(listItemStarts(state).map((item) => state.doc.lineAt(item.line).number), [1, 2, 3, 4, 5])
+})
+
+test('子のある「a. 」の項目はたためる。記号を押すと開閉する', () => {
+  const state = make(NOTE + '\t\t\t- child\n')
+  const line = state.doc.line(3)
+  const range = foldable(state, line.from, line.to)
+  assert.ok(range, 'たためる')
+  assert.equal(state.doc.sliceString(range.from, range.to), '\n\t\t\t- child')
+  const mark = alphaItemAt(state, 3).markFrom
+  assert.ok(listMarkerFold(state, mark)?.is(foldEffect))
+  assert.equal(listMarkerFold(make(NOTE), make(NOTE).doc.line(3).from + 2), null, '子がなければ何もしない')
+})
+
+test('「a. 」の下の子で Enter：同じ字下げで次の子が続く', () => {
+  const run2 = (text) => run(enterChain, text).text
+  assert.equal(run2(NOTE + '\t\t\t- child|'), NOTE + '\t\t\t- child\n\t\t\t- |')
+  assert.equal(run2(NOTE + '\t\t\t1. child|'), NOTE + '\t\t\t1. child\n\t\t\t2. |')
+  assert.equal(run2('a. x\n\t- c|'), 'a. x\n\t- c\n\t- |')
+  assert.equal(run2('> a. x\n>     - c|'), '> a. x\n>     - c\n>     - |', '引用の中')
+  // 字下げ・引用の扱いは、「a. 」を「1. 」にした文書での標準の Enter と同じ。
+  for (const text of ['a. x\n\t- c|', '> a. x\n> \t- c|', 'a. x\n\t- c\n\t\t- d|', 'a. x\n\t1. p|\n\t2. q', NOTE + '\t\t\t- child|']) {
+    assert.equal(run2(text).replace(/(^|\n)([\t >]*)[a-z]\. /g, '$1$21. '), run(insertNewlineContinueMarkup, text.replace(/(^|\n)([\t >]*)[a-z]\. /g, '$1$21. ')).text, text)
+  }
+  assert.equal(run2('a. x\n\t- c\n\t\t- d|'), 'a. x\n\t- c\n\t\t- d\n\t\t- |')
+  assert.equal(run2('a. x\n\t1. p|\n\t2. q'), 'a. x\n\t1. p\n\t2. |\n\t3. q', '後ろの番号を振り直す')
+})
+
+test('「a. 」の下の空の子で Enter すると、「a. 」と同じ段の次の文字の項目になる（番号付きの下の空の子と同じ動き）', () => {
+  assert.equal(run(enterChain, 'a. x\n\t- |').text, 'a. x\nb. |')
+  assert.equal(run(enterChain, NOTE + '\t\t\t- |').text, NOTE + '\t\tb. |')
+  assert.equal(run(enterChain, 'a. x\n\t- |\nb. y').text, 'a. x\nb. |\nc. y', '後ろの文字を振り直す')
+  // 番号付きの下では同じ形で「2. 」になる。
+  assert.equal(run(insertNewlineContinueMarkup, '1. x\n\t- |').text, '1. x\n2. |')
+})
+
+test('「a. 」の項目そのものの Enter は今までどおり（英字の Enter が先に動く）', () => {
+  assert.equal(run(enterChain, NOTE.trimEnd() + '|').text, NOTE + '\t\tb. |')
+  assert.equal(run(alphaChildEnter, 'a. x|').handled, false)
+  assert.equal(run(alphaChildEnter, '- x|').handled, false, '英字の項目の下でなければ標準の Enter に任せる')
+})
+
+test('分かっている限界：「a. 」と「b. 」の間に空行を足しても、すぐには「b. 」がただの文に戻らない（その行を書き換えると戻る）', () => {
+  // 読み取りは書き換えた所の近くだけを読み直し、離れた所は前の結果を使う。「b. 」が項目かどうかは上の行で決まるので、
+  // 上だけを書き換えると前の結果が残る。保存されるファイルは変わらず、見た目と Enter の続け方だけの違い。
+  const before = make('a. x\nb. y\n')
+  ensureSyntaxTree(before, before.doc.length, 1e9)
+  const after = before.update({ changes: { from: 4, insert: '\n' } }).state
+  assert.ok(alphaItemAt(after, 3), '前の結果が残る')
+  assert.ok(!alphaItemAt(make(after.doc.toString()), 3), '最初から読むとただの文')
+})
+
+test('書き換えたあとの読み方は、最初から読んだときと同じ（途中から読み直しても食い違わない）', () => {
+  const edits = [
+    ['a. x\nb. y\nc. z\n', { from: 0, to: 1, insert: 'q' }],
+    ['本文\n\na. x\n\t- c\nb. y\n', { from: 0, insert: '前\n' }],
+    [NOTE + '\t\t\t- child\n', { from: NOTE.length - 1, insert: '\n\t\t\t- c0' }],
+  ]
+  const dump = (state) => {
+    ensureSyntaxTree(state, state.doc.length, 1e9)
+    const out = []
+    syntaxTree(state).iterate({ enter: (n) => { out.push(`${n.name}:${n.from}-${n.to}`) } })
+    return out.join(' ')
+  }
+  for (const [doc, change] of edits) {
+    const before = make(doc)
+    ensureSyntaxTree(before, before.doc.length, 1e9)
+    const after = before.update({ changes: change }).state
+    assert.equal(dump(after), dump(make(after.doc.toString())), JSON.stringify([doc, change]))
+  }
+})
