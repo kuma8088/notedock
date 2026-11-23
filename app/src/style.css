@@ -929,6 +929,9 @@ a.cm-link-missing {
 .cm-props-key:focus,
 .cm-props-value:focus { border-color: var(--accent); outline: none; background: var(--surface); }
 input[type='checkbox'].cm-props-value { justify-self: start; accent-color: var(--accent); }
+/* タスクのノートのステータス。ほかの欄と同じく、ふだんは枠なしで、触れたときだけ枠を出す。 */
+select.cm-props-select { justify-self: start; max-width: 100%; font: inherit; cursor: pointer; padding: 2px 4px; }
+select.cm-props-select:disabled { cursor: default; opacity: 1; }
 .cm-props-note { margin: 4px; }
 
 .cm-panels { background: var(--surface) !important; color: var(--text) !important; border-color: var(--line) !important; font-family: var(--ui); font-size: 12.5px; }

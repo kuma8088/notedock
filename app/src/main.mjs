@@ -44,6 +44,7 @@ import { createConnectionWatch, createVersionWatch } from './connection.mjs'
 import { linesFrom, selectedLines } from './lines.mjs'
 import { applyMention, headingTarget, mentionCandidates, mentionQuery, sectionsOf, unwritableCount } from './mention.mjs'
 import { beginTableCell, showMenu } from './widgets.mjs'
+import { isTaskNote } from './tasks.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -2028,6 +2029,8 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   if (view) view.setState(state)
   else view = new EditorView({ state, parent: $('editor') })
   applyMode(nextMode)
+  // タスクのノートは、開いたらすぐステータスや期日を直せるように、プロパティ欄を開いておく。
+  if (isTaskNote(note.text)) view.dispatch({ effects: togglePropsPanel.of(true) })
   renderCrumbs(path)
   $('copy-path').disabled = false
   document.title = path.split('/').at(-1).replace(/\.md$/i, '')

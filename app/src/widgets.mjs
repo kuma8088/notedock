@@ -18,6 +18,7 @@ import {
   setAlign,
   sortRows,
 } from './table-model.mjs'
+import { TASK_QUICK_KEYS, isTaskItems, statusOptions, taskFieldKind } from './tasks.mjs'
 import { deleteProperty, parseFrontmatter, renameProperty, setProperty } from './yaml-lite.mjs'
 
 const CALLOUT_LABEL = {
@@ -812,14 +813,17 @@ export class TableWidget extends WidgetType {
 }
 
 export class FrontmatterWidget extends WidgetType {
-  constructor(source, open, pos) {
+  // noteEditable: ノートそのものが編集できるか（閲覧の表示かどうかとは別）。locked: 閲覧の表示か、読み取り専用か。
+  constructor(source, open, pos, { noteEditable = false, locked = false } = {}) {
     super()
     this.source = source
     this.open = open
     this.pos = pos
+    this.noteEditable = noteEditable
+    this.locked = locked
   }
   eq(other) {
-    return other.source === this.source && other.open === this.open
+    return other.source === this.source && other.open === this.open && other.noteEditable === this.noteEditable && other.locked === this.locked
   }
   toDOM(view) {
     const { items, simple } = parseFrontmatter(this.source)
@@ -832,10 +836,16 @@ export class FrontmatterWidget extends WidgetType {
     if (!this.open) return wrap
     const apply = (next) => replaceBlock(view, wrap, this.source, next)
     const editable = view.state.facet(EditorView.editable)
+    // タスクのノートは、閲覧の表示のままでもステータス・開始日・期日だけは直せる。
+    const task = isTaskItems(items)
+    const quick = task && simple && this.noteEditable
     if (!simple) {
       wrap.append(element('p', { class: 'cm-props-note' }, ['入れ子などがあるので、文字のまま編集します。']))
     }
-    for (const item of items) wrap.append(this.row(view, item, simple && editable, apply))
+    for (const item of items) {
+      const full = simple && editable
+      wrap.append(this.row(view, item, full, apply, { task, valueEditable: full || (quick && TASK_QUICK_KEYS.includes(item.key)) }))
+    }
     if (simple && editable) {
       const add = element('button', { type: 'button', class: 'cm-props-add' }, ['＋ 項目を追加'])
       add.addEventListener('click', async () => {
@@ -853,18 +863,18 @@ export class FrontmatterWidget extends WidgetType {
     wrap.append(source)
     return wrap
   }
-  row(view, item, editable, apply) {
+  row(view, item, editable, apply, { task = false, valueEditable = editable } = {}) {
     const row = element('div', { class: 'cm-props-row' })
     const name = element('input', { class: 'cm-props-key', value: item.key, 'aria-label': '項目の名前' })
     name.disabled = !editable
     name.addEventListener('change', () => apply(renameProperty(this.source, item.key, name.value)))
-    row.append(name, this.valueInput(item, editable, apply))
+    row.append(name, this.valueInput(item, valueEditable, apply, task))
     if (editable) {
       const remove = element('button', { type: 'button', class: 'cm-props-del', 'aria-label': '項目を削除' }, ['×'])
       remove.addEventListener('click', () => apply(deleteProperty(this.source, item.key)))
       row.append(remove)
     }
-    for (const input of row.querySelectorAll('input')) {
+    for (const input of row.querySelectorAll('input, select')) {
       watchTyping(input)
       // ブラウザーが補正した値もあるので、属性ではなく今の値と比べる。
       const initial = input.value
@@ -888,12 +898,24 @@ export class FrontmatterWidget extends WidgetType {
     }
     return row
   }
-  valueInput(item, editable, apply) {
+  valueInput(item, editable, apply, task = false) {
     let input
     const commit = (value) => {
       if (JSON.stringify(value) !== JSON.stringify(item.value)) apply(setProperty(this.source, item.key, value))
     }
-    if (item.type === 'checkbox') {
+    const kind = task ? taskFieldKind(item.key, item.value) : null
+    if (kind === 'status') {
+      input = element('select', { class: 'cm-props-value cm-props-select', 'aria-label': item.key })
+      for (const value of statusOptions(item.value)) {
+        const option = element('option', { value }, [value === '' ? '（未設定）' : value])
+        if (value === item.value) option.selected = true
+        input.append(option)
+      }
+      input.addEventListener('change', () => commit(input.value))
+    } else if (kind === 'date' || kind === 'text') {
+      input = element('input', { type: kind, class: 'cm-props-value', value: item.value, 'aria-label': item.key })
+      input.addEventListener('change', () => commit(input.value))
+    } else if (item.type === 'checkbox') {
       input = element('input', { type: 'checkbox', class: 'cm-props-value', 'aria-label': item.key })
       input.checked = item.value === 'true'
       input.addEventListener('change', () => commit(String(input.checked)))

@@ -111,7 +111,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
             return false
           }
           const text = doc.sliceString(from, to)
-          add(from, to, Decoration.replace({ widget: new FrontmatterWidget(text, propsOpen, from), block: true }))
+          add(from, to, Decoration.replace({ widget: new FrontmatterWidget(text, propsOpen, from, { noteEditable: ctx.editable === true, locked }), block: true }))
           return false
         }
         case 'ATXHeading1':

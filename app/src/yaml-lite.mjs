@@ -4,10 +4,16 @@ const KEY = /^([^\s:#][^:]*?):(?:\s+(.*)|\s*)$/
 const LIST_ITEM = /^\s*-\s+(.*)$/
 const COMPLEX = /^[|>{[]|^&|^\*/
 
+// 二重引用符のときだけ、書くときに付けた \" と \\ を戻す（quoteIfNeeded と往復させる）。単引用符はそのまま。
 function unquote(value) {
   const match = value.match(/^(["'])(.*)\1$/)
-  return match ? match[2] : value
+  if (!match) return value
+  return match[1] === '"' ? match[2].replace(/\\(["\\])/g, '$1') : match[2]
 }
+
+// 引用符なしで書かれたリンク（goal: [[…]]）を、リストではなくリンクとして読む項目。
+const LINK_KEYS = new Set(['goal', 'parent'])
+const BARE_LINK = /^\[\[[^\[\]]+\]\]$/
 
 export function inferType(key, value) {
   if (Array.isArray(value)) return key.toLowerCase() === 'tags' ? 'tags' : 'list'
@@ -52,6 +58,12 @@ export function parseFrontmatter(source) {
       const value = values.length > 0 ? values : ''
       items.push({ key, value, type: inferType(key, value), start: i, end })
       i = end
+      continue
+    }
+    if (LINK_KEYS.has(key.toLowerCase()) && BARE_LINK.test(raw)) {
+      items.push({ key, value: raw, type: 'text', start: i, end: i + 1, quoted: false })
+      i += 1
+      if (i < lines.length - 1 && /^\s+\S/.test(lines[i]) && !LIST_ITEM.test(lines[i])) simple = false
       continue
     }
     if (COMPLEX.test(raw)) {
