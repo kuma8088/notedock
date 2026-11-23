@@ -291,6 +291,24 @@ test('プロパティ欄：ノートが編集できるか・表示・動かし�
   assert.equal(widgetsOf(back, FrontmatterWidget)[0].eq(reading), true)
 })
 
+test('読み取り専用でも、historyStep で履歴を1つ戻して進められる（@codemirror/commands の内部の pop に頼っている）', async () => {
+  const { EditorView } = await import('@codemirror/view')
+  const { history, undo } = await import('@codemirror/commands')
+  const { historyStep } = await import('../src/widgets.mjs')
+  // view の代わりに、state と dispatch だけを持つもの。
+  let state = EditorState.create({ doc: 'status: 未着手', extensions: [history(), EditorState.readOnly.of(true), EditorView.editable.of(false)] })
+  const view = { get state() { return state }, dispatch(tr) { state = tr.state ?? state.update(tr).state } }
+  view.dispatch(state.update({ changes: { from: 8, to: 11, insert: '進行中' } }))
+  assert.equal(state.doc.toString(), 'status: 進行中')
+  // ふつうの undo は readOnly で止まる。
+  assert.equal(undo(view), false)
+  assert.equal(historyStep(view, 0), true)
+  assert.equal(state.doc.toString(), 'status: 未着手')
+  assert.equal(historyStep(view, 1), true)
+  assert.equal(state.doc.toString(), 'status: 進行中')
+  assert.equal(historyStep(view, 1), false)
+})
+
 test('閉じていないYAMLや数式の枠があっても、その先の文書を読める', () => {
   const headingAfter = (text) => {
     const names = []

@@ -475,13 +475,16 @@ function stepsOf(view) {
 
 function recordPropsChange(view) {
   const steps = stepsOf(view)
-  steps.done.push({ doc: view.state.doc, depth: undoDepth(view.state) })
+  const depth = undoDepth(view.state)
+  // 別のノートに切り替えたあと（同じ view を使い回す）などで残った、今の履歴より深いものは捨てる。
+  steps.done = steps.done.filter((entry) => entry.depth < depth)
+  steps.done.push({ doc: view.state.doc, depth })
   steps.undone.length = 0
 }
 
 // readOnly を見ずに、履歴を1つ戻す（進める）。@codemirror/commands の undo/redo は readOnly のとき何もしないため、
 // 同じ中身（historyField の pop を取り出して dispatch する）を、ここだけで行う。
-function historyStep(view, side) {
+export function historyStep(view, side) {
   const history = view.state.field(historyField, false)
   if (typeof history?.pop !== 'function') return false
   const tr = history.pop(side, view.state, false)
@@ -967,6 +970,11 @@ export class FrontmatterWidget extends WidgetType {
         const kind = view.state.readOnly ? historyKey(event) : null
         if (kind) {
           event.preventDefault()
+          // まだ確定していない打ちかけ（日付の欄）があれば、まずそれを元の値に戻すだけにする。
+          if (kind === 'undo' && input.value !== initial) {
+            input.value = initial
+            return
+          }
           const key = input.getAttribute('aria-label')
           if (runPropsHistory(view, kind)) focusPropsField(view, key)
           else showMessage(kind === 'undo' ? '閲覧の表示では、この欄から直した分だけ戻せます。ほかの変更は、編集に切り替えてから戻してください。' : 'やり直せる変更がありません。')
@@ -1008,7 +1016,9 @@ export class FrontmatterWidget extends WidgetType {
       const step = (event) => {
         const next = dateFieldStep(state, event)
         state = { typed: next.typed, pending: next.pending }
-        if (next.commit) commit(input.value)
+        // Enter やカレンダーで確定したときは、作り直した欄にフォーカスを戻す（続けて Cmd+Z で戻せるように）。
+        // 欄を離れた（blur）ときは、行き先からフォーカスを奪わない。
+        if (next.commit) commit(input.value, event.type !== 'blur')
       }
       input.addEventListener('keydown', (event) => step({ type: 'keydown', key: event.key, composing: event.isComposing }))
       input.addEventListener('change', () => step({ type: 'change', focused: input.matches(':focus') }))

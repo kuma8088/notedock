@@ -97,6 +97,13 @@ test('題名はいつも二重引用符で書き、読み直すと同じ文字�
   }
 })
 
+test('項目の名前は小文字だけを対象にする（Type・Status などは対象外）', () => {
+  assert.equal(isTaskNote('---\nType: task\n---\n'), false)
+  assert.equal(taskFieldKind('Status', '未着手'), null)
+  assert.equal(taskFieldKind('DUE', '2026-11-30'), null)
+  assert.equal(readTaskProps('---\ntype: task\nStatus: 完了\n---\n').status, '')
+})
+
 test('プロパティ欄の1行を直せるか', () => {
   const base = { key: 'status', task: true, simple: true, noteEditable: true, viewEditable: true, busy: false }
   // 編集の表示：すべて直せる。
