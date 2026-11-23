@@ -45,6 +45,8 @@ import { linesFrom, selectedLines } from './lines.mjs'
 import { applyMention, headingTarget, mentionCandidates, mentionQuery, sectionsOf, unwritableCount } from './mention.mjs'
 import { beginTableCell, showMenu } from './widgets.mjs'
 import { isTaskNote } from './tasks.mjs'
+import { dailyDateOf } from './task-buckets.mjs'
+import { createTaskPanel } from './task-panel.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -2076,6 +2078,7 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   if (restored && saver.isStopped() !== 'conflict') {
     showMessage('前回保存できなかった入力を戻して保存します。いらないときは、右上の「履歴」から前の内容に戻せます。')
   }
+  refreshTaskPanel()
   return undefined
 }
 
@@ -2637,12 +2640,65 @@ async function openPeriodicNote(period, date, { ask = false, from = 'sidebar', m
   }
 }
 
+// 右の枠はカレンダーを描かない（periodicState が null のまま）ので、日付のノートの置き場だけを別に問い合わせて覚える。
+let rightPeriodicRoot = null
+
+async function loadRightPeriodicRoot() {
+  try {
+    const result = await request(`/api/periodic?month=${todayText().slice(0, 7)}`)
+    rightPeriodicRoot = result.ok && typeof result.data?.periodicRoot === 'string' ? result.data.periodicRoot : null
+  } catch {
+    // 問い合わせられないときは、次のきっかけでもう一度試す。
+  }
+}
+
 // 開いているノートが <periodicRoot>/<年>/Daily/YYYY-MM-DD.md の形なら、その日付。
 function openDateOf(path = currentPath) {
-  const root = periodicState?.periodicRoot
-  if (!root || !path) return null
-  const match = path.match(/^(.*)\/(\d{4})\/Daily\/(\d{4}-\d{2}-\d{2})\.md$/)
-  return match && match[1] === root && match[3].startsWith(match[2]) ? match[3] : null
+  return dailyDateOf(path, periodicState?.periodicRoot ?? (PANE === 'right' ? rightPeriodicRoot : null))
+}
+
+// ---- デイリーノートの上のタスクのパネル（読み取りだけ） ----
+
+const taskPanel = createTaskPanel({
+  box: $('task-panel'),
+  store: storage,
+  keyOf: (name) => `${name}:${vaultName}`,
+  onOpen: (path, event) => {
+    const newTab = event.metaKey || event.ctrlKey
+    if (newTab && PANE === 'right') return toLeft({ type: MSG.OPEN, path })
+    if (newTab) return openIn(targetPane({ meta: true, from: 'left', active: activePane() }), path)
+    return openNote(path)
+  },
+})
+let taskPanelRequest = 0
+
+// 開いているのがデイリーノートなら、タスクの一覧を問い合わせて描く。そうでなければ隠す。
+// 呼ぶきっかけ：ノートを開いたとき、60秒ごと、画面に戻ってきたとき。
+async function refreshTaskPanel() {
+  const mine = ++taskPanelRequest
+  const path = currentPath
+  let date = openDateOf(path)
+  if (!date && PANE === 'right' && path && rightPeriodicRoot === null) {
+    await loadRightPeriodicRoot()
+    if (mine !== taskPanelRequest) return
+    date = openDateOf(path)
+  }
+  if (!date) {
+    taskPanel.hide()
+    return
+  }
+  // 別のデイリーノートへ移ったときは、まず手元の一覧でその日から数え直して出す。
+  const previous = taskPanel.last()
+  if (previous && previous.date !== date) taskPanel.show({ tasks: previous.tasks, date })
+  let result
+  try {
+    result = await request('/api/tasks')
+  } catch {
+    return
+  }
+  if (mine !== taskPanelRequest || path !== currentPath) return
+  if (!result.ok || !Array.isArray(result.data?.tasks)) return
+  taskPanel.show({ tasks: result.data.tasks, date })
 }
 
 async function drawCalendar() {
@@ -3408,7 +3464,15 @@ async function start() {
   setInterval(() => {
     refreshNotes()
     drawCalendar().catch(() => {})
+    refreshTaskPanel()
   }, 60_000)
+  watchTaskPanelVisibility()
+}
+
+function watchTaskPanelVisibility() {
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) refreshTaskPanel()
+  })
 }
 
 // 右の枠は ?note や ?today を見ず、案内も出さない。空のまま左に準備ができたと知らせ、開くノートを待つ。
@@ -3423,8 +3487,13 @@ async function startRight() {
       parent: $('editor'),
     })
   }
+  await loadRightPeriodicRoot()
   toLeft({ type: MSG.READY })
-  setInterval(refreshNotes, 60_000)
+  setInterval(() => {
+    refreshNotes()
+    refreshTaskPanel()
+  }, 60_000)
+  watchTaskPanelVisibility()
 }
 
 window.noteEditor = { getView: () => view, getSaver: () => saver }

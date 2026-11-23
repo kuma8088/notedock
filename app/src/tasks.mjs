@@ -5,6 +5,8 @@ import { parseFrontmatter, setProperty } from './yaml-lite.mjs'
 export const TASK_STATUSES = Object.freeze(['未着手', '進行中', '完了', '保留'])
 export const TASK_DEFAULT_STATUS = TASK_STATUSES[0]
 export const TASK_TYPE = 'task'
+// タスクのノートを置くフォルダー（Vault の直下）。この下（サブフォルダーを含む）の type: task だけを集める。
+export const TASK_FOLDER = 'Tasks'
 export const TASK_DATE_KEYS = Object.freeze(['start', 'due'])
 // 閲覧の表示のままでも直せる項目。
 export const TASK_QUICK_KEYS = Object.freeze(['status', ...TASK_DATE_KEYS])

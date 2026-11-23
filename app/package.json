@@ -8,7 +8,7 @@
     "build": "node build.mjs",
     "compile": "sh scripts/compile.sh",
     "test": "node --test test/*.test.mjs",
-    "test:tz": "for tz in UTC Asia/Tokyo America/Los_Angeles; do TZ=$tz node --test test/periodic.test.mjs test/calendar.test.mjs || exit 1; done",
+    "test:tz": "for tz in UTC Asia/Tokyo America/Los_Angeles; do TZ=$tz node --test test/periodic.test.mjs test/calendar.test.mjs test/task-buckets.test.mjs || exit 1; done",
     "start": "node server/main.mjs"
   },
   "dependencies": {

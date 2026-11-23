@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 
-function fingerprint(file) {
+export function fingerprint(file) {
   try {
     const stat = fs.statSync(file)
     return `${stat.ino}:${stat.size}:${stat.mtimeMs}`

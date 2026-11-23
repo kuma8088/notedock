@@ -11,6 +11,7 @@ import { createBackups } from './backups.mjs'
 import { createFolder, moveItem, planMove, trashItem } from './fileops.mjs'
 import { createNote, readNote, writeNote } from './notes.mjs'
 import { isHiddenFile } from './platform.mjs'
+import { createTaskIndex } from './tasks.mjs'
 import { openPeriodic, periodicMonth } from './periodic.mjs'
 import { replaceFile } from './durable.mjs'
 import { checkVaultSettings, readVaultSettings } from './vault-settings.mjs'
@@ -119,6 +120,8 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
   const baseScanOptions = { isHidden: (p) => isHiddenFile(p), ...scanLimits }
   const settings = () => readVaultSettings(vaultDir, root)
   const scanOptionsOf = (loaded) => ({ ...baseScanOptions, unlisted: loaded.unlisted })
+  // タスクのノートの一覧。求められたときに、変わったファイルだけ読み直す。
+  const taskIndex = createTaskIndex(root, { isHidden: (p) => isHiddenFile(p) })
   let notesCache = null
   let notesCachedAt = 0
   let notesCacheKey = ''
@@ -526,6 +529,8 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
       }
       case 'GET /api/notes':
         return send(res, 200, notes())
+      case 'GET /api/tasks':
+        return send(res, 200, taskIndex.list())
       case 'GET /api/events':
         return events(req, res, rel)
       case 'GET /api/file': {
