@@ -912,8 +912,28 @@ export class FrontmatterWidget extends WidgetType {
         input.append(option)
       }
       input.addEventListener('change', () => commit(input.value))
-    } else if (kind === 'date' || kind === 'text') {
-      input = element('input', { type: kind, class: 'cm-props-value', value: item.value, 'aria-label': item.key })
+    } else if (kind === 'date') {
+      input = element('input', { type: 'date', class: 'cm-props-value', value: item.value, 'aria-label': item.key })
+      // 日付の欄は、キーで打っている途中でも日付として成り立つと change が来る（年の1桁目で 0002 になる）。
+      // キーで打ったときは、欄を離れるか Enter で確定する。カレンダーから選んだときは、すぐ確定する。
+      let typed = false
+      let pending = false
+      const flush = () => {
+        if (pending) commit(input.value)
+        pending = false
+        typed = false
+      }
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') flush()
+        else if (!event.isComposing && event.key !== 'Tab') typed = true
+      })
+      input.addEventListener('change', () => {
+        if (typed && input.matches(':focus')) pending = true
+        else commit(input.value)
+      })
+      input.addEventListener('blur', flush)
+    } else if (kind === 'text') {
+      input = element('input', { type: 'text', class: 'cm-props-value', value: item.value, 'aria-label': item.key })
       input.addEventListener('change', () => commit(input.value))
     } else if (item.type === 'checkbox') {
       input = element('input', { type: 'checkbox', class: 'cm-props-value', 'aria-label': item.key })
