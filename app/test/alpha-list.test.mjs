@@ -250,6 +250,14 @@ test('子の間に空行があっても、次の「b. 」は子の段落に吸�
   assert.equal(item.node.parent.name, 'Document')
 })
 
+test('同じ段の英字の行をさかのぼるのは25行まで（a〜z は26個なので足りる）。長い「e. g.」の並びで重くならない', () => {
+  const az = 'abcdefghijklmnopqrstuvwxyz'.split('').map((c) => `${c}. ${c}`).join('\n')
+  assert.ok(isItem(az, 26), 'z は a から25行上')
+  const eg = 'a. x\n' + Array.from({ length: 40 }, () => 'e. g. y').join('\n')
+  assert.ok(isItem(eg, 26), 'a から25行下まで')
+  assert.ok(!isItem(eg, 27), '26行目からは a まで届かない')
+})
+
 test('z の下の空の子で Enter しても「{. 」を書かない（z の次は続けない）', () => {
   const lines = 'abcdefghijklmnopqrstuvwxyz'.split('').map((c) => `${c}. ${c}`).join('\n')
   assert.equal(run(enterChain, lines + '\n\t- |').text, lines + '\n|')

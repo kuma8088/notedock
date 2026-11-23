@@ -63,8 +63,12 @@ function* linesAbove(cx) {
   }
 }
 
+// 同じ段の英字の行は、25行までさかのぼる（a〜z は26個なので、z からでも a に届く）。
+// 上限がないと、「e. g. 」で始まる行が大量に続く形で、行ごとに上まで戻り、開くときの読み取りが行数の2乗で重くなる。
+const SAME_LEVEL_LIMIT = 25
 function mayContinue(cx, line) {
   const me = parseLine(line.text)
+  let sameLevel = 0
   for (const text of linesAbove(cx)) {
     const other = parseLine(text)
     if (other.rest.trim() === '') continue
@@ -74,6 +78,7 @@ function mayContinue(cx, line) {
       const mark = other.rest.match(ALPHA_MARK)
       if (!mark) return false
       if (mark[1] === 'a') return true
+      if (++sameLevel >= SAME_LEVEL_LIMIT) return false
       continue
     }
     return LIST_MARK.test(other.rest)
