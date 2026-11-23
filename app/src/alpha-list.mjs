@@ -150,11 +150,12 @@ function itemFromMark(state, mark) {
 }
 
 // その行が英字の項目なら、記号と本文の位置を返す。そうでなければ null。
-export function alphaItemAt(state, lineNumber) {
+// tree を渡すと、その木で見る（読み進めたばかりで、まだ状態に入っていない木）。
+export function alphaItemAt(state, lineNumber, tree = syntaxTree(state)) {
   const line = state.doc.line(lineNumber)
   if (!/[a-z]\./.test(line.text)) return null
   let mark = null
-  syntaxTree(state).iterate({
+  tree.iterate({
     from: line.from,
     to: line.to,
     enter(node) {
@@ -221,8 +222,11 @@ export function alphaChildEnter({ state, dispatch }) {
     }
   }
   if (!inner || inner.name !== 'ListItem' || !marks.length) return false
-  const swap = state.update({ changes: marks.map((mark) => ({ from: mark.from, to: mark.to, insert: '1.' })) }).state
-  ensureSyntaxTree(swap, Math.min(swap.doc.length, swap.doc.lineAt(main.head).to + 2000), 200)
+  let swap = state.update({ changes: marks.map((mark) => ({ from: mark.from, to: mark.to, insert: '1.' })) }).state
+  // 写しを読み切れないとき（時間切れ）は、標準の Enter に任せる（字下げが崩れることはあっても、項目を書き換えはしない）。
+  if (!ensureSyntaxTree(swap, Math.min(swap.doc.length, swap.doc.lineAt(main.head).to + 2000), 200)) return false
+  // 読み進めた木を状態に入れる（標準の Enter は状態の木を見る）。
+  swap = swap.update({}).state
   let result = null
   if (!insertNewlineContinueMarkup({ state: swap, dispatch: (tr) => { result = tr } }) || !result) return false
   let overlaps = false
@@ -251,14 +255,20 @@ function asAlphaSibling(state, changes, marks) {
     if (columnsOf(text.slice(0, prefix.length), state.tabSize) !== columnsOf(prefix, state.tabSize)) continue
     const letter = state.doc.sliceString(from, from + 1)
     const at = line.from + prefix.length
+    // z の次は続けず、記号を消して同じ字下げの普通の行にする（英字の項目の Enter と同じ）。
+    if (letter === 'z') {
+      const cut = match[0].length
+      return { changes: state.changes([{ from: at, to: at + cut }]), selection: { anchor: head - cut } }
+    }
     const next = nextLetter(letter)
     const insert = `${next}.`
     const fix = [{ from: at, to: at + match[1].length + 1, insert }]
     const delta = insert.length - (match[1].length + 1)
     // 後ろの英字の項目（同じ段）の文字を振り直す。直したあとの文書で読み直して数える。
+    // 読み切れないとき（時間切れ）は、文字の付け替えだけにして振り直さない。
     const after = state.update({ changes: fix }).state
-    ensureSyntaxTree(after, Math.min(after.doc.length, line.to + 2000), 200)
-    const item = alphaItemAt(after, line.number)
+    const tree = ensureSyntaxTree(after, Math.min(after.doc.length, line.to + 2000), 200)
+    const item = tree ? alphaItemAt(after, line.number, tree) : null
     const more = item ? renumberAfter(after, item.node, nextLetter(next)) : []
     const first = state.changes(fix)
     const rest = after.changes(more)

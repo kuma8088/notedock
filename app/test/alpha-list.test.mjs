@@ -250,6 +250,11 @@ test('子の間に空行があっても、次の「b. 」は子の段落に吸�
   assert.equal(item.node.parent.name, 'Document')
 })
 
+test('z の下の空の子で Enter しても「{. 」を書かない（z の次は続けない）', () => {
+  const lines = 'abcdefghijklmnopqrstuvwxyz'.split('').map((c) => `${c}. ${c}`).join('\n')
+  assert.equal(run(enterChain, lines + '\n\t- |').text, lines + '\n|')
+})
+
 test('「b. 」の上の子が長く（2万文字より多く）続いても、上の「a. 」を見つける', () => {
   const kids = Array.from({ length: 300 }, () => '\t- ' + 'あ'.repeat(80)).join('\n')
   const doc = 'a. x\n' + kids + '\nb. y\n'
