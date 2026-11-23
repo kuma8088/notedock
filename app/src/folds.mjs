@@ -23,11 +23,14 @@ export function foldedLines(state) {
 
 // 箇条書き・番号・英字（「a. 」、alpha-list.mjs）の記号（pos はその記号の中の位置）を押したときの開閉。
 // その項目がたためるなら（左の三角と同じ foldable の判定。子の項目や続きの行があるとき）たたむ、
-// たたんであれば開く。記号でない所や、たためない項目では null を返し、今までどおりカーソルを置かせる。
+// たたんであれば開く。記号でない所や、たためない項目、カーソルがその行にあるときは null を返し、今までどおりカーソルを置かせる。
 export function listMarkerFold(state, pos) {
   const mark = syntaxTree(state).resolveInner(pos, 1)
   if (mark.name !== 'ListMark' && mark.name !== 'AlphaMark') return null
   const line = state.doc.lineAt(pos)
+  // 編集中は、カーソルがある行では開閉せず、カーソルを置かせる。「•」はその行では生の「-」に戻って押せないので、番号・英字もそろえる。
+  // 閲覧（書き換えできない表示）ではカーソルが見えず「•」も戻らないので、どの行でも開閉する。
+  if (!state.readOnly && state.selection.ranges.some((range) => state.doc.lineAt(range.head).number === line.number)) return null
   let open = null
   foldedRanges(state).between(line.from, line.to, (from, to) => {
     if (!open && state.doc.lineAt(from).number === line.number) open = { from, to }

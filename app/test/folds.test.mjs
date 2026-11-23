@@ -8,7 +8,8 @@ import { foldedLines, foldsChanged, listMarkerFold } from '../src/folds.mjs'
 import { noteMarkdown } from '../src/markdown-ext.mjs'
 
 const doc = '- 親\n\t- 子1\n\t- 子2\n- 次\n'
-const make = () => EditorState.create({ doc, extensions: [noteMarkdown(), codeFolding()] })
+// カーソルは最後の行（押す記号の行とは別の行）に置く。
+const make = () => EditorState.create({ doc, selection: { anchor: doc.length }, extensions: [noteMarkdown(), codeFolding()] })
 const foldFirst = (state) => {
   const line = state.doc.line(1)
   return state.update({ effects: foldEffect.of(foldable(state, line.from, line.to)) })
@@ -105,7 +106,7 @@ test('子のない項目の記号では何もしない（今までどおりカ�
 
 test('番号の項目でも同じ。番号の途中の位置でも項目として扱う', () => {
   const doc = '10. 親\n\t1. 子\n11. 次\n'
-  let state = EditorState.create({ doc, extensions: [noteMarkdown(), codeFolding()] })
+  let state = EditorState.create({ doc, selection: { anchor: doc.length }, extensions: [noteMarkdown(), codeFolding()] })
   const effect = listMarkerFold(state, 1)
   assert.ok(effect?.is(foldEffect))
   state = apply(state, effect)
@@ -114,7 +115,7 @@ test('番号の項目でも同じ。番号の途中の位置でも項目とし�
 
 test('記号ではない所（見出しや本文）では何もしない', () => {
   const doc = '# 見出し\n\n本文\n\n- 親\n\t- 子\n'
-  const state = EditorState.create({ doc, extensions: [noteMarkdown(), codeFolding()] })
+  const state = EditorState.create({ doc, selection: { anchor: doc.length }, extensions: [noteMarkdown(), codeFolding()] })
   assert.equal(listMarkerFold(state, 0), null)
   assert.equal(listMarkerFold(state, doc.indexOf('親')), null)
   assert.ok(listMarkerFold(state, doc.indexOf('- 親')))
@@ -122,6 +123,26 @@ test('記号ではない所（見出しや本文）では何もしない', () =>
 
 test('引用の中の項目でも開閉できる', () => {
   const doc = '> - 親\n> \t- 子\n'
-  const state = EditorState.create({ doc, extensions: [noteMarkdown(), codeFolding()] })
+  const state = EditorState.create({ doc, selection: { anchor: doc.length }, extensions: [noteMarkdown(), codeFolding()] })
   assert.ok(listMarkerFold(state, 2)?.is(foldEffect))
+})
+
+test('カーソルがある行の番号・記号を押したときは開閉せず、カーソルを置かせる（「•」がその行では「-」に戻るのと同じ）', () => {
+  const numbered = '1. 親\n\t1. 子\n2. 次\n'
+  const at = (anchor) => EditorState.create({ doc: numbered, selection: { anchor }, extensions: [noteMarkdown(), codeFolding()] })
+  assert.equal(listMarkerFold(at(4), 0), null, 'カーソルが同じ行（1行目の終わり）')
+  assert.ok(listMarkerFold(at(numbered.length), 0)?.is(foldEffect), 'カーソルが別の行')
+  const alpha = 'a. 親\n\t- 子\n'
+  const alphaAt = (anchor) => EditorState.create({ doc: alpha, selection: { anchor }, extensions: [noteMarkdown(), codeFolding()] })
+  assert.equal(listMarkerFold(alphaAt(2), 0), null, '「a. 」の行にカーソル')
+  assert.ok(listMarkerFold(alphaAt(alpha.length), 0)?.is(foldEffect), '「a. 」で、カーソルが別の行')
+  // たたんだあと、その行にカーソルがあるときも開かない（カーソルを置く）。
+  let folded = alphaAt(alpha.length)
+  folded = folded.update({ effects: listMarkerFold(folded, 0) }).state
+  assert.equal(listMarkerFold(folded.update({ selection: { anchor: 1 } }).state, 0), null)
+})
+
+test('閲覧（書き換えできない表示）では、カーソルの行でも開閉する', () => {
+  const state = EditorState.create({ doc: '1. 親\n\t1. 子\n', selection: { anchor: 1 }, extensions: [noteMarkdown(), codeFolding(), EditorState.readOnly.of(true)] })
+  assert.ok(listMarkerFold(state, 0)?.is(foldEffect))
 })
