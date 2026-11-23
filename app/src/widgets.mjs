@@ -473,13 +473,23 @@ function stepsOf(view) {
   return steps
 }
 
-function recordPropsChange(view) {
+// 覚えておく件数の上限。古いものから捨てる。
+const PROPS_STEPS_LIMIT = 50
+
+function clearSteps(steps) {
+  steps.done = []
+  steps.undone = []
+}
+
+// プロパティ欄から本文を変えた直後に呼ぶ。view は state と dispatch を持つもの（テストでは EditorView でなくてよい）。
+export function recordPropsChange(view) {
   const steps = stepsOf(view)
   const depth = undoDepth(view.state)
   // 別のノートに切り替えたあと（同じ view を使い回す）などで残った、今の履歴より深いものは捨てる。
   steps.done = steps.done.filter((entry) => entry.depth < depth)
   steps.done.push({ doc: view.state.doc, depth })
-  steps.undone.length = 0
+  if (steps.done.length > PROPS_STEPS_LIMIT) steps.done = steps.done.slice(-PROPS_STEPS_LIMIT)
+  steps.undone = []
 }
 
 // readOnly を見ずに、履歴を1つ戻す（進める）。@codemirror/commands の undo/redo は readOnly のとき何もしないため、
@@ -494,21 +504,36 @@ export function historyStep(view, side) {
 }
 
 // プロパティ欄の中の Cmd+Z / Shift+Cmd+Z（Windows は Ctrl）。読み取り専用のときに使う。戻せたら true。
-function runPropsHistory(view, kind) {
+// 照合に失敗したら（間にほかの変更があった、別のノートになったなど）、覚えていたものはもう使えないので空にする。
+export function runPropsHistory(view, kind) {
   const steps = stepsOf(view)
   const state = view.state
   if (kind === 'undo') {
     const last = steps.done.at(-1)
-    if (!last || undoDepth(state) !== last.depth || !state.doc.eq(last.doc) || !historyStep(view, 0)) return false
+    if (!last) return false
+    if (undoDepth(state) !== last.depth || !state.doc.eq(last.doc) || !historyStep(view, 0)) {
+      clearSteps(steps)
+      return false
+    }
     steps.done.pop()
-    steps.undone.push({ doc: view.state.doc, depth: redoDepth(view.state), redo: last })
+    steps.undone.push({ doc: view.state.doc, depth: redoDepth(view.state) })
+    if (steps.undone.length > PROPS_STEPS_LIMIT) steps.undone = steps.undone.slice(-PROPS_STEPS_LIMIT)
     return true
   }
   const last = steps.undone.at(-1)
-  if (!last || redoDepth(state) !== last.depth || !state.doc.eq(last.doc) || !historyStep(view, 1)) return false
+  if (!last) return false
+  if (redoDepth(state) !== last.depth || !state.doc.eq(last.doc) || !historyStep(view, 1)) {
+    clearSteps(steps)
+    return false
+  }
   steps.undone.pop()
   steps.done.push({ doc: view.state.doc, depth: undoDepth(view.state) })
   return true
+}
+
+// プロパティ欄で値を直したときの、新しいプロパティの文字。タスクのノートの title は、いつも二重引用符で書く。
+export function propsValueSource(source, key, value, task = false) {
+  return setProperty(source, key, value, { quote: task && key === 'title' })
 }
 
 // 作り直した欄に、同じ項目のフォーカスを戻す（続けて Cmd+Z を押せるように）。
@@ -998,7 +1023,7 @@ export class FrontmatterWidget extends WidgetType {
   valueInput(item, editable, apply, task = false) {
     let input
     const commit = (value, refocus = false) => {
-      if (JSON.stringify(value) !== JSON.stringify(item.value)) apply(setProperty(this.source, item.key, value), refocus ? item.key : null)
+      if (JSON.stringify(value) !== JSON.stringify(item.value)) apply(propsValueSource(this.source, item.key, value, task), refocus ? item.key : null)
     }
     const kind = task ? taskFieldKind(item.key, item.value) : null
     if (kind === 'status') {

@@ -309,6 +309,67 @@ test('読み取り専用でも、historyStep で履歴を1つ戻して進めら�
   assert.equal(historyStep(view, 1), false)
 })
 
+test('プロパティ欄の取り消しの記録：本文が変わったら断る、2回戻して2回進める、別の state なら断る', async () => {
+  const { history } = await import('@codemirror/commands')
+  const { recordPropsChange, runPropsHistory } = await import('../src/widgets.mjs')
+  const fresh = (doc) => EditorState.create({ doc, extensions: [history(), EditorState.readOnly.of(true)] })
+  const makeView = (doc) => {
+    const view = { state: fresh(doc), dispatch(tr) { view.state = tr.state ?? view.state.update(tr).state } }
+    return view
+  }
+  // 欄から直したときと同じく、履歴を区切って変える。
+  const { isolateHistory } = await import('@codemirror/commands')
+  const change = (view, from, to, insert) => {
+    view.dispatch(view.state.update({ changes: { from, to, insert }, annotations: isolateHistory.of('full') }))
+    recordPropsChange(view)
+  }
+  const text = (view) => view.state.doc.toString()
+
+  // 2回戻して2回進める。
+  const a = makeView('status: 未着手\ndue: 2026-11-30')
+  change(a, 8, 11, '進行中')
+  const at = text(a).indexOf('2026-11-30')
+  change(a, at, at + 10, '2026-12-05')
+  assert.equal(text(a), 'status: 進行中\ndue: 2026-12-05')
+  assert.equal(runPropsHistory(a, 'undo'), true)
+  assert.equal(text(a), 'status: 進行中\ndue: 2026-11-30')
+  assert.equal(runPropsHistory(a, 'undo'), true)
+  assert.equal(text(a), 'status: 未着手\ndue: 2026-11-30')
+  assert.equal(runPropsHistory(a, 'undo'), false)
+  assert.equal(runPropsHistory(a, 'redo'), true)
+  assert.equal(runPropsHistory(a, 'redo'), true)
+  assert.equal(text(a), 'status: 進行中\ndue: 2026-12-05')
+  assert.equal(runPropsHistory(a, 'redo'), false)
+
+  // 欄の変更のあとに本文を変えたら断る（その変更を巻き込まない）。断ったあとは覚えていたものを空にする。
+  const b = makeView('status: 未着手\n本文')
+  change(b, 8, 11, '完了')
+  b.dispatch(b.state.update({ changes: { from: b.state.doc.length, insert: 'を足す' }, annotations: isolateHistory.of('full') }))
+  assert.equal(runPropsHistory(b, 'undo'), false)
+  assert.equal(text(b), 'status: 完了\n本文を足す')
+  // 足した分を消して本文が元と同じ文字になっても、空にしたので戻さない。
+  b.dispatch(b.state.update({ changes: { from: b.state.doc.length - 3, to: b.state.doc.length } }))
+  assert.equal(runPropsHistory(b, 'undo'), false)
+  assert.equal(text(b), 'status: 完了\n本文')
+
+  // 別の state に入れ替えたら（ノートを開き直したなど）断る。
+  const c = makeView('status: 未着手')
+  change(c, 8, 11, '保留')
+  c.state = fresh('status: 保留')
+  assert.equal(runPropsHistory(c, 'undo'), false)
+  assert.equal(text(c), 'status: 保留')
+})
+
+test('プロパティ欄で直した値：タスクのノートの title だけ、いつも二重引用符で書く', async () => {
+  const { propsValueSource } = await import('../src/widgets.mjs')
+  const source = '---\ntitle: "x"\ntype: task\nstatus: 未着手\n---'
+  assert.equal(propsValueSource(source, 'title', 'yes', true), '---\ntitle: "yes"\ntype: task\nstatus: 未着手\n---')
+  assert.equal(propsValueSource(source, 'title', 'a"b', true), '---\ntitle: "a\\"b"\ntype: task\nstatus: 未着手\n---')
+  assert.equal(propsValueSource(source, 'status', '完了', true), '---\ntitle: "x"\ntype: task\nstatus: 完了\n---')
+  // タスクでないノートは今までどおり（必要なときだけ囲む）。
+  assert.equal(propsValueSource('---\ntitle: x\n---', 'title', 'yes', false), '---\ntitle: yes\n---')
+})
+
 test('閉じていないYAMLや数式の枠があっても、その先の文書を読める', () => {
   const headingAfter = (text) => {
     const names = []
