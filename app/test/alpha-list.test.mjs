@@ -66,7 +66,8 @@ test('「a.」以外の文字は、すぐ上に項目があるときだけ項目
   assert.ok(isItem('- 親\n\tb. y', 2), '項目のすぐ下の段の最初')
   assert.ok(!isItem('b. いきなり', 1))
   assert.ok(!isItem('本文の行\ne. g. のように', 2))
-  assert.ok(!isItem('a. x\n\nb. y', 3), '空行のあと')
+  assert.ok(isItem('a. x\n\nb. y', 3), '空行をはさんでも続く（番号付きの「1. / 空行 / 2.」と同じ）')
+  assert.ok(!isItem('本文の行\n\ne. g. のように', 3), '空行の上が本文なら拾わない')
 })
 
 test('Enter で次の文字が続く', () => {
@@ -205,14 +206,57 @@ test('「a. 」の項目そのものの Enter は今までどおり（英字の 
   assert.equal(run(alphaChildEnter, '- x|').handled, false, '英字の項目の下でなければ標準の Enter に任せる')
 })
 
-test('分かっている限界：「a. 」と「b. 」の間に空行を足しても、すぐには「b. 」がただの文に戻らない（その行を書き換えると戻る）', () => {
-  // 読み取りは書き換えた所の近くだけを読み直し、離れた所は前の結果を使う。「b. 」が項目かどうかは上の行で決まるので、
-  // 上だけを書き換えると前の結果が残る。保存されるファイルは変わらず、見た目と Enter の続け方だけの違い。
+test('「a. 」と「b. 」の間に空行を足しても、書き換えたあとと最初から読んだときで同じ（どちらも項目）', () => {
   const before = make('a. x\nb. y\n')
   ensureSyntaxTree(before, before.doc.length, 1e9)
   const after = before.update({ changes: { from: 4, insert: '\n' } }).state
-  assert.ok(alphaItemAt(after, 3), '前の結果が残る')
-  assert.ok(!alphaItemAt(make(after.doc.toString()), 3), '最初から読むとただの文')
+  assert.ok(alphaItemAt(after, 3))
+  assert.ok(alphaItemAt(make(after.doc.toString()), 3))
+})
+
+const ME = '1. aaa\n\t1. 1111\n\t2. 222\n\t3. 333\n\t\ta. aaaa\n\t\t\t- child|'
+const enterTimes = (text, n) => {
+  let state = make(text)
+  for (let i = 0; i < n; i++) enterChain({ state, dispatch: (tr) => { state = tr.state } })
+  return state
+}
+const withCursor = (state) => state.doc.sliceString(0, state.selection.main.head) + '|' + state.doc.sliceString(state.selection.main.head)
+
+test('本人の形：子の末尾で Enter を3回押すと「b. 」の項目になり、続けて Enter すると「c. 」（番号付きの「2. 」と同じ）', () => {
+  const state = enterTimes(ME, 3)
+  assert.equal(withCursor(state), ME.replace('|', '') + '\n\t\t  \n\t\tb. |')
+  assert.ok(alphaItemAt(state, state.doc.lines), '「b. 」が項目')
+  // 番号付きなら同じ操作で「2. 」になる。
+  let numbered = make(ME.replace('a. aaaa', '1. aaaa'))
+  for (let i = 0; i < 3; i++) insertNewlineContinueMarkup({ state: numbered, dispatch: (tr) => { numbered = tr.state } })
+  assert.equal(withCursor(numbered), withCursor(state).replace('a. aaaa', '1. aaaa').replace('b. |', '2. |'))
+  let next = state.update({ changes: { from: state.doc.length, insert: 'bbb' }, selection: { anchor: state.doc.length + 3 } }).state
+  enterChain({ state: next, dispatch: (tr) => { next = tr.state } })
+  assert.ok(withCursor(next).endsWith('\t\tb. bbb\n\t\tc. |'))
+})
+
+test('本人の形で後ろに「b. 」「c. 」があるときは、後ろを振り直す。読み直しても全部が項目', () => {
+  const state = enterTimes(ME.replace('|', '|\n\t\tb. bbb\n\t\tc. ccc'), 3)
+  assert.equal(withCursor(state), ME.replace('|', '') + '\n\t\t  \n\t\tb. |\n\t\tc. bbb\n\t\td. ccc')
+  const fresh = make(state.doc.toString())
+  const n = fresh.doc.lines
+  assert.deepEqual([n - 2, n - 1, n].map((line) => alphaItemAt(fresh, line)?.letter), ['b', 'c', 'd'])
+})
+
+test('子の間に空行があっても、次の「b. 」は子の段落に吸われず項目になる（番号付きと同じ）', () => {
+  const doc = 'a. x\n\t- c1\n\n\t- c2\nb. y\n'
+  const item = alphaItemAt(make(doc), 5)
+  assert.ok(item)
+  assert.equal(item.node.parent.name, 'Document')
+})
+
+test('「b. 」の上の子が長く（2万文字より多く）続いても、上の「a. 」を見つける', () => {
+  const kids = Array.from({ length: 300 }, () => '\t- ' + 'あ'.repeat(80)).join('\n')
+  const doc = 'a. x\n' + kids + '\nb. y\n'
+  assert.ok(doc.length > 25000)
+  const state = make(doc)
+  ensureSyntaxTree(state, doc.length, 1e9)
+  assert.ok(alphaItemAt(state.update({}).state, 302))
 })
 
 test('書き換えたあとの読み方は、最初から読んだときと同じ（途中から読み直しても食い違わない）', () => {

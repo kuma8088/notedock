@@ -15,10 +15,12 @@ import { ensureSyntaxTree, foldNodeProp, syntaxTree } from '@codemirror/language
 // 誤って拾わないための決まり：
 // - 行頭（引用の「>」と字下げのあと）だけ。文の途中の「a. 」は対象外。
 // - 小文字1字だけ。ひな形の「Q. 」や「A. 」などの大文字、「aa. 」は対象外。ピリオドの後に空白が要る。
-// - コード・数式・ノートの先頭のプロパティ・HTML・コメント・表の中は、ほかの読み取りが先に取るので対象外。
-// - 「a. 」以外の文字は、すぐ上（深い段の行は飛ばす）に同じ段の英字の項目が「a. 」から続いているか、
-//   1つ浅い段が箇条書き・番号・英字の項目のときだけ。空行をはさむと続きとみなさない。
-//   これで、本文の行のすぐ下の「e. g. 」「i. e. 」のような行は拾わない。
+// - コード・数式・ノートの先頭のプロパティ・HTML・コメントの中は、ほかの読み取りが先に取るので対象外。
+//   表は対象外にならない：表のすぐ下の行が「a. 」で始まると、「|」を含んでいても、そこで表が終わり項目になる
+//   （「1. 」で始まる行と同じ扱い）。
+// - 「a. 」以外の文字は、すぐ上（深い段の行と空行は飛ばす）に同じ段の英字の項目が「a. 」から続いているか、
+//   1つ浅い段が箇条書き・番号・英字の項目のときだけ。
+//   これで、本文の行のすぐ下（空行をはさんでも）の「e. g. 」「i. e. 」のような行は拾わない。
 
 const ALPHA_MARK = /^([a-z])\.([\t ]+)/
 const LIST_MARK = /^(?:[-*+]|\d{1,9}[.)]|[a-z]\.)(?:[\t ]|$)/
@@ -39,15 +41,34 @@ function parseLine(text) {
 // 上の行を見て、「a. 」以外の文字の項目が続きかどうかを決める。
 // 読み取りの途中の記録ではなく、上の行の文字で決める。読み取りは書き換えた所の近くだけを読み直し、
 // 離れた所は前の結果を使うので、途中の記録に頼ると、上の「a. 」が読み直されないときに食い違う。
-const LOOK_BACK = 20000
+// さかのぼる長さに上限は付けない。止まるのは、同じ段か浅い段の行、引用の深さが変わる行、文書の先頭に着いたとき。
+// 空行（空白だけの行も）は飛ばす。番号付きの「1. / 空行 / 2. 」が1つのリストなのと同じにする
+// （標準の Enter は、2つ目の子のあとの空の子で Enter すると、空白だけの行を入れてから項目を作る）。
+
+// 今の行より上の行を、近い順に返す。
+function* linesAbove(cx) {
+  if (cx.lineStart === 0) return
+  let pos = cx.lineStart - 1
+  let carry = ''
+  for (;;) {
+    const from = Math.max(0, pos - 4096)
+    const parts = (cx.input.read(from, pos) + carry).split('\n')
+    carry = parts.shift()
+    for (let i = parts.length - 1; i >= 0; i--) yield parts[i]
+    if (from === 0) {
+      yield carry
+      return
+    }
+    pos = from
+  }
+}
+
 function mayContinue(cx, line) {
   const me = parseLine(line.text)
-  const text = cx.input.read(Math.max(0, cx.lineStart - LOOK_BACK), cx.lineStart)
-  const lines = text.split('\n')
-  lines.pop()
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const other = parseLine(lines[i])
-    if (other.quote !== me.quote || other.rest.trim() === '') return false
+  for (const text of linesAbove(cx)) {
+    const other = parseLine(text)
+    if (other.rest.trim() === '') continue
+    if (other.quote !== me.quote) return false
     if (other.cols > me.cols) continue
     if (other.cols === me.cols) {
       const mark = other.rest.match(ALPHA_MARK)
