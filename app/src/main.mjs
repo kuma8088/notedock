@@ -8,7 +8,6 @@ import {
   foldGutter,
   foldKeymap,
   foldable,
-  foldedRanges,
   indentUnit,
   syntaxHighlighting,
   syntaxTree,
@@ -31,6 +30,8 @@ import { copyText } from './copy.mjs'
 import { keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
 import { absolutePath, ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
+import { alphaChildEnter, alphaListEnter } from './alpha-list.mjs'
+import { foldedLines, foldsChanged, listMarkerFold } from './folds.mjs'
 import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
@@ -679,6 +680,9 @@ function saveNow() {
 
 const editorKeys = keymap.of([
   ...completionKeymap,
+  // 「a. 」「b. 」の英字の項目は先に見る（alpha-list.mjs）。次に英字の項目の下の子。そうでなければ Markdown の標準の続け方。
+  { key: 'Enter', run: alphaListEnter },
+  { key: 'Enter', run: alphaChildEnter },
   { key: 'Enter', run: insertNewlineContinueMarkup },
   { key: 'Backspace', run: deleteMarkupBackward },
   { key: 'Shift-Enter', run: softBreak },
@@ -756,6 +760,17 @@ const editorEvents = EditorView.domEventHandlers({
   blur(_, target) {
     if (target.state.field(previewField).composing) target.dispatch({ effects: setComposing.of(false) })
     return false
+  },
+  // 箇条書きの記号（•）や番号を押すと、その項目の子を開閉する。たためない項目では何もせず、今までどおりカーソルを置く。
+  mousedown(event, target) {
+    if (event.button !== 0 || event.altKey || event.shiftKey || event.metaKey || event.ctrlKey) return false
+    const marker = event.target.closest?.('.cm-bullet, .cm-list-number')
+    if (!marker || !target.contentDOM.contains(marker)) return false
+    const effect = listMarkerFold(target.state, target.posAtDOM(marker))
+    if (!effect) return false
+    event.preventDefault()
+    target.dispatch({ effects: effect })
+    return true
   },
   paste(event, target) {
     const file = [...(event.clipboardData?.files ?? [])].find((item) => item.type.startsWith('image/'))
@@ -895,16 +910,12 @@ function onUpdate(update) {
     scheduleState()
     syncToolbar()
   }
-  if (update.transactions.some((tr) => tr.effects.some((e) => e.is(foldEffect)))) rememberFolds()
+  if (foldsChanged(update)) rememberFolds()
 }
 
 function rememberFolds() {
   if (!view || !currentPath) return
-  const lines = []
-  foldedRanges(view.state).between(0, view.state.doc.length, (from) => {
-    lines.push(view.state.doc.lineAt(from).number)
-  })
-  storage.set(`folds:${vaultName}:${currentPath}`, lines)
+  storage.set(`folds:${vaultName}:${currentPath}`, foldedLines(view.state))
 }
 
 function restoreFolds(path) {

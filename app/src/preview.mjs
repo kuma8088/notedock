@@ -2,6 +2,7 @@ import { ensureSyntaxTree, syntaxTree } from '@codemirror/language'
 import { Facet, StateEffect, StateField } from '@codemirror/state'
 import { Decoration, EditorView } from '@codemirror/view'
 
+import { alphaItemsIn } from './alpha-list.mjs'
 import { isExternal, normalizeKey, resolveHref, wikiLinkOf } from './links.mjs'
 import {
   BulletWidget,
@@ -275,7 +276,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
             return undefined
           }
           if (item?.parent?.name === 'BulletList') {
-            if (!lineTouched(from)) add(from, to, Decoration.replace({ widget: new BulletWidget() }))
+            if (!lineTouched(from)) add(from, to, Decoration.replace({ widget: new BulletWidget(listDepth(item)) }))
           } else {
             add(from, to, Decoration.mark({ class: 'cm-list-number' }))
           }
@@ -376,6 +377,11 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
   })
 
   addIndentGuides(state, add)
+  // 「a. 」「b. 」の英字の項目（alpha-list.mjs）。記号を番号と同じ色にし、字下げの線を付ける。
+  for (const item of alphaItemsIn(state)) {
+    add(item.markFrom, item.markTo, Decoration.mark({ class: 'cm-list-number' }))
+    if (item.indent) add(item.line.from + item.quote.length, item.markFrom, Decoration.mark({ class: 'cm-indent-guide' }))
+  }
   return Decoration.set(ranges, true)
 }
 
@@ -430,6 +436,16 @@ export function headingPlace(state, pos) {
   let block = syntaxTree(state).resolveInner(line.from, 1)
   while (block.parent && block.parent.name !== 'Document') block = block.parent
   return AFTER_BLOCK.has(block.name) ? ' cm-heading-after-block' : ''
+}
+
+// 箇条書き・番号付きの入れ子の深さ（いちばん外が1）。番号付きの下の箇条書きも1段深く数える（HTML の ol の中の ul と同じ）。
+// 英字の項目（「a. 」、alpha-list.mjs）は入れ物の木を持たないので、項目そのものを1段と数える。
+function listDepth(item) {
+  let depth = 0
+  for (let node = item?.parent; node; node = node.parent) {
+    if (node.name === 'BulletList' || node.name === 'OrderedList' || node.name === 'AlphaItem') depth += 1
+  }
+  return depth
 }
 
 function addIndentGuides(state, add) {

@@ -776,6 +776,8 @@ a.cm-link-missing {
 }
 
 .cm-bullet { color: var(--muted); display: inline-block; width: 1ch; text-align: center; }
+/* 3段目の「▪」は字体の中で大きく、幅からはみ出して本文に寄るので、幅はそのままで絵だけ小さくする。 */
+.cm-bullet-3 { display: inline-flex; justify-content: center; transform: scale(0.6); }
 
 /* 箇条書きの折り返し行を本文の先頭に揃える（引用・コールアウトの中も）。--hang は hanging.mjs が行ごとに測った、本文の先頭までの幅。
    左の余白の基準は、ふつうの行がCodeMirrorの .cm-line と同じ6px、引用・コールアウトは下の .cm-quote と .cm-callout の14px。 */
