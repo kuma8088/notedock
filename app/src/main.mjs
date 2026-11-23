@@ -44,7 +44,7 @@ import { createConnectionWatch, createVersionWatch } from './connection.mjs'
 import { linesFrom, selectedLines } from './lines.mjs'
 import { applyMention, headingTarget, mentionCandidates, mentionQuery, sectionsOf, unwritableCount } from './mention.mjs'
 import { beginTableCell, showMenu } from './widgets.mjs'
-import { isTaskNote } from './tasks.mjs'
+import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
 import { dailyDateOf } from './task-buckets.mjs'
 import { createTaskPanel } from './task-panel.mjs'
 import { setProperty } from './yaml-lite.mjs'
@@ -306,6 +306,7 @@ const api = {
     const result = await request(noteUrl(path), { method: 'PUT', body: JSON.stringify({ text, baseHash }) })
     if (result.status === 409) return result.data
     if (!result.ok) throw Object.assign(new Error(result.data?.error ?? 'save failed'), { status: result.status })
+    if (isTaskFolderPath(path)) tasksSaved()
     return result.data
   },
   async backup(path, text) {
@@ -2641,20 +2642,31 @@ async function openPeriodicNote(period, date, { ask = false, from = 'sidebar', m
 }
 
 // 右の枠はカレンダーを描かない（periodicState が null のまま）ので、日付のノートの置き場だけを別に問い合わせて覚える。
-let rightPeriodicRoot = null
+// undefined はまだ分からない、null は置き場がない（聞き直さない。60秒ごとの読み直しで、左のカレンダーと同じく追いつく）。
+let rightPeriodicRoot
+let rightRootLoad = null
 
 async function loadRightPeriodicRoot() {
   try {
     const result = await request(`/api/periodic?month=${todayText().slice(0, 7)}`)
-    rightPeriodicRoot = result.ok && typeof result.data?.periodicRoot === 'string' ? result.data.periodicRoot : null
+    if (result.ok) rightPeriodicRoot = typeof result.data?.periodicRoot === 'string' ? result.data.periodicRoot : null
   } catch {
-    // 問い合わせられないときは、次のきっかけでもう一度試す。
+    // 問い合わせられないときは、分からないままにして、次のきっかけでもう一度試す。
   }
+}
+
+// まだ分からないときだけ聞く。同時に頼まれても1回にまとめる。
+function ensureRightPeriodicRoot() {
+  if (rightPeriodicRoot !== undefined) return null
+  rightRootLoad ??= loadRightPeriodicRoot().finally(() => {
+    rightRootLoad = null
+  })
+  return rightRootLoad
 }
 
 // 開いているノートが <periodicRoot>/<年>/Daily/YYYY-MM-DD.md の形なら、その日付。
 function openDateOf(path = currentPath) {
-  return dailyDateOf(path, periodicState?.periodicRoot ?? (PANE === 'right' ? rightPeriodicRoot : null))
+  return dailyDateOf(path, periodicState?.periodicRoot ?? (PANE === 'right' ? (rightPeriodicRoot ?? null) : null))
 }
 
 // ---- デイリーノートの上のタスクのパネル（読み取りだけ） ----
@@ -2678,27 +2690,34 @@ async function refreshTaskPanel() {
   const mine = ++taskPanelRequest
   const path = currentPath
   let date = openDateOf(path)
-  if (!date && PANE === 'right' && path && rightPeriodicRoot === null) {
-    await loadRightPeriodicRoot()
-    if (mine !== taskPanelRequest) return
-    date = openDateOf(path)
+  if (!date && PANE === 'right' && path) {
+    const loading = ensureRightPeriodicRoot()
+    if (loading) {
+      await loading
+      if (mine !== taskPanelRequest) return
+      date = openDateOf(path)
+    }
   }
-  if (!date) {
-    taskPanel.hide()
-    return
-  }
-  // 別のデイリーノートへ移ったときは、まず手元の一覧でその日から数え直して出す。
-  const previous = taskPanel.last()
-  if (previous && previous.date !== date) taskPanel.show({ tasks: previous.tasks, date })
-  let result
-  try {
-    result = await request('/api/tasks')
-  } catch {
-    return
-  }
-  if (mine !== taskPanelRequest || path !== currentPath) return
-  if (!result.ok || !Array.isArray(result.data?.tasks)) return
-  taskPanel.show({ tasks: result.data.tasks, date })
+  await taskPanel.refresh({
+    date,
+    load: async () => {
+      const result = await request('/api/tasks')
+      if (!result.ok) throw new Error('tasks')
+      return result.data
+    },
+    isCurrent: () => path === currentPath,
+  })
+}
+
+// タスクのノート（Tasks/ の下）を保存し終えたら、こちらと反対の枠のパネルを読み直す。
+function isTaskFolderPath(path) {
+  return typeof path === 'string' && path.toLowerCase().startsWith(`${TASK_FOLDER.toLowerCase()}/`)
+}
+
+function tasksSaved() {
+  refreshTaskPanel()
+  if (PANE === 'right') toLeft({ type: MSG.TASKS })
+  else if (split?.isOpen()) split.post({ type: MSG.TASKS })
 }
 
 async function drawCalendar() {
@@ -3069,7 +3088,7 @@ function bindLeftChrome() {
   document.addEventListener('paste', openFromPaste)
   document.addEventListener('click', (event) => {
     // チェックやリンクを押したときは、その操作のためなので案内を出さない。
-    const onBody = event.target.closest?.('#editor') && !event.target.closest('.cm-task-box, [data-href], a')
+    const onBody = event.target.closest?.('#editor') && !event.target.closest('.cm-task-box, [data-href], a, #task-panel')
     showPasteHint(Boolean(onBody) && pasteOpensNote())
   })
   // 案内が最後の行に重なるので、読み進めるときは消す。
@@ -3186,6 +3205,8 @@ function receiveFromRight(data) {
   } else if (data.type === MSG.OPEN) {
     // 右の枠でCmd+クリックしたリンクは、左で開く。
     if (typeof data.path === 'string') openIn('left', data.path, { anchor: typeof data.anchor === 'string' ? data.anchor : '' })
+  } else if (data.type === MSG.TASKS) {
+    refreshTaskPanel()
   } else if (data.type === MSG.CLICKED) {
     split.setActive('right')
   } else if (data.type === MSG.OPENED) {
@@ -3270,6 +3291,8 @@ async function receiveFromLeft(data) {
     if (!currentPath || !view) return
     const pos = Math.max(0, Math.min(Number(data.from) || 0, view.state.doc.length))
     view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
+  } else if (data.type === MSG.TASKS) {
+    refreshTaskPanel()
   } else if (data.type === MSG.CHAT) {
     sendSelectionToChat()
   } else if (data.type === MSG.HISTORY) {
@@ -3487,11 +3510,13 @@ async function startRight() {
       parent: $('editor'),
     })
   }
-  await loadRightPeriodicRoot()
+  // 置き場の問い合わせは待たない（開くノートを受け取るのを遅らせない）。パネルを描くときに、まだなら待つ。
+  ensureRightPeriodicRoot()
   toLeft({ type: MSG.READY })
   setInterval(() => {
     refreshNotes()
-    refreshTaskPanel()
+    // 置き場の設定が変わったときに追いつくよう、60秒ごとに聞き直す（左はカレンダーの読み直しで同じことをしている）。
+    loadRightPeriodicRoot().finally(refreshTaskPanel)
   }, 60_000)
   watchTaskPanelVisibility()
 }

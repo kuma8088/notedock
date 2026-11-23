@@ -182,9 +182,30 @@ test('親の名前：フォルダーつき・名前だけ・表示名つき・�
 test('件数の上限を超えたら途中までと知らせる', () => {
   const dir = makeRoot()
   for (let i = 0; i < 4; i++) put(dir, `Tasks/t${i}.md`, task({ title: `T${i}`, type: 'task' }))
+  put(dir, 'Tasks/a/t9.md', task({ title: 'T9', type: 'task' }))
   const { tasks, truncated } = createTaskIndex(dir, { maxEntries: 3 }).list()
-  assert.equal(tasks.length, 3)
+  // 切る順はパスの名前順（Tasks/a/t9.md → Tasks/t0.md → Tasks/t1.md）。
+  assert.deepEqual(tasks.map((t) => t.path), ['Tasks/a/t9.md', 'Tasks/t0.md', 'Tasks/t1.md'])
   assert.equal(truncated, true)
+})
+
+test('親の照合は、濁点の持ち方（NFC と NFD）の違いをそろえる', () => {
+  const dir = makeRoot()
+  const nfd = 'ガイド'.normalize('NFD')
+  put(dir, `Tasks/${nfd}.md`, task({ title: '親（NFD の名前）', type: 'task' }))
+  put(dir, 'Tasks/c.md', task({ title: '子', type: 'task', parent: `"[[Tasks/${'ガイド'.normalize('NFC')}]]"` }))
+  put(dir, 'Tasks/d.md', task({ title: '子2', type: 'task', parent: `"[[${'ガイド'.normalize('NFC')}]]"` }))
+  const by = Object.fromEntries(createTaskIndex(dir).list().tasks.map((t) => [t.title, t]))
+  assert.equal(by['子'].parentTitle, '親（NFD の名前）')
+  assert.ok(by['子'].parentPath)
+  assert.equal(by['子2'].parentTitle, '親（NFD の名前）')
+})
+
+test('Tasks と大文字小文字だけ違う名前のフォルダーも読み、実際の名前でパスを返す', () => {
+  const dir = makeRoot()
+  put(dir, 'tasks/x.md', task({ title: 'X', type: 'task' }))
+  const list = createTaskIndex(dir).list().tasks
+  assert.deepEqual(list.map((t) => t.path), ['tasks/x.md'])
 })
 
 test('linkTarget', () => {

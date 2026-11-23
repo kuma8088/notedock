@@ -16,6 +16,8 @@ export const MSG = {
   // SAVED は { dirty }。保存を試したあと、まだ保存できていない書きかけがあれば true。
   SAVED: 'pane:saved',
   CLOSE: 'pane:close',
+  // タスクのノートを保存した。反対の枠のタスクのパネルも読み直す。
+  TASKS: 'pane:tasks',
 }
 
 // 同じアドレスから、pane: の連絡として来たものだけを受け付ける。source を渡したときは、その枠からのものだけ。

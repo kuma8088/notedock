@@ -32,17 +32,36 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
   const cache = new Map()
   let reads = 0
 
+  // Vault 直下の、folder と大文字小文字だけ違う名前のフォルダーも使う。返すパスは実際の名前にする。
+  // 同じ名前（大文字小文字だけ違う）が2つあるとき（大文字小文字を区別するディスク）は、決めた名前どおりのものを選ぶ。
+  function actualFolder() {
+    let entries
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true })
+    } catch {
+      return null
+    }
+    const want = folder.toLowerCase()
+    const found = entries.filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && entry.name.toLowerCase() === want)
+    return (found.find((entry) => entry.name === folder) ?? found.sort((a, b) => (a.name < b.name ? -1 : 1))[0])?.name ?? null
+  }
+
   function walk() {
+    const name = actualFolder()
+    if (!name) return { files: [], truncated: false }
     let base
     try {
-      base = resolveFolderPath(root, folder)
+      base = resolveFolderPath(root, name)
       if (!fs.lstatSync(base).isDirectory()) return { files: [], truncated: false }
     } catch {
       return { files: [], truncated: false }
     }
     const files = []
     let truncated = false
-    const queue = [{ dir: base, prefix: `${folder}/`, depth: 1 }]
+    // 調べる項目の数の上限（フォルダーが極端に多いときに止めるため）。ファイルの件数の上限とは別。
+    let scanned = 0
+    const scanLimit = maxEntries * 4
+    const queue = [{ dir: base, prefix: `${name}/`, depth: 1 }]
     for (let head = 0; head < queue.length; head++) {
       const { dir, prefix, depth } = queue[head]
       let entries
@@ -52,6 +71,11 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
         continue
       }
       for (const entry of entries) {
+        if (scanned >= scanLimit) {
+          truncated = true
+          break
+        }
+        scanned++
         if (!isListable(entry.name) || entry.isSymbolicLink()) continue
         const full = path.join(dir, entry.name)
         if (isHidden(full)) continue
@@ -59,13 +83,15 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
           if (depth < maxDepth) queue.push({ dir: full, prefix: `${prefix}${entry.name}/`, depth: depth + 1 })
           else truncated = true
         } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
-          if (files.length >= maxEntries) {
-            truncated = true
-            continue
-          }
           files.push({ rel: `${prefix}${entry.name}`, full })
         }
       }
+    }
+    // 多すぎるときは、パスの名前順で先頭から maxEntries 件を使う（読み直すたびに同じものが残るように）。
+    files.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))
+    if (files.length > maxEntries) {
+      files.length = maxEntries
+      truncated = true
     }
     return { files, truncated }
   }
@@ -97,16 +123,18 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
     }
     for (const rel of [...cache.keys()]) if (!seen.has(rel)) cache.delete(rel)
     const tasks = [...cache.values()].map((entry) => entry.task).filter(Boolean)
-    const byPath = new Map(tasks.map((task) => [task.path.replace(/\.md$/i, '').toLowerCase(), task]))
+    // 照合のキーは、濁点などの持ち方の違い（NFC と NFD）と大文字小文字をそろえる。
+    const keyOf = (text) => text.normalize('NFC').toLowerCase()
+    const byPath = new Map(tasks.map((task) => [keyOf(task.path.replace(/\.md$/i, '')), task]))
     const byName = new Map()
     for (const task of tasks) {
-      const name = task.path.split('/').at(-1).replace(/\.md$/i, '').toLowerCase()
+      const name = keyOf(task.path.split('/').at(-1).replace(/\.md$/i, ''))
       byName.set(name, byName.has(name) ? null : task)
     }
     const out = tasks.map((task) => {
       if (!task.parent) return { ...task, parentPath: null, parentTitle: '' }
       const target = linkTarget(task.parent)
-      const key = target.toLowerCase()
+      const key = keyOf(target)
       const parent = byPath.get(key) ?? (key.includes('/') ? null : byName.get(key)) ?? null
       const title = parent ? parent.title || parent.path.split('/').at(-1).replace(/\.md$/i, '') : target.split('/').at(-1)
       return { ...task, parentPath: parent?.path ?? null, parentTitle: title }

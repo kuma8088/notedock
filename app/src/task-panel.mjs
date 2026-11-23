@@ -14,11 +14,14 @@ const shortDate = (date) => `${Number(date.slice(5, 7))}/${Number(date.slice(8, 
 // onOpen(path, event): タスクの名前をクリックしたとき。
 export function createTaskPanel({ box, store, keyOf, onOpen }) {
   let last = null
+  // 問い合わせの番号。あとから頼んだものがあれば、前の返事は捨てる。
+  let request = 0
 
   const panelOpen = () => store.get(keyOf('task-panel-open'), true) !== false
   const sections = () => sectionOpenState(store.get(keyOf('task-sections'), null))
 
   function hide() {
+    request++
     last = null
     box.hidden = true
     box.replaceChildren()
@@ -44,7 +47,7 @@ export function createTaskPanel({ box, store, keyOf, onOpen }) {
   // focusKey: 押したボタンを描き直したあとも、キーで続けて操作できるようにフォーカスを戻す。
   function draw(focusKey = null) {
     if (!last) return
-    const { tasks, date } = last
+    const { tasks, date, truncated } = last
     const buckets = bucketTasks(tasks, date)
     const open = panelOpen()
     const state = sections()
@@ -59,6 +62,7 @@ export function createTaskPanel({ box, store, keyOf, onOpen }) {
       draw('panel')
     })
     head.append(toggle)
+    if (truncated) head.append(el('span', 'task-panel-note', 'タスクのノートが多いため、名前順で先頭の一部だけを数えています'))
     if (!open) {
       const counts = ['soon', 'week', 'month', 'none'].map((key) => `${TASK_SECTION_LABELS[key].replace('のタスク', '')} ${buckets[key].length}`).join('・')
       head.append(el('span', 'task-panel-summary', counts))
@@ -101,12 +105,36 @@ export function createTaskPanel({ box, store, keyOf, onOpen }) {
     if (focusKey) box.querySelector(`[data-key="${focusKey}"]`)?.focus()
   }
 
-  // tasks: サーバーの一覧。date: 開いているデイリーノートの日付。タスクのノートが1つもなければ出さない。
-  function show({ tasks, date }) {
+  // tasks: サーバーの一覧。date: 開いているデイリーノートの日付。truncated: 一覧が途中までか。
+  // タスクのノートが1つもなければ出さない。
+  function show({ tasks, date, truncated = false }) {
     if (!Array.isArray(tasks) || tasks.length === 0) return hide()
-    last = { tasks, date }
+    last = { tasks, date, truncated: truncated === true }
     draw()
   }
 
-  return { show, hide, shown: () => last !== null, last: () => last }
+  // date（デイリーノートでなければ null）に合わせて、一覧を問い合わせて描く。
+  // load: 一覧（{ tasks, truncated }）を返す関数。isCurrent: 返事が来たとき、まだ同じノートを開いているか。
+  // 返り値：'hidden'・'shown'・'stale'（古い返事を捨てた）・'failed'（今の見た目のまま）。
+  async function refresh({ date, load, isCurrent = () => true }) {
+    if (!date) {
+      hide()
+      return 'hidden'
+    }
+    const mine = ++request
+    // 別のデイリーノートへ移ったときは、まず手元の一覧でその日から数え直して出す。
+    if (last && last.date !== date) show({ ...last, date })
+    let data
+    try {
+      data = await load()
+    } catch {
+      return mine === request ? 'failed' : 'stale'
+    }
+    if (mine !== request || !isCurrent()) return 'stale'
+    if (!data || !Array.isArray(data.tasks)) return 'failed'
+    show({ tasks: data.tasks, date, truncated: data.truncated })
+    return 'shown'
+  }
+
+  return { show, hide, refresh, shown: () => last !== null, last: () => last }
 }
