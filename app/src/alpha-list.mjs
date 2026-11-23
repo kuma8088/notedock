@@ -81,7 +81,7 @@ const nextLetter = (letter) => String.fromCharCode(letter.charCodeAt(0) + 1)
 // 英字の項目でないとき、選択中、記号より前にカーソルがあるときは false を返し、今までの Enter に任せる。
 export function alphaListEnter({ state, dispatch }) {
   const { ranges, main } = state.selection
-  if (ranges.length !== 1 || !main.empty) return false
+  if (state.readOnly || ranges.length !== 1 || !main.empty) return false
   const head = main.head
   const line = state.doc.lineAt(head)
   const item = alphaItemAt(state, line.number)
