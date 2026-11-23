@@ -2,6 +2,8 @@ import { syntaxTree } from '@codemirror/language'
 import { StateEffect } from '@codemirror/state'
 import { Decoration, ViewPlugin } from '@codemirror/view'
 
+import { alphaItemsIn } from './alpha-list.mjs'
+
 // 箇条書きの項目が折り返したとき、2行目からを記号のあとの本文の先頭に揃える（ぶら下げ字下げ）。
 // 記号・字下げ・チェックボックスの幅は字体や表示の切り替えで変わるので、画面で測った幅を使う。
 
@@ -11,7 +13,10 @@ const ITEM_START = /^((?:[\t ]*>[\t ]?)*)([\t ]*)(?:[-*+]|\d{1,9}[.)])(?:[\t ]+(
 // 範囲の中にある箇条書きの項目の1行目と、行頭の引用の記号・字下げの終わり、本文が始まる位置。
 // 引用・コールアウトの中の項目も含める。コードの中は除く。
 export function listItemStarts(state, from = 0, to = state.doc.length) {
-  const out = []
+  const out = alphaItemsIn(state, from, to).map((item) => {
+    const indent = item.line.from + item.quote.length
+    return { line: item.line.from, indent, lead: indent + item.indent.length, text: item.textFrom }
+  })
   syntaxTree(state).iterate({
     from,
     to,
@@ -28,7 +33,8 @@ export function listItemStarts(state, from = 0, to = state.doc.length) {
       return undefined
     },
   })
-  return out
+  // 英字の項目（alpha-list.mjs）も含める。行の順に並べる。
+  return out.sort((a, b) => a.line - b.line)
 }
 
 const hangsMeasured = StateEffect.define()

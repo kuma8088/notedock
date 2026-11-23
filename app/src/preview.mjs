@@ -2,6 +2,7 @@ import { ensureSyntaxTree, syntaxTree } from '@codemirror/language'
 import { Facet, StateEffect, StateField } from '@codemirror/state'
 import { Decoration, EditorView } from '@codemirror/view'
 
+import { alphaItemsIn } from './alpha-list.mjs'
 import { isExternal, normalizeKey, resolveHref, wikiLinkOf } from './links.mjs'
 import {
   BulletWidget,
@@ -376,6 +377,11 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
   })
 
   addIndentGuides(state, add)
+  // 「a. 」「b. 」の英字の項目（alpha-list.mjs）。木には項目として出てこないので、行を見て番号と同じ色にする。
+  for (const item of alphaItemsIn(state)) {
+    add(item.markFrom, item.markTo, Decoration.mark({ class: 'cm-list-number' }))
+    if (item.indent) add(item.line.from + item.quote.length, item.markFrom, Decoration.mark({ class: 'cm-indent-guide' }))
+  }
   return Decoration.set(ranges, true)
 }
 

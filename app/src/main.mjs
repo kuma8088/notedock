@@ -30,6 +30,7 @@ import { copyText } from './copy.mjs'
 import { keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
 import { absolutePath, ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
+import { alphaListEnter } from './alpha-list.mjs'
 import { foldedLines, foldsChanged, listMarkerFold } from './folds.mjs'
 import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
@@ -679,6 +680,8 @@ function saveNow() {
 
 const editorKeys = keymap.of([
   ...completionKeymap,
+  // 「a. 」「b. 」の英字の項目は先に見る（alpha-list.mjs）。そうでなければ Markdown の標準の続け方。
+  { key: 'Enter', run: alphaListEnter },
   { key: 'Enter', run: insertNewlineContinueMarkup },
   { key: 'Backspace', run: deleteMarkupBackward },
   { key: 'Shift-Enter', run: softBreak },
