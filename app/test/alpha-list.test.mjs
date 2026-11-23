@@ -221,6 +221,16 @@ test('書き換えたあとの読み方は、最初から読んだときと同�
     ['本文\n\na. x\n\t- c\nb. y\n', { from: 0, insert: '前\n' }],
     [NOTE + '\t\t\t- child\n', { from: NOTE.length - 1, insert: '\n\t\t\t- c0' }],
   ]
+  // 前の結果が使われるのは、書き換えた所から離れた部分だけ。長い本文を前後に置いて、使われる形で確かめる。
+  const PAD = '本文の段落。'.repeat(60) + '\n\n'
+  const TAIL = '\n' + 'あとの段落。'.repeat(60) + '\n'
+  const abc = PAD + 'a. x\nb. y\nc. z' + TAIL
+  edits.push([abc, { from: abc.indexOf('c. z') + 4, insert: '\nd. ' }])
+  edits.push([abc, { from: abc.indexOf('b. y') + 4, insert: '1' }])
+  const nested = PAD + '1. aaa\n\t1. 1111\n\t\ta. aaaa\n\t\tb. bbbb\n\t\t\t- child' + TAIL
+  edits.push([nested, { from: nested.indexOf('child') + 5, insert: 'x' }])
+  edits.push([nested, { from: nested.indexOf('bbbb') + 4, insert: 'x' }])
+  edits.push([nested, { from: nested.indexOf('aaaa') + 4, insert: 'x' }])
   const dump = (state) => {
     ensureSyntaxTree(state, state.doc.length, 1e9)
     const out = []

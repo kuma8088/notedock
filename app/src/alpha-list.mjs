@@ -16,29 +16,14 @@ import { ensureSyntaxTree, foldNodeProp, syntaxTree } from '@codemirror/language
 // - 行頭（引用の「>」と字下げのあと）だけ。文の途中の「a. 」は対象外。
 // - 小文字1字だけ。ひな形の「Q. 」や「A. 」などの大文字、「aa. 」は対象外。ピリオドの後に空白が要る。
 // - コード・数式・ノートの先頭のプロパティ・HTML・コメント・表の中は、ほかの読み取りが先に取るので対象外。
-// - 「a. 」以外の文字は、すぐ上で同じ段の英字の項目が終わったとき（間に深い段の行があってもよい）か、
-//   すぐ上の行が1つ浅い段の箇条書き・番号・英字の項目のときだけ。空行をはさむと続きとみなさない。
+// - 「a. 」以外の文字は、すぐ上（深い段の行は飛ばす）に同じ段の英字の項目が「a. 」から続いているか、
+//   1つ浅い段が箇条書き・番号・英字の項目のときだけ。空行をはさむと続きとみなさない。
 //   これで、本文の行のすぐ下の「e. g. 」「i. e. 」のような行は拾わない。
 
 const ALPHA_MARK = /^([a-z])\.([\t ]+)/
 const LIST_MARK = /^(?:[-*+]|\d{1,9}[.)]|[a-z]\.)(?:[\t ]|$)/
 
-// 読み取りの途中の記録（読み取りごと）。英字の項目を始めたときの本文の位置→記号の位置と、
-// その行で終わった英字の項目の記号の位置。
-const progress = new WeakMap()
-function progressOf(cx) {
-  let p = progress.get(cx)
-  if (!p) progress.set(cx, (p = { bases: new Map(), closedAt: -1, closedCols: new Set() }))
-  return p
-}
-
-// 前の行の文字（引用の「>」と字下げを含む）。
-function previousLine(cx) {
-  if (cx.lineStart === 0) return null
-  const end = cx.lineStart - 1
-  const text = cx.input.read(Math.max(0, end - 2000), end)
-  return text.slice(text.lastIndexOf('\n') + 1)
-}
+const LINE = /^((?:[\t ]*>[\t ]?)*)([\t ]*)(.*)$/
 
 function columnsOf(text, tabSize = 4) {
   let col = 0
@@ -46,16 +31,33 @@ function columnsOf(text, tabSize = 4) {
   return col
 }
 
-// 「a. 」以外の文字を項目にしてよいか。
+function parseLine(text) {
+  const [, quote, indent, rest] = text.match(LINE)
+  return { quote: quote.replace(/[\t ]/g, ''), cols: columnsOf(indent), rest }
+}
+
+// 上の行を見て、「a. 」以外の文字の項目が続きかどうかを決める。
+// 読み取りの途中の記録ではなく、上の行の文字で決める。読み取りは書き換えた所の近くだけを読み直し、
+// 離れた所は前の結果を使うので、途中の記録に頼ると、上の「a. 」が読み直されないときに食い違う。
+const LOOK_BACK = 20000
 function mayContinue(cx, line) {
-  const prev = previousLine(cx)
-  if (prev === null || prev.replace(/[\t >]/g, '') === '') return false
-  const p = progressOf(cx)
-  if (p.closedAt === cx.lineStart && p.closedCols.has(line.indent)) return true
-  const parent = cx.parentType().name
-  if (parent !== 'ListItem' && parent !== 'AlphaItem') return false
-  const [, lead, rest] = prev.match(/^((?:[\t ]*>[\t ]?)*[\t ]*)(.*)$/)
-  return LIST_MARK.test(rest) && columnsOf(lead) < line.indent
+  const me = parseLine(line.text)
+  const text = cx.input.read(Math.max(0, cx.lineStart - LOOK_BACK), cx.lineStart)
+  const lines = text.split('\n')
+  lines.pop()
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const other = parseLine(lines[i])
+    if (other.quote !== me.quote || other.rest.trim() === '') return false
+    if (other.cols > me.cols) continue
+    if (other.cols === me.cols) {
+      const mark = other.rest.match(ALPHA_MARK)
+      if (!mark) return false
+      if (mark[1] === 'a') return true
+      continue
+    }
+    return LIST_MARK.test(other.rest)
+  }
+  return false
 }
 
 function alphaStart(cx, line) {
@@ -73,16 +75,7 @@ export const AlphaList = {
       block: true,
       // 続きの行かどうか。番号付きの項目と同じく、本文の位置より左の行（空行を除く）で終わる。
       composite(cx, line, value) {
-        const p = progressOf(cx)
-        if (line.indent < line.baseIndent + value && line.next > -1) {
-          if (p.closedAt !== cx.lineStart) {
-            p.closedAt = cx.lineStart
-            p.closedCols = new Set()
-          }
-          const col = p.bases.get(line.baseIndent + value)
-          if (col !== undefined) p.closedCols.add(col)
-          return false
-        }
+        if (line.indent < line.baseIndent + value && line.next > -1) return false
         line.moveBaseColumn(line.baseIndent + value)
         return true
       },
@@ -102,7 +95,6 @@ export const AlphaList = {
         const spaceCols = columnsOf(line.text.slice(0, line.pos) + line.text.slice(line.pos, line.pos + mark[0].length)) - (markCol + 2)
         const empty = line.pos + mark[0].length >= line.text.length
         const base = empty || spaceCols > 4 ? markCol + 3 : markCol + 2 + spaceCols
-        progressOf(cx).bases.set(base, markCol)
         cx.startComposite('AlphaItem', line.pos, base - line.baseIndent)
         cx.addElement(cx.elt('AlphaMark', start, start + 2))
         line.moveBaseColumn(base)
