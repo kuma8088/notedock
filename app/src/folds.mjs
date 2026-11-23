@@ -1,8 +1,15 @@
 import { foldEffect, foldable, foldedRanges, syntaxTree, unfoldEffect } from '@codemirror/language'
 
-// たたんだ・開いたのどちらかがあったか。開いたこと（unfoldEffect）も見ないと、開いた項目を覚えず、開き直すとまたたたまれる。
-export function foldsChanged(transactions) {
-  return transactions.some((tr) => tr.effects.some((e) => e.is(foldEffect) || e.is(unfoldEffect)))
+// 覚え直すかどうか。操作（foldEffect・unfoldEffect）の有無ではなく、更新の前後でたたんだ行の番号を比べる。
+// 操作のない開き方もあるため：カーソルがたたんだ範囲に入ると自動で開き、範囲にかかる削除でも消える。
+// 上に行を足して番号がずれたときも違いが出るので、新しい番号で覚え直す。
+// update は画面の更新（ViewUpdate）。startState と state と transactions だけを使う。
+export function foldsChanged(update) {
+  const touched = update.transactions.some((tr) => tr.docChanged || tr.selection || tr.effects.length || tr.reconfigured)
+  if (!touched) return false
+  const before = foldedLines(update.startState)
+  const after = foldedLines(update.state)
+  return before.length !== after.length || before.some((line, i) => line !== after[i])
 }
 
 // いまたたんでいる範囲の、始まりの行の番号。

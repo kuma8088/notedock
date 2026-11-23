@@ -14,9 +14,12 @@ const foldFirst = (state) => {
   return state.update({ effects: foldEffect.of(foldable(state, line.from, line.to)) })
 }
 
+// 画面の更新（ViewUpdate）の代わり。比べるのは更新の前後の状態だけ。
+const updateOf = (...trs) => ({ startState: trs[0].startState, state: trs[trs.length - 1].state, transactions: trs })
+
 test('たたんだときは覚え直す対象になり、たたんだ行の番号が分かる', () => {
   const tr = foldFirst(make())
-  assert.equal(foldsChanged([tr]), true)
+  assert.equal(foldsChanged(updateOf(tr)), true)
   assert.deepEqual(foldedLines(tr.state), [1])
 })
 
@@ -24,8 +27,38 @@ test('開いたとき（unfoldEffect）も覚え直す対象になり、開い�
   const folded = foldFirst(make()).state
   const range = foldable(folded, folded.doc.line(1).from, folded.doc.line(1).to)
   const tr = folded.update({ effects: unfoldEffect.of(range) })
-  assert.equal(foldsChanged([tr]), true)
+  assert.equal(foldsChanged(updateOf(tr)), true)
   assert.deepEqual(foldedLines(tr.state), [])
+})
+
+test('カーソルがたたんだ範囲に入って自動で開いたときも覚え直す', () => {
+  const folded = foldFirst(make()).state
+  const tr = folded.update({ selection: { anchor: folded.doc.line(2).from + 3 } })
+  assert.equal(tr.effects.length, 0, '開く操作（unfoldEffect）は出ない')
+  assert.deepEqual(foldedLines(tr.state), [])
+  assert.equal(foldsChanged(updateOf(tr)), true)
+})
+
+test('たたんだ範囲にかかる削除で開いたときも覚え直す', () => {
+  const folded = foldFirst(make()).state
+  const tr = folded.update({ changes: { from: folded.doc.line(1).to - 1, to: folded.doc.line(3).to } })
+  assert.deepEqual(foldedLines(tr.state), [])
+  assert.equal(foldsChanged(updateOf(tr)), true)
+})
+
+test('上に行を足して、たたんだ行の番号がずれたときも覚え直す（新しい番号で）', () => {
+  const folded = foldFirst(make()).state
+  const tr = folded.update({ changes: { from: 0, insert: '前の行\n' } })
+  assert.deepEqual(foldedLines(tr.state), [2])
+  assert.equal(foldsChanged(updateOf(tr)), true)
+})
+
+test('たたんだ範囲より下の変更や、範囲の外のカーソル移動では覚え直さない', () => {
+  const folded = foldFirst(make()).state
+  const below = folded.update({ changes: { from: folded.doc.length, insert: 'x' } })
+  assert.equal(foldsChanged(updateOf(below)), false)
+  const move = folded.update({ selection: { anchor: folded.doc.line(4).from } })
+  assert.equal(foldsChanged(updateOf(move)), false)
 })
 
 test('すべて開く（unfoldAll）も覚え直す対象になる', () => {
@@ -41,13 +74,13 @@ test('すべて開く（unfoldAll）も覚え直す対象になる', () => {
     },
   })
   assert.equal(trs.length, 1)
-  assert.equal(foldsChanged(trs), true)
+  assert.equal(foldsChanged(updateOf(...trs)), true)
   assert.deepEqual(foldedLines(state), [])
 })
 
-test('たたみ・開きと関係のない変更では覚え直さない', () => {
+test('たたんだ範囲がないときの変更では覚え直さない', () => {
   const tr = make().update({ changes: { from: 0, insert: 'x' } })
-  assert.equal(foldsChanged([tr]), false)
+  assert.equal(foldsChanged(updateOf(tr)), false)
 })
 
 const apply = (state, effect) => state.update({ effects: effect }).state

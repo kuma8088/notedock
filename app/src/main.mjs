@@ -909,7 +909,7 @@ function onUpdate(update) {
     scheduleState()
     syncToolbar()
   }
-  if (foldsChanged(update.transactions)) rememberFolds()
+  if (foldsChanged(update)) rememberFolds()
 }
 
 function rememberFolds() {
