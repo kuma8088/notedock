@@ -21,6 +21,8 @@ import {
 export const setMode = StateEffect.define()
 export const setComposing = StateEffect.define()
 export const togglePropsPanel = StateEffect.define()
+// ノートを動かしている間など、プロパティ欄をすべて止めるとき true。false に戻すと表示を作り直す。
+export const setNoteBusy = StateEffect.define()
 export const noteContext = Facet.define({
   combine: (values) => values[0] ?? { path: 'note.md', known: null, api: null },
 })
@@ -76,7 +78,7 @@ function eachLine(state, from, to, fn) {
   }
 }
 
-export function buildDecorations(state, { mode = 'live', propsOpen = false } = {}) {
+export function buildDecorations(state, { mode = 'live', propsOpen = false, busy = false } = {}) {
   if (mode === 'source') return Decoration.none
   const ctx = state.facet(noteContext)
   const { touches, lineTouched } = selectionToucher(state, mode)
@@ -111,7 +113,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
             return false
           }
           const text = doc.sliceString(from, to)
-          add(from, to, Decoration.replace({ widget: new FrontmatterWidget(text, propsOpen, from, { noteEditable: ctx.editable === true, locked }), block: true }))
+          add(from, to, Decoration.replace({ widget: new FrontmatterWidget(text, propsOpen, from, { noteEditable: ctx.editable === true, locked, viewEditable: state.facet(EditorView.editable), busy }), block: true }))
           return false
         }
         case 'ATXHeading1':
@@ -460,10 +462,10 @@ function addIndentGuides(state, add) {
 
 export const previewField = StateField.define({
   create(state) {
-    return { deco: buildDecorations(state, { mode: 'live' }), mode: 'live', composing: false, propsOpen: false }
+    return { deco: buildDecorations(state, { mode: 'live' }), mode: 'live', composing: false, propsOpen: false, busy: false }
   },
   update(value, tr) {
-    let { mode, composing, propsOpen } = value
+    let { mode, composing, propsOpen, busy } = value
     let changed = false
     for (const effect of tr.effects) {
       if (effect.is(setMode)) {
@@ -475,12 +477,15 @@ export const previewField = StateField.define({
       } else if (effect.is(togglePropsPanel)) {
         propsOpen = effect.value ?? !propsOpen
         changed = true
+      } else if (effect.is(setNoteBusy)) {
+        busy = effect.value === true
+        changed = true
       }
     }
     // 日本語の変換中は表示を切り替えない。変換が終わってからまとめて直す。
-    if (composing) return { ...value, composing, mode, propsOpen, deco: value.deco.map(tr.changes) }
+    if (composing) return { ...value, composing, mode, propsOpen, busy, deco: value.deco.map(tr.changes) }
     if (changed || tr.docChanged || tr.selection) {
-      return { deco: buildDecorations(tr.state, { mode, propsOpen }), mode, composing, propsOpen }
+      return { deco: buildDecorations(tr.state, { mode, propsOpen, busy }), mode, composing, propsOpen, busy }
     }
     return value
   },

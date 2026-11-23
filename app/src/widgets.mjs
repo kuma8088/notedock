@@ -1,5 +1,5 @@
-import { redo, undo } from '@codemirror/commands'
-import { EditorView, runScopeHandlers, WidgetType } from '@codemirror/view'
+import { historyField, isolateHistory, redo, redoDepth, undo, undoDepth } from '@codemirror/commands'
+import { runScopeHandlers, WidgetType } from '@codemirror/view'
 
 import { fileUrl } from './access.mjs'
 import { askText, showMessage } from './dialogs.mjs'
@@ -18,7 +18,7 @@ import {
   setAlign,
   sortRows,
 } from './table-model.mjs'
-import { TASK_QUICK_KEYS, isTaskItems, statusOptions, taskFieldKind } from './tasks.mjs'
+import { DATE_FIELD_IDLE, dateFieldStep, isTaskItems, propsRowAccess, statusOptions, taskFieldKind } from './tasks.mjs'
 import { deleteProperty, parseFrontmatter, renameProperty, setProperty } from './yaml-lite.mjs'
 
 const CALLOUT_LABEL = {
@@ -444,21 +444,78 @@ export class MermaidWidget extends WidgetType {
 }
 
 // 置き換える前に、その場所の文字が部品を作ったときのままか確かめる。違えば書き換えない。
-function replaceAt(view, from, source, next) {
+function replaceAt(view, from, source, next, annotations = []) {
   if (view.state.doc.sliceString(from, from + source.length) !== source) {
     showMessage('内容が変わったので、この操作は行いませんでした。もう一度やり直してください。')
     return false
   }
-  if (source !== next) view.dispatch({ changes: { from, to: from + source.length, insert: next } })
+  if (source !== next) view.dispatch({ changes: { from, to: from + source.length, insert: next }, annotations })
   return true
 }
 
-function replaceBlock(view, node, source, next) {
+function replaceBlock(view, node, source, next, annotations = []) {
   if (!view.contentDOM.contains(node)) {
     showMessage('内容が変わったので、この操作は行いませんでした。もう一度やり直してください。')
     return false
   }
-  return replaceAt(view, view.posAtDOM(node), source, next)
+  return replaceAt(view, view.posAtDOM(node), source, next, annotations)
+}
+
+// プロパティ欄から行った変更の履歴。閲覧の表示（読み取り専用）では CodeMirror の undo/redo が止まるので、
+// この欄から直した分だけを、ここで覚えて戻せるようにする。
+// done・undone には、変更（または戻し）の直後の本文と履歴の深さを積む。今の本文と深さが一致するときだけ戻す。
+// 間に編集の表示での入力や取り消しがあれば深さか本文がずれるので、ほかの変更を巻き込まない。
+const propsSteps = new WeakMap()
+
+function stepsOf(view) {
+  let steps = propsSteps.get(view)
+  if (!steps) propsSteps.set(view, (steps = { done: [], undone: [] }))
+  return steps
+}
+
+function recordPropsChange(view) {
+  const steps = stepsOf(view)
+  steps.done.push({ doc: view.state.doc, depth: undoDepth(view.state) })
+  steps.undone.length = 0
+}
+
+// readOnly を見ずに、履歴を1つ戻す（進める）。@codemirror/commands の undo/redo は readOnly のとき何もしないため、
+// 同じ中身（historyField の pop を取り出して dispatch する）を、ここだけで行う。
+function historyStep(view, side) {
+  const history = view.state.field(historyField, false)
+  if (typeof history?.pop !== 'function') return false
+  const tr = history.pop(side, view.state, false)
+  if (!tr) return false
+  view.dispatch(tr)
+  return true
+}
+
+// プロパティ欄の中の Cmd+Z / Shift+Cmd+Z（Windows は Ctrl）。読み取り専用のときに使う。戻せたら true。
+function runPropsHistory(view, kind) {
+  const steps = stepsOf(view)
+  const state = view.state
+  if (kind === 'undo') {
+    const last = steps.done.at(-1)
+    if (!last || undoDepth(state) !== last.depth || !state.doc.eq(last.doc) || !historyStep(view, 0)) return false
+    steps.done.pop()
+    steps.undone.push({ doc: view.state.doc, depth: redoDepth(view.state), redo: last })
+    return true
+  }
+  const last = steps.undone.at(-1)
+  if (!last || redoDepth(state) !== last.depth || !state.doc.eq(last.doc) || !historyStep(view, 1)) return false
+  steps.undone.pop()
+  steps.done.push({ doc: view.state.doc, depth: undoDepth(view.state) })
+  return true
+}
+
+// 作り直した欄に、同じ項目のフォーカスを戻す（続けて Cmd+Z を押せるように）。
+function focusPropsField(view, key) {
+  for (const field of view.dom.querySelectorAll('.cm-props .cm-props-value')) {
+    if (field.getAttribute('aria-label') === key && !field.disabled) {
+      field.focus()
+      return
+    }
+  }
 }
 
 const menuHost = { current: null }
@@ -814,16 +871,30 @@ export class TableWidget extends WidgetType {
 
 export class FrontmatterWidget extends WidgetType {
   // noteEditable: ノートそのものが編集できるか（閲覧の表示かどうかとは別）。locked: 閲覧の表示か、読み取り専用か。
-  constructor(source, open, pos, { noteEditable = false, locked = false } = {}) {
+  // viewEditable: 画面が編集できるか（EditorView.editable）。busy: ノートを動かしている間など、欄をすべて止めるとき。
+  constructor(source, open, pos, { noteEditable = false, locked = false, viewEditable = false, busy = false } = {}) {
     super()
     this.source = source
     this.open = open
     this.pos = pos
     this.noteEditable = noteEditable
     this.locked = locked
+    this.viewEditable = viewEditable
+    this.busy = busy
   }
   eq(other) {
-    return other.source === this.source && other.open === this.open && other.noteEditable === this.noteEditable && other.locked === this.locked
+    return (
+      other.source === this.source &&
+      other.open === this.open &&
+      other.noteEditable === this.noteEditable &&
+      other.locked === this.locked &&
+      other.viewEditable === this.viewEditable &&
+      other.busy === this.busy
+    )
+  }
+  // その行の名前と値を直せるか。
+  access(item, simple, task) {
+    return propsRowAccess({ key: item.key, task, simple, noteEditable: this.noteEditable, viewEditable: this.viewEditable, busy: this.busy })
   }
   toDOM(view) {
     const { items, simple } = parseFrontmatter(this.source)
@@ -834,19 +905,28 @@ export class FrontmatterWidget extends WidgetType {
     head.addEventListener('click', () => view.dom.dispatchEvent(new CustomEvent('note-toggle-props', { bubbles: true })))
     wrap.append(head)
     if (!this.open) return wrap
-    const apply = (next) => replaceBlock(view, wrap, this.source, next)
-    const editable = view.state.facet(EditorView.editable)
+    // 欄からの変更は、1つずつ取り消せるように履歴を区切り、読み取り専用でも戻せるように覚えておく。
+    // refocus: 作り直した欄で、同じ項目にフォーカスを戻す（ステータスを選んだあと、続けて Cmd+Z を押せるように）。
+    const apply = (next, refocus) => {
+      const before = view.state.doc
+      const ok = replaceBlock(view, wrap, this.source, next, [isolateHistory.of('full')])
+      if (ok && view.state.doc !== before) {
+        recordPropsChange(view)
+        if (refocus) focusPropsField(view, refocus)
+      }
+      return ok
+    }
     // タスクのノートは、閲覧の表示のままでもステータス・開始日・期日だけは直せる。
     const task = isTaskItems(items)
-    const quick = task && simple && this.noteEditable
+    const editable = simple && this.viewEditable && !this.busy
     if (!simple) {
       wrap.append(element('p', { class: 'cm-props-note' }, ['入れ子などがあるので、文字のまま編集します。']))
     }
     for (const item of items) {
-      const full = simple && editable
-      wrap.append(this.row(view, item, full, apply, { task, valueEditable: full || (quick && TASK_QUICK_KEYS.includes(item.key)) }))
+      const { full, value } = this.access(item, simple, task)
+      wrap.append(this.row(view, item, full, apply, { task, valueEditable: value }))
     }
-    if (simple && editable) {
+    if (editable) {
       const add = element('button', { type: 'button', class: 'cm-props-add' }, ['＋ 項目を追加'])
       add.addEventListener('click', async () => {
         const name = await askText('追加する項目の名前')
@@ -883,6 +963,15 @@ export class FrontmatterWidget extends WidgetType {
           event.stopPropagation()
           return
         }
+        // 閲覧の表示（読み取り専用）では、この欄から直した分だけを戻す。
+        const kind = view.state.readOnly ? historyKey(event) : null
+        if (kind) {
+          event.preventDefault()
+          const key = input.getAttribute('aria-label')
+          if (runPropsHistory(view, kind)) focusPropsField(view, key)
+          else showMessage(kind === 'undo' ? '閲覧の表示では、この欄から直した分だけ戻せます。ほかの変更は、編集に切り替えてから戻してください。' : 'やり直せる変更がありません。')
+          return
+        }
         if (runFieldHistory(event, view, input, input.value !== initial, () => {})) return
         if (isSaveKey(event)) {
           event.preventDefault()
@@ -900,8 +989,8 @@ export class FrontmatterWidget extends WidgetType {
   }
   valueInput(item, editable, apply, task = false) {
     let input
-    const commit = (value) => {
-      if (JSON.stringify(value) !== JSON.stringify(item.value)) apply(setProperty(this.source, item.key, value))
+    const commit = (value, refocus = false) => {
+      if (JSON.stringify(value) !== JSON.stringify(item.value)) apply(setProperty(this.source, item.key, value), refocus ? item.key : null)
     }
     const kind = task ? taskFieldKind(item.key, item.value) : null
     if (kind === 'status') {
@@ -911,27 +1000,19 @@ export class FrontmatterWidget extends WidgetType {
         if (value === item.value) option.selected = true
         input.append(option)
       }
-      input.addEventListener('change', () => commit(input.value))
+      input.addEventListener('change', () => commit(input.value, true))
     } else if (kind === 'date') {
       input = element('input', { type: 'date', class: 'cm-props-value', value: item.value, 'aria-label': item.key })
-      // 日付の欄は、キーで打っている途中でも日付として成り立つと change が来る（年の1桁目で 0002 になる）。
-      // キーで打ったときは、欄を離れるか Enter で確定する。カレンダーから選んだときは、すぐ確定する。
-      let typed = false
-      let pending = false
-      const flush = () => {
-        if (pending) commit(input.value)
-        pending = false
-        typed = false
+      // 確定のしかたは tasks.mjs の dateFieldStep にまとめてある（キーで打ったら欄を離れるか Enter、選んだらすぐ）。
+      let state = DATE_FIELD_IDLE
+      const step = (event) => {
+        const next = dateFieldStep(state, event)
+        state = { typed: next.typed, pending: next.pending }
+        if (next.commit) commit(input.value)
       }
-      input.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter') flush()
-        else if (!event.isComposing && event.key !== 'Tab') typed = true
-      })
-      input.addEventListener('change', () => {
-        if (typed && input.matches(':focus')) pending = true
-        else commit(input.value)
-      })
-      input.addEventListener('blur', flush)
+      input.addEventListener('keydown', (event) => step({ type: 'keydown', key: event.key, composing: event.isComposing }))
+      input.addEventListener('change', () => step({ type: 'change', focused: input.matches(':focus') }))
+      input.addEventListener('blur', () => step({ type: 'blur' }))
     } else if (kind === 'text') {
       input = element('input', { type: 'text', class: 'cm-props-value', value: item.value, 'aria-label': item.key })
       input.addEventListener('change', () => commit(input.value))

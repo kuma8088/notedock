@@ -11,7 +11,7 @@ function unquote(value) {
   return match[1] === '"' ? match[2].replace(/\\(["\\])/g, '$1') : match[2]
 }
 
-// 引用符なしで書かれたリンク（goal: [[…]]）を、リストではなくリンクとして読む項目。
+// 引用符なしで書かれたリンク（goal: [[…]]）を、リストではなくリンクとして読む項目。小文字の名前だけを対象にする。
 const LINK_KEYS = new Set(['goal', 'parent'])
 const BARE_LINK = /^\[\[[^\[\]]+\]\]$/
 
@@ -60,7 +60,7 @@ export function parseFrontmatter(source) {
       i = end
       continue
     }
-    if (LINK_KEYS.has(key.toLowerCase()) && BARE_LINK.test(raw)) {
+    if (LINK_KEYS.has(key) && BARE_LINK.test(raw)) {
       items.push({ key, value: raw, type: 'text', start: i, end: i + 1, quoted: false })
       i += 1
       if (i < lines.length - 1 && /^\s+\S/.test(lines[i]) && !LIST_ITEM.test(lines[i])) simple = false
@@ -83,26 +83,32 @@ export function parseFrontmatter(source) {
   return { simple, items, lines }
 }
 
+// 二重引用符で囲む。\ と " だけを逃がす（unquote と往復させる）。
+function doubleQuote(text) {
+  return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
 function quoteIfNeeded(value) {
   const text = String(value)
   if (text === '') return ''
-  if (/^[\s>|{[&*!%@`#]|: |\s#|\s$|^["']/.test(text)) return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+  if (/^[\s>|{[&*!%@`#]|: |\s#|\s$|^["']/.test(text)) return doubleQuote(text)
   return text
 }
 
-function renderItem(key, value) {
+function renderItem(key, value, quote = false) {
   if (Array.isArray(value)) {
     if (value.length === 0) return [`${key}:`]
     return [`${key}:`, ...value.map((item) => `  - ${quoteIfNeeded(item)}`)]
   }
-  const text = quoteIfNeeded(value)
+  const text = quote ? doubleQuote(String(value)) : quoteIfNeeded(value)
   return [text === '' ? `${key}:` : `${key}: ${text}`]
 }
 
-export function setProperty(source, key, value) {
+// quote: true のときは、値をいつも二重引用符で囲む（空でも "" と書く）。
+export function setProperty(source, key, value, { quote = false } = {}) {
   const { items, lines } = parseFrontmatter(source)
   const item = items.find((candidate) => candidate.key === key)
-  const rendered = renderItem(key, value)
+  const rendered = renderItem(key, value, quote)
   if (item) lines.splice(item.start, item.end - item.start, ...rendered)
   else lines.splice(lines.length - 1, 0, ...rendered)
   return lines.join('\n')

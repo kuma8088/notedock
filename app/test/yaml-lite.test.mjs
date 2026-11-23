@@ -39,6 +39,20 @@ test('goal と parent は、引用符があってもなくてもリンクとし�
   assert.match(setProperty(bare, 'goal', '[[x]]'), /^goal: "\[\[x\]\]"$/m)
 })
 
+test('goal・parent は小文字の名前だけをリンクとして読む', () => {
+  assert.deepEqual(valueOf('---\nGoal: [[a]]\n---', 'Goal'), ['[a]'])
+  assert.deepEqual(valueOf('---\nPARENT: [[a]]\n---', 'PARENT'), ['[a]'])
+  assert.equal(valueOf('---\ngoal: [[a]]\n---', 'goal'), '[[a]]')
+})
+
+test('quote: true のときは、いつも二重引用符で書く', () => {
+  assert.equal(setProperty('---\n---', 'title', 'x', { quote: true }), '---\ntitle: "x"\n---')
+  assert.equal(setProperty('---\n---', 'title', '', { quote: true }), '---\ntitle: ""\n---')
+  assert.equal(setProperty('---\n---', 'title', 'a"b\\c', { quote: true }), '---\ntitle: "a\\"b\\\\c"\n---')
+  // 指定しなければ今までどおり。
+  assert.equal(setProperty('---\n---', 'title', 'x'), '---\ntitle: x\n---')
+})
+
 test('goal・parent 以外の項目と、リンクでない角かっこの読み方は変えない', () => {
   assert.deepEqual(valueOf('---\nrelated: [[a]]\n---', 'related'), ['[a]'])
   assert.deepEqual(valueOf('---\ngoal: [a, b]\n---', 'goal'), ['a', 'b'])

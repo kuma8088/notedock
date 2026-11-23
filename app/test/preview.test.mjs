@@ -7,9 +7,9 @@ import { EditorState, EditorSelection } from '@codemirror/state'
 import { headingsOf, linkCompletion } from '../src/complete.mjs'
 import { relativeHref, resolveHref, slugify } from '../src/links.mjs'
 import { noteMarkdown } from '../src/markdown-ext.mjs'
-import { atNoteStart, findCallouts, headingPlace, hiddenRanges, noteContext, previewField, setComposing, setMode } from '../src/preview.mjs'
+import { atNoteStart, findCallouts, headingPlace, hiddenRanges, noteContext, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from '../src/preview.mjs'
 import { addColumn, addRow, deleteRow, parseTable, replaceCell, setAlign, sortRows, splitRow } from '../src/table-model.mjs'
-import { CheckboxWidget, TableWidget, cleanCss, hasExternalRef, imagePlan, isExternalHref, keepHref } from '../src/widgets.mjs'
+import { CheckboxWidget, FrontmatterWidget, TableWidget, cleanCss, hasExternalRef, imagePlan, isExternalHref, keepHref } from '../src/widgets.mjs'
 import { deleteProperty, inferType, parseFrontmatter, renameProperty, setProperty } from '../src/yaml-lite.mjs'
 
 function make(doc, cursor = doc.length) {
@@ -223,6 +223,72 @@ test('編集できないノートでは、表とチェックを変えられな�
   const free = make(text)
   assert.equal(widgetsOf(free, TableWidget)[0].readOnly, false)
   assert.equal(widgetsOf(free, CheckboxWidget)[0].readOnly, false)
+})
+
+test('プロパティ欄：ノートが編集できるか・表示・動かしている間の組み合わせごとの状態', async () => {
+  const { EditorView } = await import('@codemirror/view')
+  const text = '---\ntitle: "x"\ntype: task\nstatus: 未着手\nstart:\ndue: 2026-11-30\n---\n本文'
+  // main.mjs の editableExtensions と同じ決め方（ノートが編集できて、閲覧の表示でないときだけ画面も編集できる）。
+  const stateOf = ({ editable, mode, busy = false }) => {
+    const allow = editable && mode !== 'reading'
+    const base = EditorState.create({
+      doc: text,
+      selection: EditorSelection.cursor(text.length),
+      extensions: [noteMarkdown(), noteContext.of({ path: 'a/b.md', known: new Set(), editable }), previewField, EditorView.editable.of(allow), EditorState.readOnly.of(!allow)],
+    })
+    return base.update({ effects: [setMode.of(mode), togglePropsPanel.of(true), setNoteBusy.of(busy)] }).state
+  }
+  const widgetOf = (opts) => {
+    const found = widgetsOf(stateOf(opts), FrontmatterWidget)
+    assert.equal(found.length, 1)
+    return found[0]
+  }
+  const fields = (w) => ({ open: w.open, noteEditable: w.noteEditable, locked: w.locked, viewEditable: w.viewEditable, busy: w.busy })
+  const items = parseFrontmatter(text.slice(0, text.indexOf('\n---\n') + 4)).items
+  const accessOf = (w, key) => w.access(items.find((item) => item.key === key), true, true)
+
+  const liveEdit = widgetOf({ editable: true, mode: 'live' })
+  assert.deepEqual(fields(liveEdit), { open: true, noteEditable: true, locked: false, viewEditable: true, busy: false })
+  assert.deepEqual(accessOf(liveEdit, 'title'), { full: true, value: true })
+
+  const reading = widgetOf({ editable: true, mode: 'reading' })
+  assert.deepEqual(fields(reading), { open: true, noteEditable: true, locked: true, viewEditable: false, busy: false })
+  assert.deepEqual(accessOf(reading, 'status'), { full: false, value: true })
+  assert.deepEqual(accessOf(reading, 'due'), { full: false, value: true })
+  assert.deepEqual(accessOf(reading, 'title'), { full: false, value: false })
+
+  const lockedNote = widgetOf({ editable: false, mode: 'live' })
+  assert.deepEqual(fields(lockedNote), { open: true, noteEditable: false, locked: true, viewEditable: false, busy: false })
+  assert.deepEqual(accessOf(lockedNote, 'status'), { full: false, value: false })
+  const lockedReading = widgetOf({ editable: false, mode: 'reading' })
+  assert.deepEqual(accessOf(lockedReading, 'status'), { full: false, value: false })
+
+  // 動かしている間は、閲覧・編集どちらでも止める。
+  for (const mode of ['live', 'reading']) {
+    const busy = widgetOf({ editable: true, mode, busy: true })
+    assert.equal(busy.busy, true)
+    assert.deepEqual(accessOf(busy, 'status'), { full: false, value: false }, mode)
+    assert.deepEqual(accessOf(busy, 'title'), { full: false, value: false }, mode)
+  }
+
+  // 状態が違えば eq は false（作り直す）、同じなら true。
+  const all = [
+    liveEdit,
+    reading,
+    lockedNote,
+    widgetOf({ editable: true, mode: 'live', busy: true }),
+    widgetOf({ editable: true, mode: 'reading', busy: true }),
+  ]
+  for (const [i, a] of all.entries()) {
+    for (const [j, b] of all.entries()) assert.equal(a.eq(b), i === j, `${i} vs ${j}`)
+  }
+  assert.equal(reading.eq(widgetOf({ editable: true, mode: 'reading' })), true)
+  // 編集できないノートは、閲覧でも編集の表示でも欄の中身が同じなので、作り直さない。
+  assert.equal(lockedNote.eq(lockedReading), true)
+
+  // busy を false に戻すと、表示を作り直して元の状態に戻る。
+  const back = stateOf({ editable: true, mode: 'reading', busy: true }).update({ effects: setNoteBusy.of(false) }).state
+  assert.equal(widgetsOf(back, FrontmatterWidget)[0].eq(reading), true)
 })
 
 test('閉じていないYAMLや数式の枠があっても、その先の文書を読める', () => {

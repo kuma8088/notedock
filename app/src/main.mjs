@@ -36,7 +36,7 @@ import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { noteContext, previewField, setComposing, setMode, togglePropsPanel } from './preview.mjs'
+import { noteContext, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
 import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
@@ -2386,7 +2386,9 @@ async function doMove(from, to, rename = false, confirm = false) {
   const holdsCurrent = currentPath && inside(currentPath, from)
   // 右の枠で開いているノート（またはそれを含むフォルダー）を動かすときは、右の書きかけも動かす直前に保存する。
   const rightPath = split?.isOpen() && rightState.path && inside(rightState.path, from) ? rightState.path : null
-  const lock = (locked) => view?.dispatch({ effects: editableSlot.reconfigure(editableExtensions(locked ? false : editable)) })
+  // 動かしている間は、閲覧の表示でもプロパティ欄（タスクのステータス・日付）を止める。戻すときは欄を作り直す。
+  const lock = (locked) =>
+    view?.dispatch({ effects: [editableSlot.reconfigure(editableExtensions(locked ? false : editable)), setNoteBusy.of(locked)] })
   if (holdsCurrent) lock(true)
   let moved
   try {
