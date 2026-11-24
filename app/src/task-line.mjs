@@ -8,9 +8,13 @@ import { TASK_FOLDER, readTaskProps } from './tasks.mjs'
 // ---- 行を読む ----
 
 // 引用の > の並び・字下げ・残り。alpha-list.mjs と同じ分け方。
-const LINE = /^((?:[\t ]*>[\t ]?)*)([\t ]*)(.*)$/
+// 残りは [\s\S] で取る（U+2028・U+2029・CR を含む行でも合うように）。
+const LINE = /^((?:[\t ]*>[\t ]?)*)([\t ]*)([\s\S]*)$/
 const LIST_MARK = /^(?:[-*+]|\d{1,9}[.)])(?:[\t ]+|$)/
-const CHECKBOX = /^\[[^\]]\](?:[\t ]+|$)/
+// チェックボックスは1文字の記号（空白・x・X・/・-）だけ。
+const CHECKBOX = /^\[[ xX\/-]\](?:[\t ]+|$)/
+// 区切り線（* * *・- - -・___ など）。箇条書きの記号と見分ける。
+const RULE = /^(?:(?:\*[\t ]*){3,}|(?:-[\t ]*){3,}|(?:_[\t ]*){3,})$/
 const HEADING = /^#{1,6}(?:[\t ]|$)/
 const FENCE = /^(\x60{3,}|~{3,})/
 const WIKI = /!?\[\[([^\[\]\n]+)\]\]/g
@@ -26,7 +30,7 @@ function widthOf(indent) {
 }
 
 // ノート全体を行に分けて、行ごとの種類を決める。lines[i] は 0 から数える。
-// kind: 'front'（先頭のプロパティ）・'code'（コードブロックの中と、その囲みの行）・'heading'・'list'・'text'・'blank'。
+// kind: 'front'（先頭のプロパティ）・'code'（コードブロックの中と、その囲みの行）・'heading'・'rule'（区切り線）・'list'・'text'・'blank'。
 export function analyzeLines(text) {
   const raw = String(text ?? '').split('\n')
   const out = []
@@ -63,6 +67,10 @@ export function analyzeLines(text) {
     }
     if (HEADING.test(rest) && widthOf(indent) < 4) {
       out.push({ ...base, kind: 'heading' })
+      continue
+    }
+    if (RULE.test(rest) && widthOf(indent) < 4) {
+      out.push({ ...base, kind: 'rule' })
       continue
     }
     const mark = LIST_MARK.exec(rest)
@@ -111,7 +119,7 @@ export function isWeekLinkOnly(body) {
   if (links.length === 0) return false
   let rest = body
   for (const link of [...links].reverse()) rest = rest.slice(0, link.start) + rest.slice(link.end)
-  rest = rest.replace(/※.*$/, '').replace(/\*\*|__/g, '')
+  rest = rest.replace(/※[\s\S]*$/, '').replace(/\*\*|__/g, '')
   return rest.trim() === ''
 }
 
@@ -122,12 +130,12 @@ export function isStruck(body) {
 }
 
 const foldCase = (text) => text.normalize('NFC').toLowerCase()
+const underFolder = (path, folder = TASK_FOLDER) => typeof path === 'string' && foldCase(path).startsWith(foldCase(folder) + '/')
 
 // 行に、Tasks/ の下のノートへのリンクがあるか。表示名ではなくリンク先で判定する。
 // known（Vault のノートの Set）を渡すと、名前だけのリンクも今のエディターと同じ規則で解決する。
 export function hasTaskLink(text, notePath, known, folder = TASK_FOLDER) {
-  const prefix = foldCase(folder) + '/'
-  const under = (path) => typeof path === 'string' && foldCase(path).startsWith(prefix)
+  const under = (path) => underFolder(path, folder)
   for (const match of String(text ?? '').matchAll(WIKI)) {
     const parsed = parseWikiLink(match[1])
     if (!parsed?.file) continue
@@ -145,14 +153,15 @@ export function hasTaskLink(text, notePath, known, folder = TASK_FOLDER) {
 
 const linkOfPath = (path) => '[[' + path.replace(/\.md$/i, '') + ']]'
 
-// 開いているノートが、タスクを作れるノートか。週・月・四半期のノートなら kind: 'periodic'、type: task のノートなら kind: 'task'。ほかは null。
+// 開いているノートが、タスクを作れるノートか。週・月・四半期のノートなら kind: 'periodic'、
+// Tasks/ の下（フォルダー名の大文字小文字は問わない）の type: task のノートなら kind: 'task'。ほかは null。
 export function taskSourceOf({ path, text, periodicRoot }) {
   if (typeof path !== 'string') return null
   const periodic = periodicRoot ? periodicNoteOf(periodicRoot, path) : null
   if (periodic && ['weekly', 'monthly', 'quarterly'].includes(periodic.period)) {
     return { kind: 'periodic', period: periodic.period, name: periodic.name, start: periodic.start, end: periodic.end, goal: linkOfPath(path) }
   }
-  const props = readTaskProps(text)
+  const props = underFolder(path) ? readTaskProps(text) : null
   if (props) return { kind: 'task', goal: props.goal, parent: linkOfPath(path), due: isValidDate(props.due) ? props.due : '' }
   return null
 }
@@ -163,7 +172,8 @@ const DAY_MS = 86400000
 const pad = (n) => String(n).padStart(2, '0')
 
 // 週の名前と、横に書いた終わりの日（M/D）から期日を決める。
-// 年は、週の名前から出した ISO の日曜にいちばん近い年。その年で日付として成り立たなければ ISO の日曜。
+// 年は、週の名前から出した ISO の日曜にいちばん近い年。その年で日付として成り立たないときと、
+// ISO の日曜から14日より離れているとき（書き間違いとみなす）は ISO の日曜。
 export function weekDue(name, range) {
   const week = weekRange(name)
   if (!week) return null
@@ -177,10 +187,12 @@ export function weekDue(name, range) {
     if (!best || distance < best.distance) best = { year, distance }
   }
   const date = best.year + '-' + pad(range.month) + '-' + pad(range.day)
-  return isValidDate(date) ? date : week.end
+  if (!isValidDate(date)) return week.end
+  return Math.abs(Date.parse(date + 'T00:00:00Z') - sunday) > 14 * DAY_MS ? week.end : date
 }
 
-// 行の親にあたる箇条書きを、近いものから順に返す（何段上でも）。見出し・先頭のプロパティ・引用の深さが違う行で止まる。
+// 行の親にあたる箇条書きを、近いものから順に返す（何段上でも）。見出し・区切り線・先頭のプロパティ・引用の深さが違う行で止まる。
+// 箇条書きでない行（注記の ※ … など）は飛ばして続ける。
 export function ancestorsOf(rows, index) {
   const self = rows[index]
   const out = []
@@ -188,9 +200,8 @@ export function ancestorsOf(rows, index) {
   for (let i = index - 1; i >= 0 && limit > 0; i--) {
     const row = rows[i]
     if (row.kind === 'blank' || row.kind === 'code') continue
-    if (row.kind === 'heading' || row.kind === 'front' || row.quote !== self.quote) break
-    if (row.indent >= limit) continue
-    if (row.kind !== 'list') break
+    if (row.kind === 'heading' || row.kind === 'rule' || row.kind === 'front' || row.quote !== self.quote) break
+    if (row.indent >= limit || row.kind !== 'list') continue
     out.push(row)
     limit = row.indent
   }
@@ -223,14 +234,9 @@ export function taskFromLine({ path, text, line, periodicRoot, known }) {
   let parent = ''
   let goal = source.goal
   if (source.kind === 'periodic') {
-    due = source.end
-    for (const up of ancestorsOf(rows, row.index)) {
-      const week = weekLinksOf(up.body).find((link) => link.valid)
-      if (week) {
-        due = weekDue(week.name, week.range)
-        break
-      }
-    }
+    // 親の週のリンクを先に見る。親になければ、その行自身の週のリンク。どちらもなければノートの期間の最終日。
+    const week = [...ancestorsOf(rows, row.index), row].map((r) => weekLinksOf(r.body).find((link) => link.valid)).find(Boolean)
+    due = week ? weekDue(week.name, week.range) : source.end
   } else {
     due = source.due
     parent = source.parent
@@ -245,9 +251,11 @@ const encoder = new TextEncoder()
 const bytesOf = (text) => encoder.encode(text).length
 const FALLBACK_NAME = 'タスク'
 export const TASK_NAME_MAX_BYTES = 255
+export const TASK_NAME_MAX_GRAPHEMES = 60
 
 // ファイル名に使えない・使いにくい文字を外す。リンクは表示名（なければノートの名前）にする。
-// 外すもの: / # | [ ] : \ < > " ? * と制御文字、太字の記号（** と __）。空白は1つにまとめる。先頭の . と、末尾の . と空白も外す。
+// / と : は - に置き換える（「6/4」→「6-4」、「19:00」→「19-00」）。Markdown のリンク [x](url) は表示の文字 x だけにする。
+// 外すもの: # | [ ] \ < > " ? * ^ ` と制御文字、太字の記号（** と __）、取り消し線の ~~。空白は1つにまとめる。先頭の . と - と空白、末尾の . と空白も外す。
 export function taskNameSlug(title) {
   let text = String(title ?? '').normalize('NFC')
   text = text.replace(/\[\[([^\[\]\n]*)\]\]/g, (all, inner) => {
@@ -255,10 +263,12 @@ export function taskNameSlug(title) {
     if (!parsed) return ''
     return parsed.alias || parsed.file.split('/').at(-1) || parsed.anchor
   })
-  text = text.replace(/\*\*|__/g, '')
+  text = text.replace(/!?\[([^\[\]\n]*)\]\([^()\n]*\)/g, '$1')
+  text = text.replace(/\*\*|__|~~/g, '')
   text = text.replace(/\s+/g, ' ')
+  text = text.replace(/[\/:]/g, '-')
   // eslint-disable-next-line no-control-regex
-  text = text.replace(/[\/#|\[\]:\\<>"?*\x00-\x1f\x7f]/g, '')
+  text = text.replace(/[#|\[\]\\<>"?*^\x60\x00-\x1f\x7f]/g, '')
   text = text.replace(/ {2,}/g, ' ')
   text = trimName(text)
   if (text === '') return FALLBACK_NAME
@@ -270,7 +280,21 @@ export function taskNameSlug(title) {
 }
 
 function trimName(text) {
-  return text.replace(/^[.\s]+/, '').replace(/[.\s]+$/, '')
+  // 先頭の - も外す（/ を置き換えた - で始まる名前や、コマンドのオプションと紛らわしい名前を避ける）。
+  return text.replace(/^[-.\s]+/, '').replace(/[.\s]+$/, '')
+}
+
+// 絵文字や結合文字を割らずに、書記素（見た目の1文字）で max 個まで残す。
+export function cutGraphemes(text, max) {
+  const segmenter = new Intl.Segmenter('ja', { granularity: 'grapheme' })
+  let out = ''
+  let count = 0
+  for (const { segment } of segmenter.segment(text)) {
+    if (count >= max) break
+    out += segment
+    count++
+  }
+  return out
 }
 
 // 絵文字や結合文字を割らずに、バイト数（UTF-8）が max 以下になるまで後ろから切る。
@@ -289,13 +313,13 @@ export function cutBytes(text, max) {
 }
 
 // 作成日-目標の文を縮めた名前.md。n が 2 以上なら -n を付ける（同じ名前が重なったとき）。
-// 拡張子と番号を含めて 255 バイトに収める。
-export function taskFileName(title, created, n = 1, { maxBytes = TASK_NAME_MAX_BYTES } = {}) {
+// 目標の文の部分は60文字（書記素で数える）で切り、そのうえで拡張子と番号を含めて 255 バイトに収める。
+export function taskFileName(title, created, n = 1, { maxBytes = TASK_NAME_MAX_BYTES, maxGraphemes = TASK_NAME_MAX_GRAPHEMES } = {}) {
   if (!isValidDate(created)) throw new Error('作成日の形が正しくありません：' + created)
   const suffix = n > 1 ? '-' + n : ''
   const head = created + '-'
   const room = maxBytes - bytesOf(head) - bytesOf(suffix) - bytesOf('.md')
-  let slug = trimName(cutBytes(taskNameSlug(title), room))
+  let slug = trimName(cutBytes(cutGraphemes(taskNameSlug(title), maxGraphemes), room))
   if (slug === '') slug = FALLBACK_NAME
   return head + slug + suffix + '.md'
 }

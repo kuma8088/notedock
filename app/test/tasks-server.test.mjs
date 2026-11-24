@@ -263,9 +263,9 @@ test('POST /api/tasks：同じ名前が続いたら -2、-3 を付ける。Tasks
     assert.equal(fs.existsSync(path.join(dir, 'Tasks')), false)
     const paths = []
     for (let i = 0; i < 3; i++) paths.push((await post({ title: '6/4 作品展へ出す。', created: '2026-05-03' })).data.path)
-    assert.deepEqual(paths, ['Tasks/2026-05-03-64 作品展へ出す。.md', 'Tasks/2026-05-03-64 作品展へ出す。-2.md', 'Tasks/2026-05-03-64 作品展へ出す。-3.md'])
+    assert.deepEqual(paths, ['Tasks/2026-05-03-6-4 作品展へ出す。.md', 'Tasks/2026-05-03-6-4 作品展へ出す。-2.md', 'Tasks/2026-05-03-6-4 作品展へ出す。-3.md'])
     // 作成日が違えば番号は付かない
-    assert.equal((await post({ title: '6/4 作品展へ出す。', created: '2026-06-01' })).data.path, 'Tasks/2026-06-01-64 作品展へ出す。.md')
+    assert.equal((await post({ title: '6/4 作品展へ出す。', created: '2026-06-01' })).data.path, 'Tasks/2026-06-01-6-4 作品展へ出す。.md')
     // 長い名前でも、番号を付けて 255 バイトに収める
     const long = 'あ'.repeat(120)
     const first = (await post({ title: long, created: '2026-05-03' })).data.path
@@ -287,6 +287,29 @@ test('POST /api/tasks：大文字小文字だけ違う Tasks のフォルダー�
   })
 })
 
+test('POST /api/tasks：Tasks がファイルのときは、名前の重なりと分けて tasks-folder を返す', async () => {
+  await withApp((dir) => fs.writeFileSync(path.join(dir, 'Tasks'), 'x'), async ({ dir, post }) => {
+    const { status, data } = await post({ title: 'ファイル', created: '2026-05-03' })
+    assert.equal(status, 400)
+    assert.deepEqual(data, { error: 'tasks-folder' })
+    assert.equal(fs.readFileSync(path.join(dir, 'Tasks'), 'utf8'), 'x')
+  })
+  // Vault の外を指すシンボリックリンクも同じ知らせ
+  const outside = makeRoot()
+  await withApp((dir) => fs.symlinkSync(outside, path.join(dir, 'Tasks')), async ({ post }) => {
+    assert.deepEqual((await post({ title: '外へ', created: '2026-05-03' })).data, { error: 'tasks-folder' })
+  })
+  // 名前の重なりは今までどおり番号を付けて作る
+  await withApp((dir) => {
+    fs.mkdirSync(path.join(dir, 'Tasks'))
+    fs.writeFileSync(path.join(dir, 'Tasks', '2026-05-03-重なり.md'), 'x')
+  }, async ({ post }) => {
+    const { status, data } = await post({ title: '重なり', created: '2026-05-03' })
+    assert.equal(status, 201)
+    assert.equal(data.path, 'Tasks/2026-05-03-重なり-2.md')
+  })
+})
+
 test('POST /api/tasks：Vault の外へ逃げない', async () => {
   const outside = makeRoot()
   await withApp((dir) => fs.symlinkSync(outside, path.join(dir, 'Tasks')), async ({ dir, post }) => {
@@ -298,7 +321,7 @@ test('POST /api/tasks：Vault の外へ逃げない', async () => {
   await withApp(null, async ({ dir, post }) => {
     const { status, data } = await post({ title: '../../../etc/passwd', created: '2026-05-03' })
     assert.equal(status, 201)
-    assert.equal(data.path, 'Tasks/2026-05-03-etcpasswd.md')
+    assert.equal(data.path, 'Tasks/2026-05-03-etc-passwd.md')
     assert.ok(fs.existsSync(path.join(dir, data.path)))
     // 作成日はパスの一部になるので、日付でなければ断る
     assert.equal((await post({ title: 'x', created: '../../x' })).status, 400)
@@ -330,6 +353,6 @@ test('POST /api/tasks：受け取る中身を確かめる', async () => {
     assert.equal(status, 201)
     const props = readTaskProps(fs.readFileSync(path.join(dir, data.path), 'utf8'))
     assert.deepEqual(props, { title: 'He said "hi": ok \\ x', status: '進行中', start: '2026-05-04', due: '', goal: '[[90_Periodic/2026/Monthly/2026-05]]', parent: '[[Tasks/2026-05-01-親]]' })
-    assert.equal(data.path, 'Tasks/2026-05-03-He said hi ok x.md')
+    assert.equal(data.path, 'Tasks/2026-05-03-He said hi- ok x.md')
   })
 })

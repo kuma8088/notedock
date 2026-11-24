@@ -292,8 +292,11 @@ test('タスクのノートの行：goal を引き継ぎ、parent にそのノ�
   assert.equal(sub.due, '')
   assert.equal(sub.goal, '')
   assert.equal(sub.parent, '[[Tasks/memo]]')
-  // type: task のノートなら、Tasks/ の外でも作れる（集めて一覧に出すのは Tasks/ の下だけ）。
-  assert.equal(at('Other/t.md', bare, '下の行').ok, true)
+  // タスクのノートとして扱うのは Tasks/ の下だけ（フォルダー名の大文字小文字は問わない）。
+  assert.equal(at('Other/t.md', bare, '下の行').reason, 'no-source')
+  assert.equal(at('TasksX/t.md', bare, '下の行').reason, 'no-source')
+  assert.equal(at('tasks/sub/t.md', bare, '下の行').ok, true)
+  assert.equal(at('TASKS/t.md', bare, '下の行').parent, '[[TASKS/t]]')
 })
 
 test('週・月・四半期・タスクのノート以外では作れない', () => {
@@ -344,16 +347,20 @@ test('週のリンクだけの行と、取り消し線の行', () => {
 })
 
 test('ファイル名：取り除く文字・太字の記号・リンクの括弧', () => {
-  assert.equal(taskNameSlug('a/b#c|d[e]f:g\\h<i>j"k?l*m'), 'abcdefghijklm')
+  assert.equal(taskNameSlug('a/b#c|d[e]f:g\\h<i>j"k?l*m'), 'a-bcdef-ghijklm')
+  assert.equal(taskNameSlug('3/9 19:00 公開'), '3-9 19-00 公開')
+  assert.equal(taskNameSlug('~~消す~~ \x60コード\x60 ^脚注'), '消す コード 脚注')
+  assert.equal(taskNameSlug('[資料](https://example.com/a?b=1)を読む'), '資料を読む')
+  assert.equal(taskNameSlug('![図](img/a.png) と [[Notes/b|リンク]]'), '図 と リンク')
   assert.equal(taskNameSlug('**太字**と__下線の太字__'), '太字と下線の太字')
   assert.equal(taskNameSlug('[[下描きは早い]]を読む'), '下描きは早いを読む')
   assert.equal(taskNameSlug('[[Notes/画材の一覧|画材]]を買う'), '画材を買う')
   assert.equal(taskNameSlug('[[Notes/画材の一覧#赤]]'), '画材の一覧')
-  assert.equal(taskNameSlug('6/4 作品展へ出す。'), '64 作品展へ出す。')
-  assert.equal(taskNameSlug('💰**収益目標：1万円(教室: $50)**'), '💰収益目標：1万円(教室 $50)')
+  assert.equal(taskNameSlug('6/4 作品展へ出す。'), '6-4 作品展へ出す。')
+  assert.equal(taskNameSlug('💰**収益目標：1万円(教室: $50)**'), '💰収益目標：1万円(教室- $50)')
   assert.equal(taskNameSlug('タブ\tと  空白'), 'タブ と 空白')
   assert.equal(taskNameSlug('改行\nの文'), '改行 の文')
-  assert.equal(taskNameSlug('a / b'), 'a b')
+  assert.equal(taskNameSlug('a / b'), 'a - b')
   assert.equal(taskFileName('**12回描く**', '2026-05-03'), '2026-05-03-12回描く.md')
   assert.equal(taskFileName('同じ', '2026-05-03', 2), '2026-05-03-同じ-2.md')
   assert.throws(() => taskFileName('x', '2026-02-30'))
@@ -364,6 +371,8 @@ test('ファイル名：先頭の . と、末尾の . と空白・何も残ら�
   assert.equal(taskNameSlug('...隠し.'), '隠し')
   assert.equal(taskNameSlug('  前後の空白 . . '), '前後の空白')
   assert.equal(taskNameSlug('///'), 'タスク')
+  assert.equal(taskNameSlug('- / -'), 'タスク')
+  assert.equal(taskNameSlug('/x'), 'x')
   assert.equal(taskNameSlug(''), 'タスク')
   assert.equal(taskNameSlug('CON'), 'CON_')
   assert.equal(taskNameSlug('nul.txt'), 'nul_.txt')
@@ -376,11 +385,16 @@ test('ファイル名：先頭の . と、末尾の . と空白・何も残ら�
 const bytes = (text) => new TextEncoder().encode(text).length
 const graphemes = (text) => [...new Intl.Segmenter('ja', { granularity: 'grapheme' }).segment(text)].map((s) => s.segment)
 
-test('ファイル名：長さは拡張子と番号を含めて255バイト。絵文字や結合文字を割らない', () => {
+test('ファイル名：長さは60文字（書記素）で切り、拡張子と番号を含めて255バイト。絵文字や結合文字を割らない', () => {
   const long = 'あ'.repeat(100)
   const name = taskFileName(long, '2026-05-03')
   assert.ok(bytes(name) <= 255)
-  assert.equal(name, '2026-05-03-' + 'あ'.repeat(80) + '.md')
+  assert.equal(name, '2026-05-03-' + 'あ'.repeat(60) + '.md')
+  assert.equal(taskFileName('a'.repeat(100), '2026-05-03', 3), '2026-05-03-' + 'a'.repeat(60) + '-3.md')
+  // 60文字でも 255 バイトを超えるとき（家族の絵文字は1文字で25バイト）は、バイト数で切る
+  const families = taskFileName('👨‍👩‍👧‍👦'.repeat(60), '2026-05-03')
+  assert.ok(bytes(families) <= 255)
+  assert.equal(graphemes(families.slice(11, -3)).length, 9)
   for (let n = 2; n <= 120; n += 9) assert.ok(bytes(taskFileName(long, '2026-05-03', n)) <= 255, String(n))
   // 家族の絵文字（ZWJ でつないだもの）と国旗、濁点を結合文字で書いたもの
   const family = '👨‍👩‍👧‍👦'
@@ -396,8 +410,8 @@ test('ファイル名：長さは拡張子と番号を含めて255バイト。�
     }
   }
   // 切ったあとの末尾の空白と . も外す
-  const spaced = 'あ'.repeat(79) + ' .いいい'
-  assert.equal(taskFileName(spaced, '2026-05-03'), '2026-05-03-' + 'あ'.repeat(79) + '.md')
+  const spaced = 'あ'.repeat(58) + ' .いいい'
+  assert.equal(taskFileName(spaced, '2026-05-03'), '2026-05-03-' + 'あ'.repeat(58) + '.md')
   assert.equal(cutBytes('🇯🇵🇯🇵', 9), '🇯🇵')
   assert.equal(cutBytes('🇯🇵', 7), '')
 })
@@ -410,4 +424,81 @@ test('作る中身は、title が往復しても変わらない', () => {
     assert.equal(props.goal, '[[90_Periodic/2026/Monthly/2026-05]]')
     assert.equal(props.parent, '[[Tasks/a]]')
   }
+})
+
+test('U+2028・U+2029・CR を含む行でも落ちない', () => {
+  const text = '- [[2026-W10]] (3/2-3/8)\r\n\t- [ ] 行の\u2028中で\u2029区切る\r\n- [ ] 終わり\r'
+  const path = '90_Periodic/2026/Monthly/2026-03.md'
+  const rows = analyzeLines(text)
+  assert.deepEqual(rows.map((row) => row.kind), ['list', 'list', 'list'])
+  const mid = taskFromLine({ path, text, line: 2, periodicRoot: ROOT })
+  assert.equal(mid.ok, true)
+  assert.equal(mid.title, '行の\u2028中で\u2029区切る')
+  assert.equal(mid.due, '2026-03-08')
+  assert.equal(taskFromLine({ path, text, line: 3, periodicRoot: ROOT }).title, '終わり')
+  assert.equal(goalTextOf('> - [ ] a\u2028b'), 'a\u2028b')
+  assert.equal(isWeekLinkOnly('[[2026-W10]] (3/2-3/8) ※注記\u2028続き'), true)
+  assert.equal(taskNameSlug('a\u2028b\u2029c\rd'), 'a b c d')
+})
+
+test('期日：横に書いた終わりの日が ISO の日曜から14日より離れていたら ISO の日曜', () => {
+  // 2026-W10 の ISO の日曜は 3/8
+  assert.equal(weekDue('2026-W10', { month: 3, day: 22 }), '2026-03-22')
+  assert.equal(weekDue('2026-W10', { month: 2, day: 22 }), '2026-02-22')
+  assert.equal(weekDue('2026-W10', { month: 3, day: 23 }), '2026-03-08')
+  assert.equal(weekDue('2026-W10', { month: 2, day: 21 }), '2026-03-08')
+  assert.equal(weekDue('2026-W10', { month: 8, day: 3 }), '2026-03-08')
+  const text = '- [[2026-W10]] (3/2-4/8)\n\t- [ ] 書き間違えた週'
+  assert.equal(taskFromLine({ path: '90_Periodic/2026/Monthly/2026-03.md', text, line: 2, periodicRoot: ROOT }).due, '2026-03-08')
+})
+
+test('期日：親に週のリンクがないときだけ、その行自身の週のリンクを使う', () => {
+  const text = [
+    '- [ ] [[2026-W11]] (3/9-3/15) までに出す',
+    '- [[2026-W10]] (3/2-3/8)',
+    '\t- [ ] [[2026-W12]] の準備',
+    '- 絵',
+    '\t- [ ] [[2026-W12]] に描く',
+    '\t- [ ] [[2025-W53]] 成り立たない週',
+  ].join('\n')
+  const path = '90_Periodic/2026/Monthly/2026-03.md'
+  const due = (needle) => at(path, text, needle).due
+  assert.equal(due('までに出す'), '2026-03-15')
+  assert.equal(due('の準備'), '2026-03-08')
+  assert.equal(due('に描く'), '2026-03-22')
+  assert.equal(due('成り立たない週'), '2026-03-31')
+})
+
+test('さかのぼる途中の箇条書きでない行は飛ばす。見出し・区切り線・引用の深さの違いでは止まる', () => {
+  const text = [
+    '- [[2026-W10]] (3/2-3/8)',
+    '※ 注記の行',
+    '\t- [ ] 注記の下の行',
+    '- [[2026-W11]] (3/9-3/15)',
+    '## 見出し',
+    '\t- [ ] 見出しの下の行',
+    '- [[2026-W12]] (3/16-3/22)',
+    '* * *',
+    '\t- [ ] 区切り線の下の行',
+    '- [[2026-W13]] (3/23-3/29)',
+    '> \t- [ ] 引用の中の行',
+  ].join('\n')
+  const path = '90_Periodic/2026/Monthly/2026-03.md'
+  const due = (needle) => at(path, text, needle).due
+  assert.equal(due('注記の下の行'), '2026-03-08')
+  assert.equal(due('見出しの下の行'), '2026-03-31')
+  assert.equal(due('区切り線の下の行'), '2026-03-31')
+  assert.equal(due('引用の中の行'), '2026-03-31')
+  assert.deepEqual(ancestorsOf(analyzeLines('- a\n\tメモ\n\t\t- b'), 2).map((row) => row.body), ['a'])
+})
+
+test('区切り線と、チェックボックスの記号', () => {
+  const rows = analyzeLines('* * *\n- - -\n***\n> - - -\n- [ ] a\n- [x] b\n- [X] c\n- [/] d\n- [-] e\n- [?] f\n- [>] g\n-  -')
+  assert.deepEqual(rows.map((row) => row.kind), ['rule', 'rule', 'rule', 'rule', 'list', 'list', 'list', 'list', 'list', 'list', 'list', 'list'])
+  assert.deepEqual(rows.slice(4).map((row) => row.checkbox), [true, true, true, true, true, false, false, false])
+  assert.deepEqual(rows.slice(4).map((row) => row.body), ['a', 'b', 'c', 'd', 'e', '[?] f', '[>] g', '-'])
+  const path = '90_Periodic/2026/Monthly/2026-03.md'
+  assert.equal(taskFromLine({ path, text: '- - -', line: 1, periodicRoot: ROOT }).reason, 'not-list')
+  assert.equal(taskFromLine({ path, text: '* * *', line: 1, periodicRoot: ROOT }).reason, 'not-list')
+  assert.equal(goalTextOf('- [?] 問い'), '[?] 問い')
 })

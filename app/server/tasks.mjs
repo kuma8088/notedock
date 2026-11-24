@@ -190,11 +190,24 @@ export function checkTaskInput(input) {
   }
 }
 
+// Tasks のフォルダーを用意する。作れない（Tasks がファイル・シンボリックリンク・Vault の外など）ときは、
+// 名前の重なりとは別の知らせ（400 { error: 'tasks-folder' }）にする。
+function ensureTaskFolder(root, folder) {
+  try {
+    const dir = resolveFolderPath(root, folder)
+    fs.mkdirSync(dir, { recursive: true })
+    if (!fs.lstatSync(dir).isDirectory()) throw new Error('not a folder')
+  } catch {
+    throw bad('tasks-folder')
+  }
+}
+
 // Tasks/ にタスクのノートを1つ作る。名前が重なったら -2、-3 … を付けて作り直す（wx で作るので、大文字小文字や
 // 濁点の持ち方だけが違う名前も、OS が重なりとして断る）。folder は実際のフォルダーの名前（なければ Tasks）。
 export function createTaskNote(root, input, { folder = TASK_FOLDER, maxTries = 100 } = {}) {
   const props = checkTaskInput(input)
   const text = buildTaskNote(props)
+  ensureTaskFolder(root, folder)
   for (let n = 1; n <= maxTries; n++) {
     const rel = `${folder}/${taskFileName(props.title, props.created, n)}`
     try {
