@@ -35,7 +35,9 @@ export function analyzeLines(text) {
   const raw = String(text ?? '').split('\n')
   const out = []
   let offset = 0
-  let front = raw[0] === '---' ? 'open' : 'none'
+  // 先頭のプロパティの囲み（--- と ...）は、行末の CR を外して比べる。
+  const bareOf = (line) => line.replace(/\r$/, '')
+  let front = bareOf(raw[0]) === '---' ? 'open' : 'none'
   let fence = null
   for (let i = 0; i < raw.length; i++) {
     const line = raw[i]
@@ -46,7 +48,7 @@ export function analyzeLines(text) {
     const rest = restRaw.replace(/\s+$/, '')
     const base = { index: i, from, to: from + line.length, text: line, quote, indent: widthOf(indent), rest }
     if (front === 'open') {
-      if (i > 0 && (line === '---' || line === '...')) front = 'done'
+      if (i > 0 && (bareOf(line) === '---' || bareOf(line) === '...')) front = 'done'
       out.push({ ...base, kind: 'front' })
       continue
     }

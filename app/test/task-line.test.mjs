@@ -439,6 +439,10 @@ test('U+2028・U+2029・CR を含む行でも落ちない', () => {
   assert.equal(goalTextOf('> - [ ] a\u2028b'), 'a\u2028b')
   assert.equal(isWeekLinkOnly('[[2026-W10]] (3/2-3/8) ※注記\u2028続き'), true)
   assert.equal(taskNameSlug('a\u2028b\u2029c\rd'), 'a b c d')
+  // CRLF のノートの先頭のプロパティ
+  const front = analyzeLines('---\r\ntags:\r\n  - monthly-plan\r\n---\r\n- [ ] x\r')
+  assert.deepEqual(front.map((row) => row.kind), ['front', 'front', 'front', 'front', 'list'])
+  assert.equal(taskFromLine({ path, text: '---\r\ntags:\r\n  - a\r\n---\r\n- [ ] x', line: 3, periodicRoot: ROOT }).reason, 'front')
 })
 
 test('期日：横に書いた終わりの日が ISO の日曜から14日より離れていたら ISO の日曜', () => {
