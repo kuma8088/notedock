@@ -954,6 +954,9 @@ input[type='checkbox'].cm-props-value { justify-self: start; accent-color: var(-
 select.cm-props-select { justify-self: start; max-width: 100%; font: inherit; cursor: pointer; padding: 2px 4px; }
 select.cm-props-select:disabled { cursor: default; opacity: 1; }
 .cm-props-note { margin: 4px; }
+/* タスクのノートの「このタスクを削除」。ほかのボタンと同じく控えめにし、触れたときだけ注意の色にする。 */
+.cm-props-trash { border: 0; background: none; cursor: pointer; color: var(--muted); padding: 2px 4px; border-radius: 4px; margin-left: 8px; }
+.cm-props-trash:hover { background: var(--hover); color: var(--danger, #c0392b); }
 
 .cm-panels { background: var(--surface) !important; color: var(--text) !important; border-color: var(--line) !important; font-family: var(--ui); font-size: 12.5px; }
 .cm-panel.cm-search input,

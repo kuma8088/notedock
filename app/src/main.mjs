@@ -47,6 +47,7 @@ import { beginTableCell, historyStep, showMenu } from './widgets.mjs'
 import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
 import { dailyDateOf } from './task-buckets.mjs'
 import { createTaskPanel } from './task-panel.mjs'
+import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceNoteOf, taskTitleOf, trashFailedText, unlinkRange } from './task-delete.mjs'
 import { MENU_HINT, canUndoDirectly, createFailedText, createdText, leftoverText, linkChange, linkRemoval, menuForLine, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
@@ -2770,7 +2771,14 @@ function bindTaskContextMenu() {
     // Shift を押しながらの右クリックは、いつものブラウザーのメニューにする。
     if (event.shiftKey || !view || !view.contentDOM.contains(event.target)) return
     if (event.target.closest?.('.cm-props, .cm-table-wrap, #task-panel')) return
+    // タスクのノートへのリンクの上なら「タスクを削除」。そうでなければ「タスクにする」が使える行か見る。
+    if (taskLinkContextMenu(event, view)) return
     taskContextMenu(event, view)
+  })
+  // タスクのノートのプロパティ欄の「このタスクを削除」。
+  // 開いているノートのエディターから来たものだけ受ける（ホバーの小窓などは別の部品なので、念のため確かめる）。
+  $('editor').addEventListener('note-trash-task', (event) => {
+    if (view?.dom.contains(event.target)) deleteThisTask()
   })
 }
 
@@ -2785,6 +2793,44 @@ function taskContextMenu(event, target) {
   const selection = target.state.sliceDoc(target.state.selection.main.from, target.state.selection.main.to)
   const items = [{ label: 'タスクにする', run: () => makeTask(lineNumber) }]
   // 自前のメニューを出すと標準のメニューが出ないので、選んだ文字があるときだけ「コピー」も置く。
+  if (selection) items.push('-', { label: 'コピー', run: () => copyText(selection, { clipboard: navigator.clipboard, execCopy }) })
+  showMenu(event, items)
+  addMenuHint()
+  return true
+}
+
+// 右クリックした場所の、Tasks の下にあるノートへのリンク。{ from, to, linkText, taskPath } か null。
+// [[…]] は1つの部品として描くので、部品の要素から位置を取る（posAtCoords は部品の端に来る）。ソースの表示では位置から探す。
+function taskLinkAtEvent(event, target) {
+  const state = target.state
+  let link = null
+  const anchor = event.target.closest?.('.cm-link')
+  if (anchor && target.contentDOM.contains(anchor)) {
+    try {
+      const pos = target.posAtDOM(anchor)
+      link = linkAt(state, pos, 1) ?? linkAt(state, Math.min(pos + 1, state.doc.length), -1)
+    } catch {
+      link = null
+    }
+  }
+  if (!link) {
+    const pos = target.posAtCoords({ x: event.clientX, y: event.clientY })
+    if (pos != null) link = linkAt(state, pos, 1) ?? linkAt(state, pos, -1)
+  }
+  if (!link?.href || isExternal(link.href)) return null
+  const resolved = resolveHref(currentPath, link.href)
+  if (!resolved?.path || !isUnderTaskFolder(resolved.path) || !known?.has(normalizeKey(resolved.path))) return null
+  return { from: link.from, to: link.to, linkText: state.sliceDoc(link.from, link.to), taskPath: resolved.path }
+}
+
+// タスクのノートへのリンクの上だけ、自前のメニューに「タスクを削除」を出す。type: task かは選んだあとに一覧で確かめる。
+function taskLinkContextMenu(event, target) {
+  if (event.defaultPrevented || target !== view || !canConvertNow()) return false
+  const info = taskLinkAtEvent(event, target)
+  if (!info) return false
+  event.preventDefault()
+  const selection = target.state.sliceDoc(target.state.selection.main.from, target.state.selection.main.to)
+  const items = [{ label: 'タスクを削除', run: () => deleteTaskFromLink(info) }]
   if (selection) items.push('-', { label: 'コピー', run: () => copyText(selection, { clipboard: navigator.clipboard, execCopy }) })
   showMenu(event, items)
   addMenuHint()
@@ -2930,6 +2976,197 @@ function showTaskNotice(text) {
 
 function hideTaskNotice() {
   $('task-notice').hidden = true
+}
+
+// ---- 「タスクを削除」（段階1-E1） ----
+
+// サーバーのタスクの一覧（GET /api/tasks の tasks）。読めなければ null。
+async function loadTaskList() {
+  const result = await request('/api/tasks').catch(() => null)
+  return result?.ok && Array.isArray(result.data?.tasks) ? result.data.tasks : null
+}
+
+// 保存し終えて、書きかけが残っていないか。
+function savedClean() {
+  return Boolean(saver) && !saver.isStopped() && CLEAN_STATES.has($('status').dataset.state)
+}
+
+// タスクのノートを順にゴミ箱へ移す。先頭（消すタスク）を移せなければ、子は移さない。
+// 右の枠でそのノートを開いていれば、先に右の書きかけを保存して右の枠を閉じる（trashItem と同じ流れ）。
+async function trashTaskNotes(paths) {
+  if (PANE !== 'right' && split?.isOpen() && rightState.path && paths.some((path) => pathKey(path) === pathKey(rightState.path))) await closeSplit()
+  const moved = []
+  const failed = []
+  for (const [index, path] of paths.entries()) {
+    const done = await request('/api/trash', { method: 'POST', body: JSON.stringify({ path }) }).catch(() => ({ ok: false }))
+    if (done.ok) moved.push(path)
+    else if (index === 0) {
+      failed.push(...paths)
+      break
+    } else failed.push(path)
+  }
+  // 「取り消す」の相手がゴミ箱へ行ったら、もう取り消せないので知らせを閉じる。
+  if (lastTask && moved.some((path) => pathKey(path) === pathKey(lastTask.taskPath))) {
+    lastTask = null
+    hideTaskNotice()
+  }
+  return { moved, failed }
+}
+
+// 移したあと：知らせ、両方の枠のファイル一覧・パネル・リンクの見た目を読み直す。読み直しの失敗は、次の読み直しで追いつくので知らせない。
+async function afterTaskTrash({ title, rootPath, result, undo, unlinked }) {
+  const rootMoved = result.moved.some((path) => pathKey(path) === pathKey(rootPath))
+  if (rootMoved) showDeleteNotice(deletedText({ title, movedChildren: result.moved.length - 1, undo, unlinked }))
+  if (result.failed.length) showMessage((rootMoved ? '' : (unlinked ? 'リンクは外しましたが、' : '')) + trashFailedText(result.failed))
+  try {
+    await refreshNotes()
+    redrawLinks()
+    tasksSaved()
+  } catch {
+    // 何もしない
+  }
+}
+
+function showDeleteNotice(text) {
+  const notice = $('task-notice')
+  notice.replaceChildren(document.createTextNode(text), bannerButton('閉じる', hideTaskNotice))
+  notice.hidden = false
+}
+
+// 月のノートなどの行のリンク（→タスク）から削除する。リンクを外す変更（履歴に積む）→ すぐ保存 → ゴミ箱へ。
+async function deleteTaskFromLink(info) {
+  if (taskBusy) return
+  if (!canConvertNow()) {
+    showMessage('今は書き換えられないので、タスクを削除できません。')
+    return
+  }
+  taskBusy = true
+  const path = currentPath
+  const target = view
+  try {
+    const list = await loadTaskList()
+    if (!list) {
+      showMessage('タスクの一覧を読めなかったので、削除できません。')
+      return
+    }
+    const task = findTask(list, info.taskPath)
+    if (!task) {
+      showMessage('リンク先はタスクのノート（Tasks の下の type: task のノート）ではないので、削除できません。')
+      return
+    }
+    const children = collectDescendants(list, task.path)
+    const title = taskTitleOf(task)
+    const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink: 'line' }), deleteChoices(children.length))
+    if (!choice) return
+    if (path !== currentPath || target !== view || !canConvertNow()) {
+      showMessage('確かめている間にノートが変わったので、削除をやめました。')
+      return
+    }
+    const at = relocateLink(view.state.doc.toString(), info, { notePath: currentPath, taskPath: task.path, known })
+    if (!at) {
+      showMessage('外すリンクが見つからない（または同じリンクが2つ以上ある）ので、削除をやめました。')
+      return
+    }
+    const range = unlinkRange(at.lineText, at.lineFrom, at.from, at.to)
+    commitOpenField()
+    // 閲覧の表示では「元に戻す」が効かないので、編集の表示に切り替えてから書き換える。
+    if (mode === 'reading') applyMode('live')
+    view.dispatch({ changes: { ...range, insert: '' }, annotations: [isolateHistory.of('full'), Transaction.userEvent.of('delete.task')] })
+    await saver?.flush()
+    if (!savedClean()) {
+      showMessage('リンクは外しましたが、保存できなかったので、タスクのノートはゴミ箱へ移していません。')
+      return
+    }
+    const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
+    const result = await trashTaskNotes(paths)
+    await afterTaskTrash({ title, rootPath: task.path, result, undo: true, unlinked: true })
+  } catch {
+    showMessage('タスクを削除する途中で失敗しました。ファイル一覧で、残っているものを確かめてください。')
+  } finally {
+    taskBusy = false
+  }
+}
+
+// 開いているタスクのノートを削除する（プロパティ欄の「このタスクを削除」）。
+// リンクを外す相手は parent があれば親のノート、なければ goal のノート。その中でこのタスクを指すリンクがちょうど1つなら外す。
+// 開いていないノートなので、今の保存の経路（PUT /api/note のハッシュ照合）で書き換える。
+async function deleteThisTask() {
+  if (taskBusy) return
+  if (!view || !currentPath || !editable || !saver || saver.isStopped()) {
+    showMessage('今はこのノートを削除できません。')
+    return
+  }
+  taskBusy = true
+  const taskPath = currentPath
+  try {
+    commitOpenField()
+    await saver.flush()
+    const list = await loadTaskList()
+    const task = list ? findTask(list, taskPath) : null
+    if (!task) {
+      showMessage(list ? 'このノートはタスクの一覧にない（Tasks の下の type: task のノートではない）ので、削除できません。' : 'タスクの一覧を読めなかったので、削除できません。')
+      return
+    }
+    const children = collectDescendants(list, task.path)
+    const title = taskTitleOf(task)
+    const source = sourceNoteOf(task, known)
+    const sourceName = source ? source.path.split('/').at(-1).replace(/\.md$/i, '') : ''
+    let unlink = source ? 'none-missing' : 'none-source'
+    let linkCount = 0
+    if (source?.exists) {
+      const note = await api.read(source.path).catch(() => null)
+      if (note?.editable) {
+        const plan = planUnlinkInNote(note.text, source.path, task.path, known)
+        linkCount = plan.count
+        unlink = plan.change ? 'source' : 'none-count'
+      }
+    }
+    const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink, sourceName, linkCount }), deleteChoices(children.length))
+    if (!choice) return
+    if (taskPath !== currentPath) {
+      showMessage('確かめている間に別のノートを開いたので、削除をやめました。')
+      return
+    }
+    let unlinked = false
+    if (unlink === 'source') {
+      // 確かめている間に変わっていてもよいよう、読み直してから外す。ハッシュが合わなければ（書き換えられた）外さずにやめる。
+      const fresh = await api.read(source.path).catch(() => null)
+      const plan = fresh?.editable ? planUnlinkInNote(fresh.text, source.path, task.path, known) : null
+      if (!plan?.change) {
+        showMessage('「' + sourceName + '」の中のリンクが見つからなくなったので、削除をやめました。')
+        return
+      }
+      const next = fresh.text.slice(0, plan.change.from) + fresh.text.slice(plan.change.to)
+      const saved = await api.write(source.path, next, fresh.hash).catch(() => null)
+      if (!saved || saved.conflict) {
+        showMessage('「' + sourceName + '」がちょうど書き換えられたか、保存できなかったので、リンクを外せませんでした。削除をやめました。もう一度選んでください。')
+        return
+      }
+      unlinked = true
+    }
+    commitOpenField()
+    await saver?.flush()
+    const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
+    const result = await trashTaskNotes(paths)
+    if (result.moved.some((path) => pathKey(path) === pathKey(task.path))) {
+      // 開いていたノートがなくなったので、リンク元のノートを開く（openNote が今の保存の仕組みを閉じる）。
+      // リンク元がなければ、左は知らせを見せてから何も開いていない画面に戻す。右の枠ではそのまま残し、
+      // 今の「ファイルが消えた」ときの扱い（保存を止める）に任せる。
+      if (source?.exists) await openNote(source.path)
+      else if (PANE !== 'right') {
+        await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked }))
+        saver?.close()
+        saver = null
+        location.href = '/'
+        return
+      }
+    }
+    await afterTaskTrash({ title, rootPath: task.path, result, undo: false, unlinked })
+  } catch {
+    showMessage('タスクを削除する途中で失敗しました。ファイル一覧で、残っているものを確かめてください。')
+  } finally {
+    taskBusy = false
+  }
 }
 
 async function drawCalendar() {

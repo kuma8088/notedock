@@ -969,6 +969,12 @@ export class FrontmatterWidget extends WidgetType {
       view.focus()
     })
     wrap.append(source)
+    // タスクのノートは、閲覧の表示のままでも削除できるよう、ここに「このタスクを削除」を置く（ツールバーは閲覧では隠れる）。
+    if (task && this.noteEditable && !this.busy) {
+      const trash = element('button', { type: 'button', class: 'cm-props-trash' }, ['このタスクを削除'])
+      trash.addEventListener('click', () => view.dom.dispatchEvent(new CustomEvent('note-trash-task', { bubbles: true })))
+      wrap.append(trash)
+    }
     return wrap
   }
   row(view, item, editable, apply, { task = false, valueEditable = editable } = {}) {
