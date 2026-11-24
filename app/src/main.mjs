@@ -47,7 +47,7 @@ import { beginTableCell, historyStep, showMenu } from './widgets.mjs'
 import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
 import { dailyDateOf } from './task-buckets.mjs'
 import { createTaskPanel } from './task-panel.mjs'
-import { canUndoDirectly, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
+import { canUndoDirectly, createFailedText, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -778,10 +778,6 @@ const editorEvents = EditorView.domEventHandlers({
     event.preventDefault()
     target.dispatch({ effects: effect })
     return true
-  },
-  // 「タスクにする」が使える行の上だけ、自前のメニューを出す。ほかの場所はブラウザーの標準のメニューのまま。
-  contextmenu(event, target) {
-    return taskContextMenu(event, target)
   },
   paste(event, target) {
     const file = [...(event.clipboardData?.files ?? [])].find((item) => item.type.startsWith('image/'))
@@ -2752,6 +2748,17 @@ function canConvertNow() {
   return Boolean(view && currentPath && editable && saver && !saver.isStopped() && !view.composing && !view.compositionStarted)
 }
 
+// 「タスクにする」が使える行の上だけ、自前のメニューを出す。ほかの場所はブラウザーの標準のメニューのまま。
+// チェックボックスや箇条書きの記号などの部品の上でも出すよう、エディターの handlers ではなく本文の DOM で受ける
+// （部品の中の出来事は CodeMirror の handlers に届かない）。表のマスは自分のメニューを出すので（defaultPrevented）、ここでは何もしない。
+function bindTaskContextMenu() {
+  $('editor').addEventListener('contextmenu', (event) => {
+    if (!view || !view.contentDOM.contains(event.target)) return
+    if (event.target.closest?.('.cm-props, .cm-table-wrap, #task-panel')) return
+    taskContextMenu(event, view)
+  })
+}
+
 function taskContextMenu(event, target) {
   if (event.defaultPrevented || target !== view || !canConvertNow()) return false
   if (PANE === 'right' && rightPeriodicRoot === undefined) ensureRightPeriodicRoot()
@@ -2809,7 +2816,7 @@ async function makeTask(lineNumber) {
     const target = view
     const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify(taskRequestBody(found, todayText())) })
     if (!created.ok || typeof created.data?.path !== 'string') {
-      showMessage('タスクのノートを作れませんでした。')
+      showMessage(createFailedText(created.status, created.data?.error))
       return
     }
     const taskPath = created.data.path
@@ -2829,7 +2836,9 @@ async function makeTask(lineNumber) {
     known.add(normalizeKey(taskPath))
     view.dispatch({
       changes: linkChange(found, taskPath),
-      effects: contextSlot.reconfigure(noteContextFor(currentPath, editable)),
+      // 編集の表示へ切り替えると行の位置がずれるので、リンクを足した行を見える所へ出す。
+      // 狭いペインでは下半分にチャットの欄が重なるので、真ん中ではなく上のほうに出す。
+      effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), EditorView.scrollIntoView(found.from, { y: 'start', yMargin: 60 })],
       annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.task')],
     })
     lastTask = { view, path, taskPath, doc: view.state.doc, depth: undoDepth(view.state) }
@@ -3175,6 +3184,7 @@ function openFromPaste(event) {
 
 function bindChrome() {
   bindToolbar()
+  bindTaskContextMenu()
   // 右の枠では、上のボタン列、ファイルの一覧、「探す」、貼り付けでノートを開く処理を使わない。
   if (PANE !== 'right') bindLeftChrome()
   else bindRightChrome()

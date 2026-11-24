@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EditorState, Text } from '@codemirror/state'
 
-import { canUndoDirectly, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskLinkText, taskRequestBody } from '../src/task-convert.mjs'
+import { canUndoDirectly, createFailedText, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskLinkText, taskRequestBody } from '../src/task-convert.mjs'
 
 const ROOT = '90_Periodic'
 const MONTH = '90_Periodic/2026/Monthly/2026-05.md'
@@ -98,6 +98,9 @@ test('知らせの文', () => {
   assert.match(createdText('2026-05-10'), /Tasks に残ります/)
   assert.equal(reasonText('heading').includes('見出し'), true)
   assert.equal(typeof reasonText('unknown'), 'string')
+  assert.match(createFailedText(400, 'tasks-folder'), /Tasks というフォルダーを作れませんでした/)
+  assert.match(createFailedText(409), /多すぎて/)
+  assert.equal(createFailedText(500), 'タスクのノートを作れませんでした。')
 })
 
 test('取り消し：作った直後と同じなら履歴で戻す。違えばリンクの文字だけを外す', () => {

@@ -17,6 +17,14 @@ const REASON_TEXT = {
   struck: '取り消し線を引いた行はタスクにできません。',
   'has-task-link': 'この行は、もうタスクになっています。',
   callout: '囲みの見出しの行はタスクにできません。',
+  rule: '区切り線はタスクにできません。',
+}
+
+// POST /api/tasks が断ったときの知らせ。
+export function createFailedText(status, error) {
+  if (status === 400 && error === 'tasks-folder') return 'Vault の直下に Tasks というフォルダーを作れませんでした（同じ名前のファイルがあるなど）。タスクのノートは作っていません。'
+  if (status === 409) return '同じ名前のタスクのノートが多すぎて、作れませんでした。'
+  return 'タスクのノートを作れませんでした。'
 }
 
 export function reasonText(reason) {
