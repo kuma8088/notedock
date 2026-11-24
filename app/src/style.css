@@ -140,6 +140,7 @@ input {
 #bar button,
 #banner button,
 #port-moved-notice button,
+#task-notice button,
 dialog button {
   border: 1px solid var(--line);
   background: var(--surface);
@@ -150,6 +151,7 @@ dialog button {
 
 #bar button:hover,
 #port-moved-notice button:hover,
+#task-notice button:hover,
 #banner button:hover {
   background: var(--hover);
 }
@@ -313,7 +315,8 @@ body.split-open .tool-group { flex-wrap: wrap; }
 .tool-strike { text-decoration: line-through; }
 
 #banner,
-#port-moved-notice {
+#port-moved-notice,
+#task-notice {
   padding: 8px 14px;
   background: var(--warn-bg);
   color: var(--warn-text);
@@ -324,8 +327,16 @@ body.split-open .tool-group { flex-wrap: wrap; }
   flex-wrap: wrap;
 }
 
+/* タスクを作ったあとの知らせ。警告ではないので、落ち着いた色にする。 */
+#task-notice {
+  background: var(--hover);
+  color: inherit;
+  border-bottom: 1px solid var(--line);
+}
+
 #banner[hidden],
 #port-moved-notice[hidden],
+#task-notice[hidden],
 #outline[hidden] {
   display: none;
 }

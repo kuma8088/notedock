@@ -1,5 +1,5 @@
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, startCompletion } from '@codemirror/autocomplete'
-import { defaultKeymap, history, historyKeymap, indentWithTab, insertNewline, isolateHistory } from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, indentWithTab, insertNewline, isolateHistory, undoDepth } from '@codemirror/commands'
 import { deleteMarkupBackward, insertNewlineContinueMarkup } from '@codemirror/lang-markdown'
 import {
   HighlightStyle,
@@ -43,10 +43,11 @@ import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleS
 import { createConnectionWatch, createVersionWatch } from './connection.mjs'
 import { linesFrom, selectedLines } from './lines.mjs'
 import { applyMention, headingTarget, mentionCandidates, mentionQuery, sectionsOf, unwritableCount } from './mention.mjs'
-import { beginTableCell, showMenu } from './widgets.mjs'
+import { beginTableCell, historyStep, showMenu } from './widgets.mjs'
 import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
 import { dailyDateOf } from './task-buckets.mjs'
 import { createTaskPanel } from './task-panel.mjs'
+import { canUndoDirectly, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -606,6 +607,7 @@ const TOOLBAR_ACTIONS = {
   rule: () => runSpec(horizontalRuleSpec)(view),
   codeblock: () => runSpec(codeBlockSpec)(view),
   callout: (button) => menuBelow(button, CALLOUT_MENU.map(([label, kind]) => ({ label, run: () => runSpec((state) => calloutSpec(state, kind))(view) }))),
+  maketask: () => makeTaskAtCursor(),
 }
 
 // 変換中と、表のマスやノートの情報の欄を編集している間は、押しても何もしない。
@@ -700,6 +702,7 @@ const editorKeys = keymap.of([
   { key: 'Mod-Shift-t', run: insertTable, preventDefault: true },
   { key: 'Mod-Alt-[', run: (target) => foldAll(target), preventDefault: true },
   { key: 'Mod-Alt-]', run: (target) => unfoldAll(target), preventDefault: true },
+  { key: 'Mod-Alt-t', run: () => makeTaskAtCursor(), preventDefault: true },
   ...closeBracketsKeymap,
   ...searchKeymap,
   ...foldKeymap,
@@ -775,6 +778,10 @@ const editorEvents = EditorView.domEventHandlers({
     event.preventDefault()
     target.dispatch({ effects: effect })
     return true
+  },
+  // 「タスクにする」が使える行の上だけ、自前のメニューを出す。ほかの場所はブラウザーの標準のメニューのまま。
+  contextmenu(event, target) {
+    return taskContextMenu(event, target)
   },
   paste(event, target) {
     const file = [...(event.clipboardData?.files ?? [])].find((item) => item.type.startsWith('image/'))
@@ -886,7 +893,7 @@ function extensionsFor(path, canEdit) {
     }),
     syntaxHighlighting(highlight),
     noteMarkdown(languages),
-    contextSlot.of(noteContext.of({ path, known, newNoteDir: defaultNoteDir(path, noteFolders(notes)), api, editable: canEdit })),
+    contextSlot.of(noteContextFor(path, canEdit)),
     previewField,
     hangingIndent,
     editableSlot.of(editableExtensions(canEdit)),
@@ -896,6 +903,11 @@ function extensionsFor(path, canEdit) {
     EditorView.updateListener.of(onUpdate),
     EditorView.contentAttributes.of({ spellcheck: 'false', autocapitalize: 'off', autocorrect: 'off' }),
   ]
+}
+
+// リンクの解決などに使う、開いているノートの情報。作り直すとき（タスクを作ったあと）も同じ中身にする。
+function noteContextFor(path, canEdit) {
+  return noteContext.of({ path, known, newNoteDir: defaultNoteDir(path, noteFolders(notes)), api, editable: canEdit })
 }
 
 function editableExtensions(canEdit) {
@@ -2016,6 +2028,8 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   saver?.close()
   saver = null
   currentPath = path
+  lastTask = null
+  hideTaskNotice()
   // 右の枠では、カレンダーとファイルの一覧を使わない（左の一覧の開閉の記録も書き換えない）。
   if (PANE !== 'right') renderCalendar()
   sourceOnly = note.sourceOnly
@@ -2720,6 +2734,154 @@ function tasksSaved() {
   else if (split?.isOpen()) split.post({ type: MSG.TASKS })
 }
 
+// ---- 「タスクにする」（段階1-C2） ----
+
+// 開いているノートの日付のノートの置き場。左はカレンダーの問い合わせ、右は B で覚えた置き場を使う。
+function periodicRootNow() {
+  return periodicState?.periodicRoot ?? (PANE === 'right' ? (rightPeriodicRoot ?? null) : null)
+}
+
+// 今の文書の、1から数えた行がタスクにできるか。
+function taskAtLine(lineNumber) {
+  if (!view || !currentPath) return { ok: false, reason: 'no-source' }
+  return taskForDocLine(view.state.doc, lineNumber, { path: currentPath, periodicRoot: periodicRootNow(), known })
+}
+
+// 書き換えてよい状態か（編集できるノートで、保存が止まっていない。変換中でない）。
+function canConvertNow() {
+  return Boolean(view && currentPath && editable && saver && !saver.isStopped() && !view.composing && !view.compositionStarted)
+}
+
+function taskContextMenu(event, target) {
+  if (event.defaultPrevented || target !== view || !canConvertNow()) return false
+  if (PANE === 'right' && rightPeriodicRoot === undefined) ensureRightPeriodicRoot()
+  const pos = target.posAtCoords({ x: event.clientX, y: event.clientY })
+  if (pos == null) return false
+  const lineNumber = target.state.doc.lineAt(pos).number
+  if (!menuForLine(taskAtLine(lineNumber))) return false
+  event.preventDefault()
+  const selection = target.state.sliceDoc(target.state.selection.main.from, target.state.selection.main.to)
+  const items = [{ label: 'タスクにする', run: () => makeTask(lineNumber) }]
+  // 自前のメニューを出すと標準のメニューが出ないので、選んだ文字があるときだけ「コピー」も置く。
+  if (selection) items.push('-', { label: 'コピー', run: () => copyText(selection, { clipboard: navigator.clipboard, execCopy }) })
+  showMenu(event, items)
+  return true
+}
+
+// ツールバーのボタンとキー（Cmd+Option+T）。カーソルのある行をタスクにする。
+function makeTaskAtCursor() {
+  if (!view || !currentPath) return true
+  if (!editable) {
+    showMessage('このノートは編集できないので、タスクにできません。')
+    return true
+  }
+  const lineNumber = view.state.doc.lineAt(view.state.selection.main.head).number
+  const found = taskAtLine(lineNumber)
+  if (!found.ok) {
+    showMessage(reasonText(found.reason))
+    return true
+  }
+  makeTask(lineNumber)
+  return true
+}
+
+let taskBusy = false
+// 最後に作ったタスクの「取り消す」に使う。{ view, path, taskPath, doc, depth }
+let lastTask = null
+
+async function makeTask(lineNumber) {
+  if (taskBusy) return
+  if (!canConvertNow()) {
+    showMessage(editable ? '今は書き換えられないので、タスクにできません。' : 'このノートは編集できないので、タスクにできません。')
+    return
+  }
+  const found = taskAtLine(lineNumber)
+  if (!found.ok) {
+    showMessage(reasonText(found.reason))
+    return
+  }
+  taskBusy = true
+  try {
+    commitOpenField()
+    // 閲覧の表示では「元に戻す」が効かないので、編集の表示に切り替えてから書き換える。
+    if (mode === 'reading') applyMode('live')
+    const path = currentPath
+    const target = view
+    const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify(taskRequestBody(found, todayText())) })
+    if (!created.ok || typeof created.data?.path !== 'string') {
+      showMessage('タスクのノートを作れませんでした。')
+      return
+    }
+    const taskPath = created.data.path
+    // 待っている間に、ノートが替わった・行が書き換わった・保存が止まったときは、リンクを足さずに作ったノートをゴミ箱へ移す。
+    if (path !== currentPath || target !== view || !canConvertNow() || !lineStillThere(view.state.doc, found)) {
+      const trashed = await request('/api/trash', { method: 'POST', body: JSON.stringify({ path: taskPath }) })
+      showMessage(trashed.ok
+        ? '作っている間に行が書き換わったので、リンクは足していません。作ったタスクのノートはゴミ箱へ移しました。もう一度選んでください。'
+        : `作っている間に行が書き換わったので、リンクは足していません。作ったタスクのノート（${taskPath}）はゴミ箱へ移せなかったので残っています。`)
+      await refreshNotes()
+      tasksSaved()
+      return
+    }
+    if (mode === 'reading') applyMode('live')
+    // 新しいノートを known に足してから、リンクの解決に使う情報を作り直す。同じ1回の変更にして、リンクがすぐ解決済みとして描かれるようにする。
+    known = new Set(known ?? [])
+    known.add(normalizeKey(taskPath))
+    view.dispatch({
+      changes: linkChange(found, taskPath),
+      effects: contextSlot.reconfigure(noteContextFor(currentPath, editable)),
+      annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.task')],
+    })
+    lastTask = { view, path, taskPath, doc: view.state.doc, depth: undoDepth(view.state) }
+    saver?.save()
+    showTaskNotice(createdText(created.data.due ?? found.due))
+    await refreshNotes()
+    tasksSaved()
+  } catch {
+    showMessage('タスクのノートを作れませんでした。')
+  } finally {
+    taskBusy = false
+  }
+}
+
+// 「取り消す」：足したリンクを外す。ノートは Tasks に残る。
+function undoLastTask() {
+  const last = lastTask
+  hideTaskNotice()
+  if (!last || last.view !== view || last.path !== currentPath) {
+    showMessage('ノートを切り替えたので、取り消せません。リンクを手で消してください。')
+    return
+  }
+  if (canUndoDirectly(last, { doc: view.state.doc, depth: undoDepth(view.state) })) {
+    historyStep(view, 0)
+  } else {
+    // あとで打った文字があるときは、それを消さないよう、足したリンクの文字だけを外す。
+    const change = linkRemoval(view.state.doc.toString(), last.taskPath)
+    if (!change) {
+      showMessage('リンクが見つからないので、取り消せません。')
+      return
+    }
+    view.dispatch({ changes: change, annotations: [isolateHistory.of('full'), Transaction.userEvent.of('delete.task')] })
+  }
+  lastTask = null
+  saver?.save()
+  tasksSaved()
+}
+
+function showTaskNotice(text) {
+  const notice = $('task-notice')
+  notice.replaceChildren(
+    document.createTextNode(text),
+    bannerButton('取り消す', undoLastTask),
+    bannerButton('閉じる', hideTaskNotice),
+  )
+  notice.hidden = false
+}
+
+function hideTaskNotice() {
+  $('task-notice').hidden = true
+}
+
 async function drawCalendar() {
   const mine = ++calendarRequest
   const month = calMonth
@@ -3206,6 +3368,7 @@ function receiveFromRight(data) {
     // 右の枠でCmd+クリックしたリンクは、左で開く。
     if (typeof data.path === 'string') openIn('left', data.path, { anchor: typeof data.anchor === 'string' ? data.anchor : '' })
   } else if (data.type === MSG.TASKS) {
+    refreshNotes()
     refreshTaskPanel()
   } else if (data.type === MSG.CLICKED) {
     split.setActive('right')
@@ -3292,6 +3455,7 @@ async function receiveFromLeft(data) {
     const pos = Math.max(0, Math.min(Number(data.from) || 0, view.state.doc.length))
     view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
   } else if (data.type === MSG.TASKS) {
+    refreshNotes()
     refreshTaskPanel()
   } else if (data.type === MSG.CHAT) {
     sendSelectionToChat()

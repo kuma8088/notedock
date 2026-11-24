@@ -59,10 +59,14 @@
     <button type="button" data-action="codeblock" title="コードのまとまり">コード枠</button>
     <button type="button" data-action="callout" title="色付きの囲み" aria-haspopup="menu">囲み ▾</button>
   </div>
+  <div class="tool-group">
+    <button type="button" data-action="maketask" title="カーソルの行をタスクにする（Cmd+Alt+T）">タスクにする</button>
+  </div>
   <input id="toolbar-image" type="file" accept="image/*" hidden>
 </div>
 <div id="banner" hidden></div>
 <div id="port-moved-notice" hidden></div>
+<div id="task-notice" role="status" hidden></div>
 <main id="layout">
   <div id="editor">
     <section id="task-panel" hidden aria-label="タスク"></section>
