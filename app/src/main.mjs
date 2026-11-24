@@ -48,7 +48,7 @@ import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
 import { checkNewTask, dailyDateOf } from './task-buckets.mjs'
 import { createTaskSide } from './task-side.mjs'
 import { createTaskPanel } from './task-panel.mjs'
-import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceNoteOf, taskTitleOf, trashFailedText, unlinkRange } from './task-delete.mjs'
+import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkRange } from './task-delete.mjs'
 import { MENU_HINT, canUndoDirectly, createFailedText, createdText, leftoverText, linkChange, linkRemoval, menuForLine, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
@@ -3007,7 +3007,8 @@ function savedClean() {
 
 // タスクのノートを順にゴミ箱へ移す。先頭（消すタスク）を移せなければ、子は移さない。
 // 右の枠でそのノートを開いていれば、先に右の書きかけを保存して右の枠を閉じる（trashItem と同じ流れ）。
-async function trashTaskNotes(paths) {
+// open：右の枠から移したとき、左でそのどれかを開いていれば左で開き直すノート（リンク元。なければ null で何も開いていない画面）。
+async function trashTaskNotes(paths, { open = null } = {}) {
   if (PANE !== 'right' && split?.isOpen() && rightState.path && paths.some((path) => pathKey(path) === pathKey(rightState.path))) await closeSplit()
   const moved = []
   const failed = []
@@ -3024,14 +3025,31 @@ async function trashTaskNotes(paths) {
     lastTask = null
     hideTaskNotice()
   }
+  if (PANE === 'right' && moved.length) toLeft({ type: MSG.TRASHED, paths: moved, open })
   return { moved, failed }
 }
 
+// 右の枠でゴミ箱へ移したノートを左で開いていたら、保存を止めて（消えたノートを書き戻さないように）開き直す。
+// 開き直すノートがないときは、何も開いていない画面に戻す。右の枠が知らせを見せている間は、枠が閉じるまで待つ
+// （すぐ読み込み直すと、右の枠の知らせごと消えるため）。
+let reloadAfterSplit = false
+async function trashedElsewhere({ paths, open }) {
+  if (PANE === 'right' || !Array.isArray(paths)) return
+  // 左のファイル一覧・サイドバー・パネル・リンクの見た目は、開いているノートに関係なく読み直す。
+  refreshAfterTasks().catch(() => {})
+  if (!currentPath || !paths.some((path) => typeof path === 'string' && pathKey(path) === pathKey(currentPath))) return
+  saver?.close()
+  saver = null
+  if (typeof open === 'string' && open && pathKey(open) !== pathKey(currentPath)) await openNote(open)
+  else if (split?.isOpen()) reloadAfterSplit = true
+  else location.href = '/'
+}
+
 // 移したあと：知らせ、両方の枠のファイル一覧・パネル・リンクの見た目を読み直す。読み直しの失敗は、次の読み直しで追いつくので知らせない。
-async function afterTaskTrash({ title, rootPath, result, undo, unlinked }) {
+async function afterTaskTrash({ title, rootPath, result, undo, unlinked, sourceName = '' }) {
   const rootMoved = result.moved.some((path) => pathKey(path) === pathKey(rootPath))
-  if (rootMoved) showDeleteNotice(deletedText({ title, movedChildren: result.moved.length - 1, undo, unlinked }))
-  if (result.failed.length) showMessage((rootMoved ? '' : (unlinked ? 'リンクは外しましたが、' : '')) + trashFailedText(result.failed))
+  if (rootMoved) showDeleteNotice(deletedText({ title, movedChildren: result.moved.length - 1, undo, unlinked, sourceName, keyLabel }))
+  if (result.failed.length) showMessage(trashFailedNotice({ failed: result.failed, rootMoved, unlinked, undo, keyLabel }))
   try {
     await refreshNotes()
     redrawLinks()
@@ -3070,15 +3088,36 @@ async function deleteTaskFromLink(info) {
     }
     const children = collectDescendants(list, task.path)
     const title = taskTitleOf(task)
-    const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink: 'line' }), deleteChoices(children.length))
+    // 開いているノートがリンク元（parent があれば親、なければ goal）でなければ、参照として書いたリンクから消している。
+    // そのときは、リンク元の中のリンクも「このタスクを削除」と同じ手順で外す（外せないときは理由を確認の文に書く）。
+    const own = sourceNoteOf(task, known)
+    const extra = own && pathKey(own.path) !== pathKey(currentPath) ? await sourceUnlinkPlan(task) : null
+    const also = extra && extra.unlink !== 'none-source' ? extra : null
+    const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink: 'line', also }), deleteChoices(children.length))
     if (!choice) return
     if (path !== currentPath || target !== view || !canConvertNow()) {
       showMessage('確かめている間にノートが変わったので、削除をやめました。')
       return
     }
+    if (!relocateLink(view.state.doc.toString(), info, { notePath: currentPath, taskPath: task.path, known })) {
+      showMessage('外すリンクが見つからない（または同じリンクが2つ以上ある）ので、削除をやめました。')
+      return
+    }
+    // 先にリンク元のリンクを外す（外せなければ、何も変えずにやめる）。
+    let sourceUnlinked = ''
+    if (also?.unlink === 'source') {
+      if (!(await unlinkInSource(also.source, task, also.sourceName))) return
+      sourceUnlinked = also.sourceName
+      if (path !== currentPath || target !== view || !canConvertNow()) {
+        showMessage('「' + sourceUnlinked + '」の中のリンクは外しましたが、その間にノートが変わったので、行のリンクは外さず、ゴミ箱へも移していません。')
+        return
+      }
+    }
     const at = relocateLink(view.state.doc.toString(), info, { notePath: currentPath, taskPath: task.path, known })
     if (!at) {
-      showMessage('外すリンクが見つからない（または同じリンクが2つ以上ある）ので、削除をやめました。')
+      showMessage(sourceUnlinked
+        ? '「' + sourceUnlinked + '」の中のリンクは外しましたが、行のリンクが見つからなくなったので、ゴミ箱へは移していません。'
+        : '外すリンクが見つからない（または同じリンクが2つ以上ある）ので、削除をやめました。')
       return
     }
     const range = unlinkRange(at.lineText, at.lineFrom, at.from, at.to)
@@ -3092,13 +3131,50 @@ async function deleteTaskFromLink(info) {
       return
     }
     const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
-    const result = await trashTaskNotes(paths)
-    await afterTaskTrash({ title, rootPath: task.path, result, undo: true, unlinked: true })
+    const result = await trashTaskNotes(paths, { open: path })
+    await afterTaskTrash({ title, rootPath: task.path, result, undo: true, unlinked: true, sourceName: sourceUnlinked })
   } catch {
     showMessage('タスクを削除する途中で失敗しました。ファイル一覧で、残っているものを確かめてください。')
   } finally {
     taskBusy = false
   }
+}
+
+// リンク元のノート（parent があれば親、なければ goal）の中のリンクを外せるか調べる。
+// unlink：'source'（ちょうど1つあるので外せる）・'none-count'（0 か 2つ以上）・'none-editable'（編集できない）・'none-missing'（見つからない）・'none-source'（goal も parent もない）。
+async function sourceUnlinkPlan(task) {
+  const source = sourceNoteOf(task, known)
+  const sourceName = source ? source.path.split('/').at(-1).replace(/\.md$/i, '') : ''
+  let unlink = source ? 'none-missing' : 'none-source'
+  let linkCount = 0
+  if (source?.exists) {
+    const note = await api.read(source.path).catch(() => null)
+    if (note && !note.editable) unlink = 'none-editable'
+    else if (note) {
+      const plan = planUnlinkInNote(note.text, source.path, task.path, known)
+      linkCount = plan.count
+      unlink = plan.change ? 'source' : 'none-count'
+    }
+  }
+  return { source, sourceName, unlink, linkCount }
+}
+
+// リンク元のノートの中のリンクを、今の保存の経路（PUT /api/note のハッシュ照合）で外す。外せなければ知らせて false。
+// 確かめている間に変わっていてもよいよう、読み直してから外す。ハッシュが合わなければ（書き換えられた）外さない。
+async function unlinkInSource(source, task, sourceName) {
+  const fresh = await api.read(source.path).catch(() => null)
+  const plan = fresh?.editable ? planUnlinkInNote(fresh.text, source.path, task.path, known) : null
+  if (!plan?.change) {
+    showMessage('「' + sourceName + '」の中のリンクが見つからなくなったので、削除をやめました。')
+    return false
+  }
+  const next = fresh.text.slice(0, plan.change.from) + fresh.text.slice(plan.change.to)
+  const saved = await api.write(source.path, next, fresh.hash).catch(() => null)
+  if (!saved || saved.conflict) {
+    showMessage('「' + sourceName + '」がちょうど書き換えられたか、保存できなかったので、リンクを外せませんでした。削除をやめました。もう一度選んでください。')
+    return false
+  }
+  return true
 }
 
 // 開いているタスクのノートを削除する（プロパティ欄の「このタスクを削除」）。
@@ -3123,18 +3199,7 @@ async function deleteThisTask() {
     }
     const children = collectDescendants(list, task.path)
     const title = taskTitleOf(task)
-    const source = sourceNoteOf(task, known)
-    const sourceName = source ? source.path.split('/').at(-1).replace(/\.md$/i, '') : ''
-    let unlink = source ? 'none-missing' : 'none-source'
-    let linkCount = 0
-    if (source?.exists) {
-      const note = await api.read(source.path).catch(() => null)
-      if (note?.editable) {
-        const plan = planUnlinkInNote(note.text, source.path, task.path, known)
-        linkCount = plan.count
-        unlink = plan.change ? 'source' : 'none-count'
-      }
-    }
+    const { source, sourceName, unlink, linkCount } = await sourceUnlinkPlan(task)
     const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink, sourceName, linkCount }), deleteChoices(children.length))
     if (!choice) return
     if (taskPath !== currentPath) {
@@ -3143,35 +3208,25 @@ async function deleteThisTask() {
     }
     let unlinked = false
     if (unlink === 'source') {
-      // 確かめている間に変わっていてもよいよう、読み直してから外す。ハッシュが合わなければ（書き換えられた）外さずにやめる。
-      const fresh = await api.read(source.path).catch(() => null)
-      const plan = fresh?.editable ? planUnlinkInNote(fresh.text, source.path, task.path, known) : null
-      if (!plan?.change) {
-        showMessage('「' + sourceName + '」の中のリンクが見つからなくなったので、削除をやめました。')
-        return
-      }
-      const next = fresh.text.slice(0, plan.change.from) + fresh.text.slice(plan.change.to)
-      const saved = await api.write(source.path, next, fresh.hash).catch(() => null)
-      if (!saved || saved.conflict) {
-        showMessage('「' + sourceName + '」がちょうど書き換えられたか、保存できなかったので、リンクを外せませんでした。削除をやめました。もう一度選んでください。')
-        return
-      }
+      if (!(await unlinkInSource(source, task, sourceName))) return
       unlinked = true
     }
     commitOpenField()
     await saver?.flush()
     const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
-    const result = await trashTaskNotes(paths)
+    const result = await trashTaskNotes(paths, { open: source?.exists ? source.path : null })
     if (result.moved.some((path) => pathKey(path) === pathKey(task.path))) {
       // 開いていたノートがなくなったので、リンク元のノートを開く（openNote が今の保存の仕組みを閉じる）。
       // リンク元がなければ、左は知らせを見せてから何も開いていない画面に戻す。右の枠ではそのまま残し、
       // 今の「ファイルが消えた」ときの扱い（保存を止める）に任せる。
       if (source?.exists) await openNote(source.path)
-      else if (PANE !== 'right') {
-        await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked }))
+      else {
+        await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked, keyLabel }))
         saver?.close()
         saver = null
-        location.href = '/'
+        // 右の枠は、開いていたノートがなくなったので枠を閉じてもらう。左は何も開いていない画面に戻す。
+        if (PANE === 'right') toLeft({ type: MSG.CLOSE })
+        else location.href = '/'
         return
       }
     }
@@ -3732,6 +3787,10 @@ async function closeSplit() {
   rightShown = null
   rightState = { path: null, selection: '', dirty: false, headings: null, lines: null }
   syncSplitButton()
+  if (reloadAfterSplit) {
+    reloadAfterSplit = false
+    location.href = '/'
+  }
 }
 
 function bindSplit() {
@@ -3783,6 +3842,8 @@ function receiveFromRight(data) {
     refreshAfterTasks()
   } else if (data.type === MSG.NOTE_SAVED) {
     refreshTaskSide()
+  } else if (data.type === MSG.TRASHED) {
+    trashedElsewhere(data)
   } else if (data.type === MSG.CLICKED) {
     split.setActive('right')
   } else if (data.type === MSG.OPENED) {

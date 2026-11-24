@@ -139,16 +139,32 @@ export function sourceNoteOf({ path, goal, parent }, known) {
 const nameOf = (path) => String(path ?? '').split('/').at(-1).replace(/\.md$/i, '')
 export const taskTitleOf = (task) => (task?.title || nameOf(task?.path)).replace(/\*\*|__/g, '')
 
-// 確認の文。where：リンクを外す場所の説明（null ならリンクは外さない理由 note を添える）。
-export function deleteQuestion({ title, childCount = 0, unlink = 'line', sourceName = '', linkCount = 1 }) {
-  const lines = ['タスク「' + title + '」をゴミ箱へ移します。']
-  if (unlink === 'line') lines.push('行のリンクも外します。')
-  else if (unlink === 'source') lines.push('「' + sourceName + '」の中のリンクも外します。')
-  else if (unlink === 'none-source') lines.push('goal も parent もないタスクなので、外すリンクはありません。')
-  else if (unlink === 'none-missing') lines.push('リンク元のノートが見つからないので、リンクは外しません。')
-  else if (unlink === 'none-count') lines.push(linkCount === 0
+// リンク元のノート（parent か goal）について、外すか・外さない理由の1文。
+function sourceSentence(unlink, sourceName, linkCount) {
+  if (unlink === 'source') return '「' + sourceName + '」の中のリンクも外します。'
+  if (unlink === 'none-source') return 'goal も parent もないタスクなので、外すリンクはありません。'
+  if (unlink === 'none-missing') return 'リンク元のノートが見つからないので、リンクは外しません。'
+  if (unlink === 'none-editable') return '「' + sourceName + '」は編集できないノートなので、その中のリンクは外しません。'
+  if (unlink === 'none-count') return linkCount === 0
     ? '「' + sourceName + '」の中にこのタスクへのリンクが見つからないので、リンクは外しません。'
-    : '「' + sourceName + '」の中にこのタスクへのリンクが' + linkCount + 'つあるので、どれを外すか決められません。リンクは外しません。')
+    : '「' + sourceName + '」の中にこのタスクへのリンクが' + linkCount + 'つあるので、どれを外すか決められません。リンクは外しません。'
+  return ''
+}
+
+// 確認の文。unlink：'line'（右クリックした行のリンク）か、リンク元のノートの扱い（sourceSentence の種類）。
+// also：unlink が 'line' で、開いているノートがリンク元（parent か goal）でないときの、リンク元の扱い { unlink, sourceName, linkCount }。
+export function deleteQuestion({ title, childCount = 0, unlink = 'line', sourceName = '', linkCount = 1, also = null }) {
+  const lines = ['タスク「' + title + '」をゴミ箱へ移します。']
+  if (unlink === 'line') {
+    lines.push('行のリンクも外します。')
+    if (also) {
+      const extra = sourceSentence(also.unlink, also.sourceName ?? '', also.linkCount ?? 1)
+      if (extra) lines.push(also.unlink === 'source' ? 'リンク元の' + extra : extra)
+    }
+  } else {
+    const sentence = sourceSentence(unlink, sourceName, linkCount)
+    if (sentence) lines.push(sentence)
+  }
   if (childCount > 0) lines.push('', 'サブタスクが' + childCount + '件あります。一緒にゴミ箱へ移すか、残すかを選んでください。残したサブタスクは、親のないタスクになります。')
   return lines.join('\n')
 }
@@ -167,10 +183,21 @@ export function deleteChoices(childCount) {
 
 // 移したあとの知らせ。undo：外したリンクがエディターの履歴にあり、「元に戻す」で戻せるか。
 // unlinked：リンクを外したか（開いていないノートのリンクを外したときは、履歴には積まれない）。
-export function deletedText({ title, movedChildren = 0, undo = true, unlinked = true }) {
+// sourceName：開いていないリンク元のノートの中のリンクも外したとき、そのノートの名前（「元に戻す」では戻らない）。
+// keyLabel：キーの案内を Windows では Ctrl にする関数（keys.mjs の keyLabel）。
+export function deletedText({ title, movedChildren = 0, undo = true, unlinked = true, sourceName = '', keyLabel = (text) => text }) {
   const head = 'タスク「' + title + '」' + (movedChildren > 0 ? 'とサブタスク' + movedChildren + '件' : '') + 'をゴミ箱へ移しました。'
-  if (undo) return head + '「元に戻す」（Cmd+Z）でリンクは戻りますが、ノートはゴミ箱にあります。'
-  return head + (unlinked ? 'リンクも外しました。' : '') + 'ノートはゴミ箱にあります。'
+  const source = sourceName ? '「' + sourceName + '」の中のリンクも外しました（こちらは「元に戻す」では戻りません）。' : ''
+  if (undo) return head + keyLabel('「元に戻す」（Cmd+Z）で行のリンクは戻りますが、ノートはゴミ箱にあります。') + source
+  return head + (unlinked ? 'リンクも外しました。' : '') + source + 'ノートはゴミ箱にあります。'
+}
+
+// ゴミ箱へ移せなかったものがあるときの知らせ。rootMoved：消すタスク自身は移せたか。
+// unlinked・undo：行のリンクを外したか、それを「元に戻す」で戻せるか（タスク自身を移せなかったときは、戻し方を添える）。
+export function trashFailedNotice({ failed, rootMoved, unlinked = false, undo = false, keyLabel = (text) => text }) {
+  const head = rootMoved ? '' : unlinked ? 'リンクは外しましたが、' : ''
+  const tail = !rootMoved && unlinked && undo ? keyLabel('\n「元に戻す」（Cmd+Z）で、外したリンクを戻せます。') : ''
+  return head + trashFailedText(failed) + tail
 }
 
 // 子を続けて移す途中で失敗したときの知らせ。

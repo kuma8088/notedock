@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, planUnlinkInNote, relocateLink, sourceNoteOf, taskLinksIn, trashFailedText, unlinkRange } from '../src/task-delete.mjs'
+import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, planUnlinkInNote, relocateLink, sourceNoteOf, taskLinksIn, trashFailedNotice, trashFailedText, unlinkRange } from '../src/task-delete.mjs'
 
 const T = (path, parentPath = null, title = '') => ({ path, parentPath, title })
 
@@ -152,4 +152,39 @@ test('知らせの文', () => {
   assert.match(deletedText({ title: 'T', undo: false, unlinked: true }), /リンクも外しました。ノートはゴミ箱にあります。$/)
   assert.doesNotMatch(deletedText({ title: 'T', undo: false, unlinked: false }), /元に戻す|リンクも/)
   assert.match(trashFailedText(['Tasks/a.md']), /1件/)
+})
+
+// ---- E1 のレビューの小1〜小5 ----
+
+test('確認の文：参照のリンクから消すときは、行のリンクとリンク元の扱いの両方を書く', () => {
+  const both = deleteQuestion({ title: 'T', unlink: 'line', also: { unlink: 'source', sourceName: '2026-11' } })
+  assert.match(both, /行のリンクも外します。\nリンク元の「2026-11」の中のリンクも外します。/)
+  assert.match(deleteQuestion({ title: 'T', unlink: 'line', also: { unlink: 'none-count', sourceName: '2026-11', linkCount: 2 } }), /行のリンクも外します。\n「2026-11」の中にこのタスクへのリンクが2つある/)
+  assert.match(deleteQuestion({ title: 'T', unlink: 'line', also: { unlink: 'none-missing' } }), /リンク元のノートが見つからない/)
+  // also がなければ、今までどおり行のリンクだけ
+  assert.equal(deleteQuestion({ title: 'T' }), 'タスク「T」をゴミ箱へ移します。\n行のリンクも外します。')
+})
+
+test('確認の文：リンク元が編集できないときの種類（none-editable）', () => {
+  assert.match(deleteQuestion({ title: 'T', unlink: 'none-editable', sourceName: '2026-11' }), /「2026-11」は編集できないノートなので、その中のリンクは外しません。/)
+  assert.match(deleteQuestion({ title: 'T', unlink: 'line', also: { unlink: 'none-editable', sourceName: 'P' } }), /行のリンクも外します。\n「P」は編集できない/)
+})
+
+test('知らせ：Cmd+Z は keyLabel を通す。リンク元のリンクも外したら書き添える', () => {
+  const ctrl = (text) => text.replace(/\bCmd\+/g, 'Ctrl+')
+  assert.match(deletedText({ title: 'T', keyLabel: ctrl }), /Ctrl\+Z/)
+  assert.doesNotMatch(deletedText({ title: 'T', keyLabel: ctrl }), /Cmd/)
+  assert.match(deletedText({ title: 'T', sourceName: '2026-11' }), /「2026-11」の中のリンクも外しました（こちらは「元に戻す」では戻りません）/)
+  assert.match(deletedText({ title: 'T', undo: false, unlinked: true, sourceName: 'P' }), /リンクも外しました。「P」の中のリンクも外しました/)
+})
+
+test('ゴミ箱へ移せなかったとき：行のリンクを外していれば「元に戻す」で戻せることを添える', () => {
+  const ctrl = (text) => text.replace(/\bCmd\+/g, 'Ctrl+')
+  const lineFailed = trashFailedNotice({ failed: ['Tasks/a.md'], rootMoved: false, unlinked: true, undo: true, keyLabel: ctrl })
+  assert.match(lineFailed, /^リンクは外しましたが、ゴミ箱へ移せなかった/)
+  assert.match(lineFailed, /「元に戻す」（Ctrl\+Z）で、外したリンクを戻せます。$/)
+  // ノートのほうから消したとき（履歴にない）は、戻し方を書かない
+  assert.doesNotMatch(trashFailedNotice({ failed: ['Tasks/a.md'], rootMoved: false, unlinked: true, undo: false }), /元に戻す/)
+  // 子だけ失敗したとき（タスク自身は移せた）は、失敗したものだけ
+  assert.equal(trashFailedNotice({ failed: ['Tasks/b.md'], rootMoved: true, unlinked: true, undo: true }), trashFailedText(['Tasks/b.md']))
 })
