@@ -2728,8 +2728,14 @@ function isTaskFolderPath(path) {
 // （新しいタスクへのリンクが、ないノートへのリンクとして描かれたままにならないように）。
 async function refreshAfterTasks() {
   await refreshNotes()
-  if (view && currentPath) view.dispatch({ effects: contextSlot.reconfigure(noteContextFor(currentPath, editable)) })
+  redrawLinks()
   refreshTaskPanel()
+}
+
+// リンクの解決に使う情報を作り直し、表示も作り直す。previewField は setMode・文書の変更・選択の変更でしか描き直さないので、
+// 今の表示の setMode を添える（リンクが「ないノート」の見た目のまま残らないように）。
+function redrawLinks() {
+  if (view && currentPath) view.dispatch({ effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), setMode.of(mode)] })
 }
 
 function tasksSaved() {
@@ -2832,6 +2838,8 @@ async function makeTask(lineNumber) {
   }
   taskBusy = true
   let taskPath = null
+  // リンクを足し終えたか。足したあとの失敗（一覧の読み直しがつながらないなど）を、リンクを足せなかったと知らせないため。
+  let linked = false
   const path = currentPath
   const target = view
   const startedReading = mode === 'reading'
@@ -2871,14 +2879,16 @@ async function makeTask(lineNumber) {
       effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), EditorView.scrollIntoView(plan.at.from, { y: 'start', yMargin: 60 })],
       annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.task')],
     })
+    linked = true
     lastTask = { view, path, taskPath, doc: view.state.doc, depth: undoDepth(view.state) }
     saver?.save()
     showTaskNotice(createdText(created.data.due ?? found.due))
     await refreshNotes()
     tasksSaved()
   } catch {
-    // ノートを作ったあとの失敗なら、ノートが残っていることを知らせる。
-    showMessage(taskPath ? leftoverText(taskPath) : 'タスクのノートを作れませんでした。')
+    // リンクを足したあとの失敗（一覧の読み直しなど）は、次の読み直しで追いつくので知らせない。
+    // ノートを作ったあと、リンクを足す前の失敗なら、ノートが残っていることを知らせる。
+    if (!linked) showMessage(taskPath ? leftoverText(taskPath) : 'タスクのノートを作れませんでした。')
   } finally {
     taskBusy = false
   }
