@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EditorState, Text } from '@codemirror/state'
 
+import { MENU_HINT, leftoverText, notLinkedText, planAfterCreate } from '../src/task-convert.mjs'
 import { canUndoDirectly, createFailedText, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskLinkText, taskRequestBody } from '../src/task-convert.mjs'
 
 const ROOT = '90_Periodic'
@@ -112,4 +113,28 @@ test('取り消し：作った直後と同じなら履歴で戻す。違えば�
   assert.deepEqual(linkRemoval(text, 'Tasks/x.md'), { from: 4, to: 21, insert: '' })
   assert.equal(linkRemoval('- 目標', 'Tasks/x.md'), null)
   assert.equal(linkRemoval(text + '\n' + text, 'Tasks/x.md'), null)
+})
+
+test('POST のあと：同じ場所ならそこへ、ずれただけなら同じ文字の行へ、ほかはゴミ箱へ', () => {
+  const found = { from: 2, to: 6, lineText: '- 目標' }
+  const base = { sameNote: true, canWrite: true, found }
+  assert.deepEqual(planAfterCreate({ ...base, doc: docOf('a\n- 目標\nb') }), { action: 'link', at: { from: 2, to: 6, lineText: '- 目標' }, moved: false })
+  // 上に1行足されて、ずれただけ
+  assert.deepEqual(planAfterCreate({ ...base, doc: docOf('new\na\n- 目標\nb') }), { action: 'link', at: { from: 6, to: 10, lineText: '- 目標' }, moved: true })
+  // 同じ文字の行が2つある（どちらか分からない）
+  assert.deepEqual(planAfterCreate({ ...base, doc: docOf('x\na\n- 目標\n- 目標') }), { action: 'trash', reason: 'changed' })
+  // 行が書き換わった
+  assert.deepEqual(planAfterCreate({ ...base, doc: docOf('a\n- 目標X\nb') }), { action: 'trash', reason: 'changed' })
+  // ノートを切り替えた・保存が止まった（切り替えを先に見る）
+  assert.deepEqual(planAfterCreate({ ...base, sameNote: false, canWrite: false, doc: docOf('a\n- 目標') }), { action: 'trash', reason: 'switched' })
+  assert.deepEqual(planAfterCreate({ ...base, canWrite: false, doc: docOf('a\n- 目標') }), { action: 'trash', reason: 'stopped' })
+})
+
+test('リンクを足さなかったときの知らせは、理由とゴミ箱へ移せたかで分ける', () => {
+  assert.match(notLinkedText('switched', { trashed: true, taskPath: 'Tasks/a.md' }), /^作っている間に別のノートを開いたので、リンクは足していません。作ったタスクのノートはゴミ箱へ移しました。/)
+  assert.match(notLinkedText('stopped', { trashed: true, taskPath: 'Tasks/a.md' }), /保存が止まった/)
+  assert.match(notLinkedText('changed', { trashed: true, taskPath: 'Tasks/a.md' }), /行が書き換わった/)
+  assert.match(notLinkedText('changed', { trashed: false, taskPath: 'Tasks/a.md' }), /作ったノート（Tasks\/a\.md）が Tasks に残っています。$/)
+  assert.equal(leftoverText('Tasks/a.md'), 'リンクを足せませんでした。作ったノート（Tasks/a.md）が Tasks に残っています。')
+  assert.equal(MENU_HINT, 'Shift+右クリックでいつものメニュー')
 })

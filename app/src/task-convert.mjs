@@ -67,6 +67,46 @@ export function lineStillThere(doc, { from, to, lineText }) {
   return line.from === from && line.to === to
 }
 
+// POST /api/tasks が成功したあとに、どうするか。
+//   { action: 'link', at: { from, to, lineText }, moved }：その行の末尾にリンクを足す。moved は、覚えた場所からずれた行へ足すとき true。
+//   { action: 'trash', reason }：リンクは足さず、作ったノートをゴミ箱へ。reason は 'switched'（別のノートを開いた）・
+//     'stopped'（保存が止まった・書き換えられない）・'changed'（行が書き換わった、または同じ文字の行が見つからない・2つ以上ある）。
+// 位置がずれただけ（上で行を足した・消したなど）なら、同じ文字の行がちょうど1つあるときだけ、そこへ足す。
+export function planAfterCreate({ sameNote, canWrite, doc, found }) {
+  if (!sameNote) return { action: 'trash', reason: 'switched' }
+  if (!canWrite) return { action: 'trash', reason: 'stopped' }
+  if (lineStillThere(doc, found)) return { action: 'link', at: { from: found.from, to: found.to, lineText: found.lineText }, moved: false }
+  const same = []
+  for (let n = 1; n <= doc.lines && same.length < 2; n++) {
+    const line = doc.line(n)
+    if (line.text === found.lineText) same.push(line)
+  }
+  if (same.length === 1) return { action: 'link', at: { from: same[0].from, to: same[0].to, lineText: same[0].text }, moved: true }
+  return { action: 'trash', reason: 'changed' }
+}
+
+const NOT_LINKED_WHY = {
+  switched: '作っている間に別のノートを開いたので',
+  stopped: '作っている間にこのノートの保存が止まったので',
+  changed: '作っている間に行が書き換わったので',
+}
+
+// リンクを足さなかったときの知らせ。trashed はゴミ箱へ移せたか。
+export function notLinkedText(reason, { trashed, taskPath }) {
+  const why = NOT_LINKED_WHY[reason] ?? '作っている間にノートが変わったので'
+  return why + '、リンクは足していません。' + (trashed
+    ? '作ったタスクのノートはゴミ箱へ移しました。もう一度選んでください。'
+    : `作ったノート（${taskPath}）が Tasks に残っています。`)
+}
+
+// ノートを作ったあと、リンクを足す途中で失敗したときの知らせ。
+export function leftoverText(taskPath) {
+  return `リンクを足せませんでした。作ったノート（${taskPath}）が Tasks に残っています。`
+}
+
+// 自前のメニューの下に出す案内。
+export const MENU_HINT = 'Shift+右クリックでいつものメニュー'
+
 // 送る中身（作成日は画面の今日）。
 export function taskRequestBody(found, created) {
   const body = { title: found.title, created }

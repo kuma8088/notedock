@@ -327,6 +327,16 @@ body.split-open .tool-group { flex-wrap: wrap; }
   flex-wrap: wrap;
 }
 
+/* 自前のメニューの下の、いつものメニューの出し方の案内。 */
+.note-menu-hint {
+  margin: 4px 0 0;
+  padding: 4px 10px 2px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 /* タスクを作ったあとの知らせ。警告ではないので、落ち着いた色にする。 */
 #task-notice {
   background: var(--hover);

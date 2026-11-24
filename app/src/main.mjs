@@ -47,7 +47,7 @@ import { beginTableCell, historyStep, showMenu } from './widgets.mjs'
 import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
 import { dailyDateOf } from './task-buckets.mjs'
 import { createTaskPanel } from './task-panel.mjs'
-import { canUndoDirectly, createFailedText, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
+import { MENU_HINT, canUndoDirectly, createFailedText, createdText, leftoverText, linkChange, linkRemoval, menuForLine, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -2724,6 +2724,14 @@ function isTaskFolderPath(path) {
   return typeof path === 'string' && path.toLowerCase().startsWith(`${TASK_FOLDER.toLowerCase()}/`)
 }
 
+// 反対の枠でタスクが作られた・保存されたとき。ファイル一覧を読み直してから、リンクの解決に使う情報を作り直す
+// （新しいタスクへのリンクが、ないノートへのリンクとして描かれたままにならないように）。
+async function refreshAfterTasks() {
+  await refreshNotes()
+  if (view && currentPath) view.dispatch({ effects: contextSlot.reconfigure(noteContextFor(currentPath, editable)) })
+  refreshTaskPanel()
+}
+
 function tasksSaved() {
   refreshTaskPanel()
   if (PANE === 'right') toLeft({ type: MSG.TASKS })
@@ -2753,7 +2761,8 @@ function canConvertNow() {
 // （部品の中の出来事は CodeMirror の handlers に届かない）。表のマスは自分のメニューを出すので（defaultPrevented）、ここでは何もしない。
 function bindTaskContextMenu() {
   $('editor').addEventListener('contextmenu', (event) => {
-    if (!view || !view.contentDOM.contains(event.target)) return
+    // Shift を押しながらの右クリックは、いつものブラウザーのメニューにする。
+    if (event.shiftKey || !view || !view.contentDOM.contains(event.target)) return
     if (event.target.closest?.('.cm-props, .cm-table-wrap, #task-panel')) return
     taskContextMenu(event, view)
   })
@@ -2772,7 +2781,21 @@ function taskContextMenu(event, target) {
   // 自前のメニューを出すと標準のメニューが出ないので、選んだ文字があるときだけ「コピー」も置く。
   if (selection) items.push('-', { label: 'コピー', run: () => copyText(selection, { clipboard: navigator.clipboard, execCopy }) })
   showMenu(event, items)
+  addMenuHint()
   return true
+}
+
+// 自前のメニューの下に、いつものメニューの出し方を小さく出す。足した分だけ下や右にはみ出したら、内側へずらす。
+function addMenuHint() {
+  const menu = [...document.querySelectorAll('.note-menu')].at(-1)
+  if (!menu) return
+  const hint = document.createElement('p')
+  hint.className = 'note-menu-hint'
+  hint.textContent = MENU_HINT
+  menu.append(hint)
+  const rect = menu.getBoundingClientRect()
+  if (rect.bottom > innerHeight) menu.style.top = `${Math.max(4, innerHeight - rect.height - 4)}px`
+  if (rect.right > innerWidth) menu.style.left = `${Math.max(4, innerWidth - rect.width - 4)}px`
 }
 
 // ツールバーのボタンとキー（Cmd+Option+T）。カーソルのある行をタスクにする。
@@ -2808,24 +2831,31 @@ async function makeTask(lineNumber) {
     return
   }
   taskBusy = true
+  let taskPath = null
+  const path = currentPath
+  const target = view
+  const startedReading = mode === 'reading'
+  // 閲覧から始めてリンクを足さなかったときは、閲覧の表示に戻す（同じノートを開いているときだけ）。
+  const backToReading = () => {
+    if (startedReading && path === currentPath && target === view && mode === 'live') applyMode('reading')
+  }
   try {
     commitOpenField()
     // 閲覧の表示では「元に戻す」が効かないので、編集の表示に切り替えてから書き換える。
-    if (mode === 'reading') applyMode('live')
-    const path = currentPath
-    const target = view
+    if (startedReading) applyMode('live')
     const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify(taskRequestBody(found, todayText())) })
     if (!created.ok || typeof created.data?.path !== 'string') {
+      backToReading()
       showMessage(createFailedText(created.status, created.data?.error))
       return
     }
-    const taskPath = created.data.path
-    // 待っている間に、ノートが替わった・行が書き換わった・保存が止まったときは、リンクを足さずに作ったノートをゴミ箱へ移す。
-    if (path !== currentPath || target !== view || !canConvertNow() || !lineStillThere(view.state.doc, found)) {
+    taskPath = created.data.path
+    const plan = planAfterCreate({ sameNote: path === currentPath && target === view, canWrite: canConvertNow(), doc: view?.state.doc, found })
+    if (plan.action === 'trash') {
+      // リンクを足さないときは、作ったノートをゴミ箱へ移す。
       const trashed = await request('/api/trash', { method: 'POST', body: JSON.stringify({ path: taskPath }) })
-      showMessage(trashed.ok
-        ? '作っている間に行が書き換わったので、リンクは足していません。作ったタスクのノートはゴミ箱へ移しました。もう一度選んでください。'
-        : `作っている間に行が書き換わったので、リンクは足していません。作ったタスクのノート（${taskPath}）はゴミ箱へ移せなかったので残っています。`)
+      backToReading()
+      showMessage(notLinkedText(plan.reason, { trashed: trashed.ok, taskPath }))
       await refreshNotes()
       tasksSaved()
       return
@@ -2835,10 +2865,10 @@ async function makeTask(lineNumber) {
     known = new Set(known ?? [])
     known.add(normalizeKey(taskPath))
     view.dispatch({
-      changes: linkChange(found, taskPath),
+      changes: linkChange(plan.at, taskPath),
       // 編集の表示へ切り替えると行の位置がずれるので、リンクを足した行を見える所へ出す。
       // 狭いペインでは下半分にチャットの欄が重なるので、真ん中ではなく上のほうに出す。
-      effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), EditorView.scrollIntoView(found.from, { y: 'start', yMargin: 60 })],
+      effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), EditorView.scrollIntoView(plan.at.from, { y: 'start', yMargin: 60 })],
       annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.task')],
     })
     lastTask = { view, path, taskPath, doc: view.state.doc, depth: undoDepth(view.state) }
@@ -2847,7 +2877,8 @@ async function makeTask(lineNumber) {
     await refreshNotes()
     tasksSaved()
   } catch {
-    showMessage('タスクのノートを作れませんでした。')
+    // ノートを作ったあとの失敗なら、ノートが残っていることを知らせる。
+    showMessage(taskPath ? leftoverText(taskPath) : 'タスクのノートを作れませんでした。')
   } finally {
     taskBusy = false
   }
@@ -3378,8 +3409,7 @@ function receiveFromRight(data) {
     // 右の枠でCmd+クリックしたリンクは、左で開く。
     if (typeof data.path === 'string') openIn('left', data.path, { anchor: typeof data.anchor === 'string' ? data.anchor : '' })
   } else if (data.type === MSG.TASKS) {
-    refreshNotes()
-    refreshTaskPanel()
+    refreshAfterTasks()
   } else if (data.type === MSG.CLICKED) {
     split.setActive('right')
   } else if (data.type === MSG.OPENED) {
@@ -3465,8 +3495,7 @@ async function receiveFromLeft(data) {
     const pos = Math.max(0, Math.min(Number(data.from) || 0, view.state.doc.length))
     view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
   } else if (data.type === MSG.TASKS) {
-    refreshNotes()
-    refreshTaskPanel()
+    refreshAfterTasks()
   } else if (data.type === MSG.CHAT) {
     sendSelectionToChat()
   } else if (data.type === MSG.HISTORY) {
