@@ -54,6 +54,48 @@ export function askText(message, initial = '') {
   })
 }
 
+// 「新しいタスク」：題名と期日（空でよい）を聞く。check({ title, due }) が { ok, error } を返し、ok でなければ閉じずに知らせる。
+// 返り値：{ title, due } か null（やめた）。
+export function askNewTask(check) {
+  return open((dialog, finish) => {
+    const heading = document.createElement('p')
+    heading.textContent = '新しいタスク'
+    heading.className = 'dialog-title'
+    const titleLabel = document.createElement('label')
+    titleLabel.textContent = '題名'
+    const title = document.createElement('input')
+    title.type = 'text'
+    title.autocomplete = 'off'
+    titleLabel.append(title)
+    const dueLabel = document.createElement('label')
+    dueLabel.textContent = '期日（空のままでもよい）'
+    const due = document.createElement('input')
+    due.type = 'date'
+    dueLabel.append(due)
+    const error = document.createElement('p')
+    error.className = 'dialog-error'
+    error.hidden = true
+    const submit = () => {
+      const result = check({ title: title.value, due: due.value })
+      if (result.ok) return finish({ title: result.title, due: result.due })
+      error.textContent = result.error === 'due' ? '期日の形が正しくありません。' : '題名を入れてください。'
+      error.hidden = false
+      ;(result.error === 'due' ? due : title).focus()
+    }
+    for (const input of [title, due]) {
+      input.addEventListener('keydown', (event) => {
+        event.stopPropagation()
+        if (event.key === 'Enter' && !event.isComposing) {
+          event.preventDefault()
+          submit()
+        }
+      })
+    }
+    setTimeout(() => title.focus(), 0)
+    dialog.append(heading, titleLabel, dueLabel, error, actions(button('やめる', () => finish(null)), button('作る', submit, true)))
+  })
+}
+
 export function askConfirm(message, yes = 'はい') {
   return open((dialog, finish) => {
     const label = document.createElement('p')

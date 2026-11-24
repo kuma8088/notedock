@@ -81,6 +81,33 @@ export function bucketTasks(tasks, baseDate, { soonDays = TASK_SOON_DAYS } = {})
   return out
 }
 
+// サイドバーの「タスク」の並べ方（段階1-E2）。
+// open：未完了を期日の早い順の1列（期日なしは最後。同じ期日なら題名順）。done：完了（件数だけ見せてたたむ）。
+// unlinked：「リンクが外れたタスク」（サーバーの unlinked。完了したものも含む）。
+export function sideTaskModel(tasks) {
+  const out = { open: [], done: [], unlinked: [] }
+  for (const task of tasks ?? []) {
+    if (!task?.path) continue
+    if (isTaskDone(String(task.status ?? '').trim())) out.done.push(task)
+    else out.open.push(task)
+    if (task.unlinked === true) out.unlinked.push(task)
+  }
+  for (const key of Object.keys(out)) out[key].sort(compareTasks)
+  return out
+}
+
+// 「新しいタスク」の入力を確かめる。title は前後の空白を外す。due は空か YYYY-MM-DD。
+// 返り値：{ ok: true, title, due } か { ok: false, error: 'title' | 'due' }。
+export function checkNewTask({ title, due } = {}) {
+  // eslint-disable-next-line no-control-regex
+  const text = String(title ?? '').replace(/\t/g, ' ').trim()
+  // eslint-disable-next-line no-control-regex
+  if (!text || /[\x00-\x1f\x7f]/.test(text)) return { ok: false, error: 'title' }
+  const date = String(due ?? '').trim()
+  if (date && !isValidDate(date)) return { ok: false, error: 'due' }
+  return { ok: true, title: text, due: date }
+}
+
 function compareTasks(a, b) {
   const da = taskSpan(a)?.end ?? '9999-99-99'
   const db = taskSpan(b)?.end ?? '9999-99-99'

@@ -1586,7 +1586,8 @@ body.chat-on #editor .cm-content { padding-bottom: 220px; }
   gap: 4px 10px;
 }
 
-#task-panel button {
+#task-panel button,
+#tasks-side button {
   border: 0;
   background: none;
   padding: 0;
@@ -1672,14 +1673,16 @@ body.chat-on #editor .cm-content { padding-bottom: 220px; }
   padding: 2px 0;
 }
 
-#task-panel .task-open {
+#task-panel .task-open,
+#tasks-side .task-open {
   flex: 1 1 12em;
   min-width: 0;
   color: var(--link);
   overflow-wrap: anywhere;
 }
 
-#task-panel .task-open:hover {
+#task-panel .task-open:hover,
+#tasks-side .task-open:hover {
   text-decoration: underline;
 }
 
@@ -1744,4 +1747,90 @@ body.chat-on #editor .cm-content { padding-bottom: 220px; }
   border-radius: 4px;
   padding: 1px 6px;
   font-size: 11.5px;
+}
+
+/* ---- サイドバーの「タスク」（段階1-E2）。カレンダーとファイルの一覧の間に置く ---- */
+#tasks-side {
+  flex: 0 1 auto;
+  max-height: 45%;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 10px 8px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--ui);
+  font-size: var(--list-size);
+  line-height: 1.45;
+}
+
+#tasks-side[hidden] {
+  display: none;
+}
+
+/* ファイルの一覧を隠しているときは、残りの高さを使う。 */
+#side:has(> #files[hidden]) > #tasks-side {
+  flex: 1 1 auto;
+  max-height: none;
+}
+
+.task-side-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.task-side-title {
+  flex: 1;
+  font-weight: 700;
+}
+
+#tasks-side .task-side-new {
+  color: var(--link);
+  font-size: 12px;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+#tasks-side .task-side-new:hover {
+  background: var(--hover);
+}
+
+#tasks-side .task-list {
+  padding-left: 0;
+}
+
+#tasks-side .task-side-fold .task-list {
+  padding-left: calc(1em + 6px);
+}
+
+#tasks-side .task-empty {
+  padding-left: 0;
+}
+
+#tasks-side .task-side-fold .task-empty {
+  padding-left: calc(1em + 6px);
+}
+
+#tasks-side .task-side-fold {
+  margin-top: 4px;
+  border-top: 1px solid var(--line);
+  padding-top: 2px;
+}
+
+#tasks-side .task-trash {
+  color: var(--caution);
+  font-size: 11px;
+  padding: 0 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+}
+
+#tasks-side .task-trash:hover {
+  background: var(--hover);
+}
+
+#tasks-side .task-side-new:focus-visible,
+#tasks-side .task-trash:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }

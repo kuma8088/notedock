@@ -14,6 +14,8 @@ import {
   taskLabel,
   taskSpan,
   weekRange,
+  checkNewTask,
+  sideTaskModel,
 } from '../src/task-buckets.mjs'
 
 const t = (path, props = {}) => ({ path: `Tasks/${path}.md`, title: path, status: '未着手', start: '', due: '', ...props })
@@ -147,4 +149,33 @@ test('デイリーノートの日付は、置き場の下の 年/Daily/日付.md
 test('開閉の記録は知っている区分だけ読み、始めは直近だけ開く', () => {
   assert.deepEqual(sectionOpenState(null), TASK_SECTION_DEFAULT_OPEN)
   assert.deepEqual(sectionOpenState({ week: true, soon: false, other: true, month: 'x' }), { soon: false, week: true, month: false, none: false, done: false })
+})
+
+// ---- サイドバーの並べ方（段階1-E2） ----
+
+test('sideTaskModel：未完了は期日の早い順の1列（期日なしは最後、同じ期日は題名順）。完了は別。外れたものは unlinked にも', () => {
+  const tasks = [
+    { path: 'Tasks/n.md', title: '期日なし', status: '未着手' },
+    { path: 'Tasks/b.md', title: 'い', due: '2026-11-30', status: '進行中', unlinked: true },
+    { path: 'Tasks/a.md', title: 'あ', due: '2026-11-30' },
+    { path: 'Tasks/e.md', title: '早い', due: '2026-11-02', status: '保留' },
+    { path: 'Tasks/d.md', title: '済み', due: '2026-11-01', status: '完了', unlinked: true },
+    { path: 'Tasks/s.md', title: '開始日だけ', start: '2026-11-01' },
+    { path: 'Tasks/x.md', title: '知らない値', due: '2026-12-01', status: 'done' },
+    { title: 'パスなし' },
+  ]
+  const model = sideTaskModel(tasks)
+  assert.deepEqual(model.open.map((t) => t.title), ['早い', 'あ', 'い', '知らない値', '期日なし', '開始日だけ'])
+  assert.deepEqual(model.done.map((t) => t.title), ['済み'])
+  assert.deepEqual(model.unlinked.map((t) => t.title), ['済み', 'い'])
+  assert.deepEqual(sideTaskModel(null), { open: [], done: [], unlinked: [] })
+})
+
+test('checkNewTask：題名は必須（前後の空白を外す）、期日は空か日付', () => {
+  assert.deepEqual(checkNewTask({ title: '  見積もり\t送る ', due: '' }), { ok: true, title: '見積もり 送る', due: '' })
+  assert.deepEqual(checkNewTask({ title: 'a', due: '2026-11-30' }), { ok: true, title: 'a', due: '2026-11-30' })
+  assert.deepEqual(checkNewTask({ title: '   ', due: '' }), { ok: false, error: 'title' })
+  assert.deepEqual(checkNewTask({ title: 'a\nb' }), { ok: false, error: 'title' })
+  assert.deepEqual(checkNewTask({ title: 'a', due: '2026-02-30' }), { ok: false, error: 'due' })
+  assert.deepEqual(checkNewTask({ title: 'a', due: '11/30' }), { ok: false, error: 'due' })
 })

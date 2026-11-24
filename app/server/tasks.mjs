@@ -8,8 +8,11 @@ import { TASK_DEFAULT_STATUS, TASK_FOLDER, TASK_STATUSES, buildTaskNote, readTas
 import { taskFileName } from '../src/task-line.mjs'
 import { isValidDate } from '../src/periodic.mjs'
 import { createNote, readNote } from './notes.mjs'
-import { isListable, resolveFolderPath } from './paths.mjs'
+import { isListable, resolveFolderPath, resolveNotePath } from './paths.mjs'
 import { fingerprint } from './watch.mjs'
+import { normalizeKey } from '../src/links.mjs'
+import { linkRefsIn, unlinkedMap } from '../src/task-unlinked.mjs'
+import { pathKey } from '../src/task-delete.mjs'
 
 const BOM = String.fromCharCode(0xfeff)
 
@@ -29,10 +32,19 @@ export function linkTarget(value) {
   return text.replace(/\.md$/i, '')
 }
 
-export function createTaskIndex(root, { isHidden = () => false, maxEntries = 5000, maxDepth = 16, folder = TASK_FOLDER } = {}) {
-  // rel → { fp, task }。task が null なら type: task でないノート。
+// notes()：Vault のノート一覧（{ known, truncated }。app.mjs の notes() と同じもの）。「リンクが外れたか」の判定でリンクを解決するのに使う。
+// 渡さなければ判定はせず、unlinked はいつも false。
+export function createTaskIndex(root, { isHidden = () => false, maxEntries = 5000, maxDepth = 16, folder = TASK_FOLDER, notes = null } = {}) {
+  // rel → { fp, task, refs }。task が null なら type: task でないノート。refs はそのノートのリンク（判定に使う）。
   const cache = new Map()
+  // goal・parent のノート（Tasks/ の外）の、rel → { fp, refs }。判定の答えではなく、ファイルから取り出したものだけを覚える。
+  const sources = new Map()
   let reads = 0
+  let sourceReads = 0
+  // notes() が同じものを返す間は、同じ Set を使う（リンクの解決の表を作り直さないため）。
+  let knownFrom = null
+  let knownSet = null
+  let actualOf = new Map()
 
   // Vault 直下の、folder と大文字小文字だけ違う名前のフォルダーも使う。返すパスは実際の名前にする。
   // 同じ名前（大文字小文字だけ違う）が2つあるとき（大文字小文字を区別するディスク）は、決めた名前どおりのものを選ぶ。
@@ -104,11 +116,56 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
     try {
       note = readNote(root, rel)
     } catch {
-      return null
+      return { task: null, refs: [] }
     }
     const props = propsOf(note.text)
-    if (!props) return null
-    return { path: rel, ...props, editable: note.editable, reason: note.reason }
+    return { task: props ? { path: rel, ...props, editable: note.editable, reason: note.reason } : null, refs: linkRefsIn(note.text) }
+  }
+
+  function knownNow() {
+    if (!notes) return null
+    let listed
+    try {
+      listed = notes()
+    } catch {
+      return null
+    }
+    if (listed !== knownFrom) {
+      knownFrom = listed
+      knownSet = new Set((listed?.known ?? []).map(normalizeKey))
+      // 照合のキー（NFC）から、ディスクの上の実際の名前へ（NFD の名前のノートも読めるように）。
+      actualOf = new Map((listed?.known ?? []).map((rel) => [normalizeKey(rel), rel]))
+    }
+    return { set: knownSet, truncated: listed?.truncated === true }
+  }
+
+  // goal・parent のノートのリンク。読めない・隠しファイルなら null。変わっていなければ読み直さない。
+  function sourceRefs(rel, used) {
+    const actual = actualOf.get(normalizeKey(rel)) ?? rel
+    used.add(actual)
+    let full
+    try {
+      full = resolveNotePath(root, actual)
+    } catch {
+      return null
+    }
+    if (isHidden(full)) return null
+    const fp = fingerprint(full)
+    if (fp === 'missing') {
+      sources.delete(actual)
+      return null
+    }
+    const hit = sources.get(actual)
+    if (hit && hit.fp === fp) return hit.refs
+    sourceReads++
+    let refs = null
+    try {
+      refs = linkRefsIn(readNote(root, actual).text)
+    } catch {
+      refs = null
+    }
+    sources.set(actual, { fp, refs })
+    return refs
   }
 
   // 今のタスクの一覧。親の名前（parentTitle）と、親のノートの場所（parentPath）も付ける。
@@ -121,10 +178,11 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
       const hit = cache.get(rel)
       if (hit && hit.fp === fp) continue
       // 読む前に取った印で覚える。読んでいる間に変わっても、次の一覧で読み直される。
-      cache.set(rel, { fp, task: load(rel) })
+      cache.set(rel, { fp, ...load(rel) })
     }
     for (const rel of [...cache.keys()]) if (!seen.has(rel)) cache.delete(rel)
     const tasks = [...cache.values()].map((entry) => entry.task).filter(Boolean)
+    const unlinked = judge(tasks, truncated)
     // 照合のキーは、濁点などの持ち方の違い（NFC と NFD）と大文字小文字をそろえる。
     const keyOf = (text) => text.normalize('NFC').toLowerCase()
     const byPath = new Map(tasks.map((task) => [keyOf(task.path.replace(/\.md$/i, '')), task]))
@@ -134,18 +192,32 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
       byName.set(name, byName.has(name) ? null : task)
     }
     const out = tasks.map((task) => {
-      if (!task.parent) return { ...task, parentPath: null, parentTitle: '' }
+      const flag = unlinked?.get(pathKey(task.path)) === true
+      if (!task.parent) return { ...task, parentPath: null, parentTitle: '', unlinked: flag }
       const target = linkTarget(task.parent)
       const key = keyOf(target)
       const parent = byPath.get(key) ?? (key.includes('/') ? null : byName.get(key)) ?? null
       const title = parent ? parent.title || parent.path.split('/').at(-1).replace(/\.md$/i, '') : target.split('/').at(-1)
-      return { ...task, parentPath: parent?.path ?? null, parentTitle: title }
+      return { ...task, parentPath: parent?.path ?? null, parentTitle: title, unlinked: flag }
     })
     out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
     return { tasks: out, truncated }
   }
 
-  return { list, reads: () => reads, folderName: actualFolder }
+  // 「リンクが外れたか」を毎回決め直す（答えはほかのファイルと known で変わるので覚えない）。
+  // 一覧が途中まで（多すぎる）ときは、Tasks/ からのリンクを全部は見られないので、どれも外れたとしない。
+  function judge(tasks, truncated) {
+    const known = knownNow()
+    if (!known || truncated) return null
+    const used = new Set()
+    const taskNotes = [...cache.entries()].map(([rel, entry]) => ({ path: rel, refs: entry.refs ?? [] }))
+    const map = unlinkedMap(tasks, { known: known.set, refsOf: (rel) => sourceRefs(rel, used), taskNotes, complete: !known.truncated })
+    // 使わなくなった goal・parent のノートは覚えておかない。
+    for (const rel of [...sources.keys()]) if (!used.has(rel)) sources.delete(rel)
+    return map
+  }
+
+  return { list, reads: () => reads, sourceReads: () => sourceReads, folderName: actualFolder }
 }
 
 // ---- タスクのノートを作る（POST /api/tasks） ----

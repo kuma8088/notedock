@@ -122,7 +122,7 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
   const settings = () => readVaultSettings(vaultDir, root)
   const scanOptionsOf = (loaded) => ({ ...baseScanOptions, unlisted: loaded.unlisted })
   // タスクのノートの一覧。求められたときに、変わったファイルだけ読み直す。
-  const taskIndex = createTaskIndex(root, { isHidden: (p) => isHiddenFile(p) })
+  const taskIndex = createTaskIndex(root, { isHidden: (p) => isHiddenFile(p), notes: () => notes() })
   let notesCache = null
   let notesCachedAt = 0
   let notesCacheKey = ''

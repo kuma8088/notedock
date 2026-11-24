@@ -356,3 +356,67 @@ test('POST /api/tasks：受け取る中身を確かめる', async () => {
     assert.equal(data.path, 'Tasks/2026-05-03-He said hi- ok x.md')
   })
 })
+
+// ---- リンクが外れたか（段階1-E2）とキャッシュ ----
+
+test('GET /api/tasks の unlinked：goal のノートのリンクを消して保存すると外れた、戻すと外れていない。読み直しは変わったものだけ', async () => {
+  const r = makeRoot()
+  const MONTH = '90_Periodic/2026/Monthly/2026-11.md'
+  put(r, MONTH, '- 目標 [[Tasks/a|→タスク]]\n')
+  put(r, 'Tasks/a.md', task({ title: 'A', type: 'task', goal: '"[[90_Periodic/2026/Monthly/2026-11]]"' }))
+  put(r, 'Tasks/free.md', task({ title: 'F', type: 'task' }))
+  let scans = 0
+  const index = createTaskIndex(r, { notes: () => { scans++; return { known: ['Tasks/a.md', 'Tasks/free.md', MONTH], truncated: false } } })
+  const flags = () => Object.fromEntries(index.list().tasks.map((t) => [t.title, t.unlinked]))
+  assert.deepEqual(flags(), { A: false, F: false })
+  assert.equal(index.sourceReads(), 1)
+  const reads = index.reads()
+  // 変わっていなければ、タスクのノートも goal のノートも読み直さない（答えは毎回決め直す）
+  assert.deepEqual(flags(), { A: false, F: false })
+  assert.equal(index.reads(), reads)
+  assert.equal(index.sourceReads(), 1)
+  // リンクを手で消す（大きさが変わる）
+  put(r, MONTH, '- 目標\n')
+  assert.deepEqual(flags(), { A: true, F: false })
+  assert.equal(index.sourceReads(), 2)
+  assert.equal(index.reads(), reads)
+  // 別のタスクのノートへリンクの行を移す
+  put(r, 'Tasks/free.md', task({ title: 'F', type: 'task' }, '- [ ] A [[Tasks/a|→タスク]]\n'))
+  assert.deepEqual(flags(), { A: false, F: false })
+  assert.equal(index.reads(), reads + 1)
+  // goal のノートが消えた
+  put(r, 'Tasks/free.md', task({ title: 'F', type: 'task' }))
+  fs.rmSync(path.join(r, MONTH))
+  const gone = createTaskIndex(r, { notes: () => ({ known: ['Tasks/a.md', 'Tasks/free.md'], truncated: false }) })
+  assert.equal(gone.list().tasks.find((t) => t.title === 'A').unlinked, true)
+  // Vault の一覧が途中までなら、見つからないことを理由にしない
+  const partial = createTaskIndex(r, { notes: () => ({ known: ['Tasks/a.md'], truncated: true }) })
+  assert.equal(partial.list().tasks.find((t) => t.title === 'A').unlinked, false)
+  // notes を渡さなければ判定しない
+  assert.equal(createTaskIndex(r).list().tasks.every((t) => t.unlinked === false), true)
+  assert.ok(scans >= 1)
+})
+
+test('GET /api/tasks の unlinked：サーバー全体で、リンクを消すと外れたに変わる', async () => {
+  const r = makeRoot()
+  const st = fs.mkdtempSync(path.join(os.tmpdir(), 'tasks-state-'))
+  put(r, '90_Periodic/2026/Monthly/2026-11.md', '- 目標 [[Tasks/a|→タスク]]\n')
+  put(r, 'Tasks/a.md', task({ title: 'A', type: 'task', goal: '"[[90_Periodic/2026/Monthly/2026-11]]"' }))
+  const app = createApp({ root: r, port: 0, backupDir: st, stateDir: st, vaultDir: path.join(st, 'vault'), noToken: true })
+  const srv = await app.listen(0)
+  const url = `http://127.0.0.1:${srv.address().port}`
+  try {
+    const first = await (await fetch(`${url}/api/tasks`)).json()
+    assert.equal(first.tasks[0].unlinked, false)
+    const note = await (await fetch(`${url}/api/note?path=${encodeURIComponent('90_Periodic/2026/Monthly/2026-11.md')}`)).json()
+    const put2 = await fetch(`${url}/api/note?path=${encodeURIComponent('90_Periodic/2026/Monthly/2026-11.md')}`, { method: 'PUT', headers: { 'x-note-editor': '1', 'content-type': 'application/json' }, body: JSON.stringify({ text: '- 目標\n', baseHash: note.hash }) })
+    assert.equal(put2.status, 200)
+    const second = await (await fetch(`${url}/api/tasks`)).json()
+    assert.equal(second.tasks[0].unlinked, true)
+  } finally {
+    await new Promise((done) => {
+      srv.closeAllConnections()
+      srv.close(done)
+    })
+  }
+})

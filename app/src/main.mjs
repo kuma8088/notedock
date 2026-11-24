@@ -25,7 +25,7 @@ import { findHeading, headingsOf, linkCompletion, wikiLinkCompletion } from './c
 import { calendarModel, shiftMonth } from './calendar.mjs'
 import { periodInfo, todayButtonHidden } from './periodic.mjs'
 import { PRODUCT } from './product.mjs'
-import { askChoice, askConfirm, askNewNote, askPlace, askText, showCopyable, showMessage } from './dialogs.mjs'
+import { askChoice, askConfirm, askNewNote, askNewTask, askPlace, askText, showCopyable, showMessage } from './dialogs.mjs'
 import { copyText } from './copy.mjs'
 import { keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
@@ -45,7 +45,8 @@ import { linesFrom, selectedLines } from './lines.mjs'
 import { applyMention, headingTarget, mentionCandidates, mentionQuery, sectionsOf, unwritableCount } from './mention.mjs'
 import { beginTableCell, historyStep, showMenu } from './widgets.mjs'
 import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
-import { dailyDateOf } from './task-buckets.mjs'
+import { checkNewTask, dailyDateOf } from './task-buckets.mjs'
+import { createTaskSide } from './task-side.mjs'
 import { createTaskPanel } from './task-panel.mjs'
 import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceNoteOf, taskTitleOf, trashFailedText, unlinkRange } from './task-delete.mjs'
 import { MENU_HINT, canUndoDirectly, createFailedText, createdText, leftoverText, linkChange, linkRemoval, menuForLine, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
@@ -309,6 +310,7 @@ const api = {
     if (result.status === 409) return result.data
     if (!result.ok) throw Object.assign(new Error(result.data?.error ?? 'save failed'), { status: result.status })
     if (isTaskFolderPath(path)) tasksSaved()
+    else noteSaved()
     return result.data
   },
   async backup(path, text) {
@@ -1835,6 +1837,7 @@ function renderOutline() {
 // 開く前の状態に戻すためなので、次回の表示の設定は変えない。
 let filesUnderOutline = false
 let calendarUnderOutline = false
+let tasksUnderOutline = false
 function closeOutline() {
   const box = $('outline')
   if (box.hidden) return
@@ -1843,11 +1846,16 @@ function closeOutline() {
     $('calendar').hidden = false
     drawCalendar()
   }
+  if (tasksUnderOutline) {
+    $('tasks-side').hidden = false
+    refreshTaskSide()
+  }
   if (filesUnderOutline) {
     $('files').hidden = false
     drawFiles()
   }
   calendarUnderOutline = false
+  tasksUnderOutline = false
   filesUnderOutline = false
 }
 
@@ -1856,8 +1864,10 @@ function toggleOutline() {
   if (box.hidden) {
     filesUnderOutline = !$('files').hidden
     calendarUnderOutline = !$('calendar').hidden
+    tasksUnderOutline = !$('tasks-side').hidden
     $('files').hidden = true
     $('calendar').hidden = true
+    $('tasks-side').hidden = true
     box.hidden = false
     renderOutline()
   } else {
@@ -1917,14 +1927,16 @@ function setupSideResize() {
 function closeSideIfNarrow() {
   if (!isNarrow()) return
   $('calendar').hidden = true
+  $('tasks-side').hidden = true
   $('files').hidden = true
 }
 
-// 一覧もカレンダーも隠れたら、右の列ごと隠す。
+// 一覧もカレンダーもタスクも隠れたら、右の列ごと隠す。
 function syncSide() {
-  $('side').hidden = $('calendar').hidden && $('files').hidden
+  $('side').hidden = $('calendar').hidden && $('tasks-side').hidden && $('files').hidden
 }
 new MutationObserver(syncSide).observe($('calendar'), { attributes: true, attributeFilter: ['hidden'] })
+new MutationObserver(syncSide).observe($('tasks-side'), { attributes: true, attributeFilter: ['hidden'] })
 new MutationObserver(syncSide).observe($('files'), { attributes: true, attributeFilter: ['hidden'] })
 
 function jumpTo(pos) {
@@ -2731,6 +2743,7 @@ async function refreshAfterTasks() {
   await refreshNotes()
   redrawLinks()
   refreshTaskPanel()
+  refreshTaskSide()
 }
 
 // リンクの解決に使う情報を作り直し、表示も作り直す。previewField は setMode・文書の変更・選択の変更でしか描き直さないので、
@@ -2741,6 +2754,7 @@ function redrawLinks() {
 
 function tasksSaved() {
   refreshTaskPanel()
+  refreshTaskSide()
   if (PANE === 'right') toLeft({ type: MSG.TASKS })
   else if (split?.isOpen()) split.post({ type: MSG.TASKS })
 }
@@ -3169,6 +3183,105 @@ async function deleteThisTask() {
   }
 }
 
+// ---- サイドバーの「タスク」（段階1-E2）。左の枠だけで使う ----
+
+const taskSide = createTaskSide({
+  box: $('tasks-side'),
+  store: storage,
+  keyOf: (name) => `${name}:${vaultName}`,
+  today: todayText,
+  onOpen: (path, event) => {
+    openIn(targetPane({ meta: event.metaKey || event.ctrlKey, from: 'sidebar', active: activePane() }), path)
+    // 狭い幅では右の列が本文に重なるので閉じる（次回の表示の設定は変えない）。
+    closeSideIfNarrow()
+  },
+  onTrash: (path) => trashUnlinkedTask(path),
+  onCreate: () => createTaskFromSide(),
+})
+
+// 読み直し。きっかけ：起動、60秒ごと、画面に戻ったとき、タスクを作った・消した・Tasks の下を保存したとき、
+// 反対の枠からの知らせ、ほかのノートを保存したとき（リンクを手で消すと「外れた」に変わるため。少し待ってまとめる）。
+function refreshTaskSide() {
+  if (PANE === 'right' || $('tasks-side').hidden) return
+  taskSide.refresh(async () => {
+    const result = await request('/api/tasks')
+    if (!result.ok) throw new Error('tasks')
+    return result.data
+  })
+}
+
+let noteSavedTimer = null
+function noteSaved() {
+  if (PANE === 'right') {
+    toLeft({ type: MSG.NOTE_SAVED })
+    return
+  }
+  clearTimeout(noteSavedTimer)
+  noteSavedTimer = setTimeout(refreshTaskSide, 500)
+}
+
+// 「新しいタスク」：題名と期日を聞いて、goal も parent もないタスクのノートを作り、開く。
+async function createTaskFromSide() {
+  const input = await askNewTask(checkNewTask)
+  if (!input) return
+  const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify({ title: input.title, due: input.due, created: todayText() }) }).catch(() => ({ ok: false }))
+  if (!created.ok || typeof created.data?.path !== 'string') {
+    showMessage(createFailedText(created.status, created.data?.error))
+    return
+  }
+  await refreshNotes()
+  tasksSaved()
+  await openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), created.data.path)
+  closeSideIfNarrow()
+}
+
+// 「リンクが外れたタスク」の「ゴミ箱へ」。外れたリンクはないので、リンクは外さずにノートをゴミ箱へ移す。
+// 子がいれば一緒に移すか聞く。開いているノートなら「このタスクを削除」と同じ流れにする。
+async function trashUnlinkedTask(path) {
+  if (taskBusy) return
+  if (currentPath && pathKey(currentPath) === pathKey(path)) {
+    deleteThisTask()
+    return
+  }
+  taskBusy = true
+  try {
+    const list = await loadTaskList()
+    const task = list ? findTask(list, path) : null
+    if (!task || task.unlinked !== true) {
+      showMessage(list ? 'このタスクは、もうリンクが外れたタスクではない（またはなくなった）ので、移しませんでした。' : 'タスクの一覧を読めなかったので、移せません。')
+      refreshTaskSide()
+      return
+    }
+    const children = collectDescendants(list, task.path)
+    const title = taskTitleOf(task)
+    const source = sourceNoteOf(task, known)
+    const sourceName = source ? source.path.split('/').at(-1).replace(/\.md$/i, '') : ''
+    const unlink = source?.exists ? 'none-count' : 'none-missing'
+    const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink, sourceName, linkCount: 0 }), deleteChoices(children.length))
+    if (!choice) return
+    const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
+    // 左で開いているノートを一緒に移すときは、先に保存する。移したあとは何も開いていない画面に戻す。
+    const openGoes = Boolean(currentPath) && paths.some((item) => pathKey(item) === pathKey(currentPath))
+    if (openGoes) {
+      commitOpenField()
+      await saver?.flush()
+    }
+    const result = await trashTaskNotes(paths)
+    if (openGoes && result.moved.some((item) => pathKey(item) === pathKey(currentPath))) {
+      await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked: false }))
+      saver?.close()
+      saver = null
+      location.href = '/'
+      return
+    }
+    await afterTaskTrash({ title, rootPath: task.path, result, undo: false, unlinked: false })
+  } catch {
+    showMessage('タスクをゴミ箱へ移す途中で失敗しました。ファイル一覧で、残っているものを確かめてください。')
+  } finally {
+    taskBusy = false
+  }
+}
+
 async function drawCalendar() {
   const mine = ++calendarRequest
   const month = calMonth
@@ -3256,6 +3369,16 @@ function showCalendar(show, { remember = true } = {}) {
     closeOutline()
     $('calendar').hidden = false
     drawCalendar()
+  }
+}
+
+function showTasksSide(show, { remember = true } = {}) {
+  $('tasks-side').hidden = !show
+  if (remember) storage.set('tasks-shown', show)
+  if (show) {
+    closeOutline()
+    $('tasks-side').hidden = false
+    refreshTaskSide()
   }
 }
 
@@ -3571,6 +3694,7 @@ function bindLeftChrome() {
   })
   $('toggle-outline').addEventListener('click', toggleOutline)
   $('toggle-calendar').addEventListener('click', () => showCalendar($('calendar').hidden))
+  $('toggle-tasks').addEventListener('click', () => showTasksSide($('tasks-side').hidden))
   $('today-note').addEventListener('click', () => openPeriodicNote('daily', todayText(), { ask: false }))
   $('toggle-files').addEventListener('click', () => showFiles($('files').hidden))
   // 押しても、書いていた場所からカーソルが動かないようにする。
@@ -3657,6 +3781,8 @@ function receiveFromRight(data) {
     if (typeof data.path === 'string') openIn('left', data.path, { anchor: typeof data.anchor === 'string' ? data.anchor : '' })
   } else if (data.type === MSG.TASKS) {
     refreshAfterTasks()
+  } else if (data.type === MSG.NOTE_SAVED) {
+    refreshTaskSide()
   } else if (data.type === MSG.CLICKED) {
     split.setActive('right')
   } else if (data.type === MSG.OPENED) {
@@ -3917,6 +4043,7 @@ async function start() {
   await refreshNotes()
   const narrow = isNarrow()
   showCalendar(storage.get('calendar-shown', !narrow), { remember: false })
+  showTasksSide(storage.get('tasks-shown', !narrow), { remember: false })
   // カレンダーをたたんでいても、今日のノートのボタンを出すか隠すかは起動時に決める。
   await drawCalendar()
   const params = new URLSearchParams(location.search)
@@ -3938,13 +4065,16 @@ async function start() {
     refreshNotes()
     drawCalendar().catch(() => {})
     refreshTaskPanel()
+    refreshTaskSide()
   }, 60_000)
   watchTaskPanelVisibility()
 }
 
 function watchTaskPanelVisibility() {
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) refreshTaskPanel()
+    if (document.hidden) return
+    refreshTaskPanel()
+    refreshTaskSide()
   })
 }
 
@@ -3952,6 +4082,7 @@ function watchTaskPanelVisibility() {
 async function startRight() {
   // カレンダーとファイルの一覧は出さないので、描く処理が動かないよう隠しておく。
   $('calendar').hidden = true
+  $('tasks-side').hidden = true
   $('files').hidden = true
   await refreshNotes()
   if (!view) {
