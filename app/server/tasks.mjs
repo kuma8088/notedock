@@ -4,8 +4,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { TASK_FOLDER, readTaskProps } from '../src/tasks.mjs'
-import { readNote } from './notes.mjs'
+import { TASK_DEFAULT_STATUS, TASK_FOLDER, TASK_STATUSES, buildTaskNote, readTaskProps } from '../src/tasks.mjs'
+import { taskFileName } from '../src/task-line.mjs'
+import { isValidDate } from '../src/periodic.mjs'
+import { createNote, readNote } from './notes.mjs'
 import { isListable, resolveFolderPath } from './paths.mjs'
 import { fingerprint } from './watch.mjs'
 
@@ -143,5 +145,64 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
     return { tasks: out, truncated }
   }
 
-  return { list, reads: () => reads }
+  return { list, reads: () => reads, folderName: actualFolder }
+}
+
+// ---- タスクのノートを作る（POST /api/tasks） ----
+
+const bad = (message) => Object.assign(new Error(message), { status: 400 })
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\x00-\x1f\x7f]/
+const LINK = /^\[\[[^\[\]]+\]\]$/
+const BARE = /^[^\[\]"]+$/
+
+function linkField(value, name) {
+  if (value === undefined || value === null || value === '') return ''
+  if (typeof value !== 'string' || CONTROL.test(value)) throw bad(name)
+  const text = value.trim()
+  if (!LINK.test(text) && !BARE.test(text)) throw bad(name)
+  return text
+}
+
+function dateField(value, name) {
+  if (value === undefined || value === null || value === '') return ''
+  if (!isValidDate(value)) throw bad(name)
+  return value
+}
+
+// 画面から受け取った中身を確かめる。作成日（created）は画面の今日で、サーバーでは決めない。
+export function checkTaskInput(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw bad('body')
+  const { created, status = TASK_DEFAULT_STATUS } = input
+  // タブは空白にする。改行などの制御文字は、プロパティの行が増えてしまうので断る。
+  const title = typeof input.title === 'string' ? input.title.replace(/\t/g, ' ') : input.title
+  if (typeof title !== 'string' || title.trim() === '' || CONTROL.test(title)) throw bad('title')
+  if (!isValidDate(created)) throw bad('created')
+  if (!TASK_STATUSES.includes(status)) throw bad('status')
+  return {
+    title: title.trim(),
+    created,
+    status,
+    start: dateField(input.start, 'start'),
+    due: dateField(input.due, 'due'),
+    goal: linkField(input.goal, 'goal'),
+    parent: linkField(input.parent, 'parent'),
+  }
+}
+
+// Tasks/ にタスクのノートを1つ作る。名前が重なったら -2、-3 … を付けて作り直す（wx で作るので、大文字小文字や
+// 濁点の持ち方だけが違う名前も、OS が重なりとして断る）。folder は実際のフォルダーの名前（なければ Tasks）。
+export function createTaskNote(root, input, { folder = TASK_FOLDER, maxTries = 100 } = {}) {
+  const props = checkTaskInput(input)
+  const text = buildTaskNote(props)
+  for (let n = 1; n <= maxTries; n++) {
+    const rel = `${folder}/${taskFileName(props.title, props.created, n)}`
+    try {
+      const created = createNote(root, rel, text)
+      return { path: rel, hash: created.hash, title: props.title, due: props.due }
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+    }
+  }
+  throw Object.assign(new Error('同じ名前のタスクが多すぎます'), { status: 409 })
 }

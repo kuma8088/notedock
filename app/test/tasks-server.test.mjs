@@ -6,6 +6,7 @@ import { after, before, test } from 'node:test'
 
 import { createApp } from '../server/app.mjs'
 import { createTaskIndex, linkTarget } from '../server/tasks.mjs'
+import { readTaskProps } from '../src/tasks.mjs'
 
 const task = (props, body = '') => `---\n${Object.entries(props).map(([k, v]) => `${k}: ${v}`).join('\n')}\n---\n${body}`
 
@@ -212,4 +213,123 @@ test('linkTarget', () => {
   assert.equal(linkTarget('[[Tasks/a|x]]'), 'Tasks/a')
   assert.equal(linkTarget('[[a#見出し]]'), 'a')
   assert.equal(linkTarget('Tasks/a.md'), 'Tasks/a')
+})
+
+
+// ---- POST /api/tasks ----
+
+async function withApp(setup, run) {
+  const dir = makeRoot()
+  const state = fs.mkdtempSync(path.join(os.tmpdir(), 'tasks-state-'))
+  setup?.(dir)
+  const app = createApp({ root: dir, port: 0, backupDir: state, stateDir: state, vaultDir: path.join(state, 'vault'), noToken: true })
+  const srv = await app.listen(0)
+  const url = 'http://127.0.0.1:' + srv.address().port
+  const post = async (body) => {
+    const response = await fetch(url + '/api/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'x-note-editor': '1' }, body: typeof body === 'string' ? body : JSON.stringify(body) })
+    return { status: response.status, data: await response.json().catch(() => null) }
+  }
+  try {
+    await run({ dir, url, post })
+  } finally {
+    await new Promise((r) => {
+      srv.closeAllConnections()
+      srv.close(r)
+    })
+  }
+}
+
+const sample = { title: '**4枚描く** [[下描き]]', created: '2026-05-03', due: '2026-05-10', goal: '[[90_Periodic/2026/Monthly/2026-05]]' }
+
+test('POST /api/tasks は Tasks/ にタスクのノートを作り、作ったパスを返す。作成日は受け取ったものを使う', async () => {
+  await withApp(null, async ({ dir, url, post }) => {
+    const { status, data } = await post(sample)
+    assert.equal(status, 201)
+    assert.equal(data.path, 'Tasks/2026-05-03-4枚描く 下描き.md')
+    assert.equal(data.due, '2026-05-10')
+    const text = fs.readFileSync(path.join(dir, data.path), 'utf8')
+    assert.equal(text, '---\ntitle: "**4枚描く** [[下描き]]"\ntype: task\nstatus: 未着手\nstart:\ndue: 2026-05-10\ngoal: "[[90_Periodic/2026/Monthly/2026-05]]"\n---\n')
+    // 一覧とノートの一覧にすぐ出る
+    const tasks = await (await fetch(url + '/api/tasks')).json()
+    assert.deepEqual(tasks.tasks.map((t) => t.path), [data.path])
+    assert.equal(tasks.tasks[0].title, sample.title)
+    const notes = await (await fetch(url + '/api/notes')).json()
+    assert.ok(notes.notes.includes(data.path))
+  })
+})
+
+test('POST /api/tasks：同じ名前が続いたら -2、-3 を付ける。Tasks/ がなければ作る', async () => {
+  await withApp(null, async ({ dir, post }) => {
+    assert.equal(fs.existsSync(path.join(dir, 'Tasks')), false)
+    const paths = []
+    for (let i = 0; i < 3; i++) paths.push((await post({ title: '6/4 作品展へ出す。', created: '2026-05-03' })).data.path)
+    assert.deepEqual(paths, ['Tasks/2026-05-03-64 作品展へ出す。.md', 'Tasks/2026-05-03-64 作品展へ出す。-2.md', 'Tasks/2026-05-03-64 作品展へ出す。-3.md'])
+    // 作成日が違えば番号は付かない
+    assert.equal((await post({ title: '6/4 作品展へ出す。', created: '2026-06-01' })).data.path, 'Tasks/2026-06-01-64 作品展へ出す。.md')
+    // 長い名前でも、番号を付けて 255 バイトに収める
+    const long = 'あ'.repeat(120)
+    const first = (await post({ title: long, created: '2026-05-03' })).data.path
+    const second = (await post({ title: long, created: '2026-05-03' })).data.path
+    assert.ok(second.endsWith('-2.md'))
+    for (const rel of [first, second]) {
+      assert.ok(Buffer.byteLength(rel.split('/').at(-1)) <= 255)
+      assert.ok(fs.existsSync(path.join(dir, rel)))
+    }
+  })
+})
+
+test('POST /api/tasks：大文字小文字だけ違う Tasks のフォルダーがあれば、その名前を使う', async () => {
+  await withApp((dir) => fs.mkdirSync(path.join(dir, 'tasks')), async ({ dir, post }) => {
+    const { status, data } = await post({ title: '小文字', created: '2026-05-03' })
+    assert.equal(status, 201)
+    assert.equal(data.path, 'tasks/2026-05-03-小文字.md')
+    assert.deepEqual(fs.readdirSync(dir), ['tasks'])
+  })
+})
+
+test('POST /api/tasks：Vault の外へ逃げない', async () => {
+  const outside = makeRoot()
+  await withApp((dir) => fs.symlinkSync(outside, path.join(dir, 'Tasks')), async ({ dir, post }) => {
+    const { status } = await post({ title: '外へ', created: '2026-05-03' })
+    assert.equal(status, 400)
+    assert.deepEqual(fs.readdirSync(outside), [])
+    assert.deepEqual(fs.readdirSync(dir), ['Tasks'])
+  })
+  await withApp(null, async ({ dir, post }) => {
+    const { status, data } = await post({ title: '../../../etc/passwd', created: '2026-05-03' })
+    assert.equal(status, 201)
+    assert.equal(data.path, 'Tasks/2026-05-03-etcpasswd.md')
+    assert.ok(fs.existsSync(path.join(dir, data.path)))
+    // 作成日はパスの一部になるので、日付でなければ断る
+    assert.equal((await post({ title: 'x', created: '../../x' })).status, 400)
+    assert.equal((await post({ title: 'x', created: '2026-02-30' })).status, 400)
+    assert.equal((await post({ title: 'x' })).status, 400)
+  })
+})
+
+test('POST /api/tasks：受け取る中身を確かめる', async () => {
+  await withApp(null, async ({ dir, post }) => {
+    const bad = [
+      { ...sample, title: '' },
+      { ...sample, title: '   ' },
+      { ...sample, title: 3 },
+      { ...sample, title: 'a\ntype: memo' },
+      { ...sample, status: 'done' },
+      { ...sample, due: '2026-5-1' },
+      { ...sample, start: 'あした' },
+      { ...sample, goal: '[[a]]\nx: 1' },
+      { ...sample, goal: '[[a]] [[b]]' },
+      { ...sample, parent: 5 },
+      [],
+    ]
+    for (const body of bad) assert.equal((await post(body)).status, 400, JSON.stringify(body))
+    assert.equal((await post('{')).status, 400)
+    assert.equal(fs.existsSync(path.join(dir, 'Tasks')), false)
+    // 引用符やバックスラッシュ、タブを含む題名、ステータス・開始日・親
+    const { status, data } = await post({ title: 'He said "hi":\tok \\ x', created: '2026-05-03', status: '進行中', start: '2026-05-04', due: '', parent: '[[Tasks/2026-05-01-親]]', goal: '90_Periodic/2026/Monthly/2026-05' })
+    assert.equal(status, 201)
+    const props = readTaskProps(fs.readFileSync(path.join(dir, data.path), 'utf8'))
+    assert.deepEqual(props, { title: 'He said "hi": ok \\ x', status: '進行中', start: '2026-05-04', due: '', goal: '[[90_Periodic/2026/Monthly/2026-05]]', parent: '[[Tasks/2026-05-01-親]]' })
+    assert.equal(data.path, 'Tasks/2026-05-03-He said hi ok x.md')
+  })
 })

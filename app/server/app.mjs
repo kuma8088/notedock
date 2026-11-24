@@ -11,7 +11,8 @@ import { createBackups } from './backups.mjs'
 import { createFolder, moveItem, planMove, trashItem } from './fileops.mjs'
 import { createNote, readNote, writeNote } from './notes.mjs'
 import { isHiddenFile } from './platform.mjs'
-import { createTaskIndex } from './tasks.mjs'
+import { createTaskIndex, createTaskNote } from './tasks.mjs'
+import { TASK_FOLDER } from '../src/tasks.mjs'
 import { openPeriodic, periodicMonth } from './periodic.mjs'
 import { replaceFile } from './durable.mjs'
 import { checkVaultSettings, readVaultSettings } from './vault-settings.mjs'
@@ -531,6 +532,19 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
         return send(res, 200, notes())
       case 'GET /api/tasks':
         return send(res, 200, taskIndex.list())
+      // タスクのノートを Tasks/ に作る。目標のノートへのリンクは画面がエディターの変更として足す（サーバーは書き換えない）。
+      case 'POST /api/tasks': {
+        let body
+        try {
+          body = JSON.parse(await readBody(req, MAX_JSON))
+        } catch (error) {
+          if (error.status) throw error
+          return send(res, 400, { error: 'bad request' })
+        }
+        const created = createTaskNote(root, body, { folder: taskIndex.folderName() ?? TASK_FOLDER })
+        notesCache = null
+        return send(res, 201, created)
+      }
       case 'GET /api/events':
         return events(req, res, rel)
       case 'GET /api/file': {
