@@ -189,10 +189,23 @@ export function undoneText({ moved = false } = {}) {
   return '取り消しました。' + left + 'いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。'
 }
 
-// 履歴の undo（Cmd+Z）で、「タスクにする」の変更まで戻ったか。last は作った直後の履歴の深さ（depth）。
-// 「タスクにする」の変更は1つの履歴になっている（isolateHistory）ので、深さがそれより浅くなれば、その変更は戻っている。
-export function undidTask(last, { undo, depth }) {
-  return Boolean(last && undo && Number.isInteger(last.depth) && depth < last.depth)
+// 文書に、「タスクにする」で足したリンク（「 リンク」）があるか。
+export function hasTaskLink(text, path) {
+  return String(text).includes(' ' + taskLinkText(path))
+}
+
+// 履歴の undo・redo（Cmd+Z・Cmd+Shift+Z）で、足したリンクが文書から消えたか、戻ったか。
+// 履歴の深さでは決めない。CodeMirror の履歴は長くなると古いほうから切り詰めるので、関係のない Cmd+Z でも深さが浅くなるため。
+// 変更の前（before）と後（after）の文書で、リンクがあるかどうかが変わったときだけ答える。
+// 'removed'：undo でリンクが消えた（「タスクにする」の変更まで戻った）。'restored'：undo か redo でリンクが戻った。
+// どちらでもない（打った・消した変更、リンクに関係のない undo・redo、選んだ範囲だけの undo）なら null。
+export function historyLinkChange(path, { undo = false, redo = false, before, after }) {
+  if (!path || (!undo && !redo) || typeof before !== 'string' || typeof after !== 'string') return null
+  const had = hasTaskLink(before, path)
+  const has = hasTaskLink(after, path)
+  if (undo && had && !has) return 'removed'
+  if (!had && has) return 'restored'
+  return null
 }
 
 // 「取り消す」で、履歴の undo をそのまま使ってよいか。作った直後の文書と同じで、履歴の深さも同じときだけ。

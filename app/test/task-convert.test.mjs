@@ -2,11 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EditorState, Text } from '@codemirror/state'
 
-import { MENU_HINT, createLostText, leftoverText, notLinkedText, planAfterCreate, undidTask, undoneText } from '../src/task-convert.mjs'
+import { MENU_HINT, createLostText, hasTaskLink, historyLinkChange, leftoverText, notLinkedText, planAfterCreate, undoneText } from '../src/task-convert.mjs'
 import { canUndoDirectly, createFailedText, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskLinkText, taskRequestBody } from '../src/task-convert.mjs'
 import { expectedTaskPath, moveChanges, moveUndoChange, movedBody } from '../src/task-convert.mjs'
-import { Transaction } from '@codemirror/state'
-import { history, isolateHistory, undo, undoDepth } from '@codemirror/commands'
+import { EditorSelection, Transaction } from '@codemirror/state'
+import { history, isolateHistory, redo, undo, undoDepth } from '@codemirror/commands'
 import { noteMarkdown } from '../src/markdown-ext.mjs'
 import { noteContext, previewField } from '../src/preview.mjs'
 import { frontmatterGuard } from '../src/modes.mjs'
@@ -270,14 +270,76 @@ test('取り消したあとの知らせ：タスクのノートが残ること�
   assert.equal(undoneText(), '取り消しました。タスクのノートは Tasks に残っています。いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。')
 })
 
-test('Cmd+Z で「タスクにする」の変更まで戻ったか（作ったときの知らせを閉じる）', () => {
-  const last = { depth: 3 }
-  assert.equal(undidTask(last, { undo: true, depth: 2 }), true)
-  // あとで打った文字を戻しただけ（深さは作った直後と同じ）
-  assert.equal(undidTask(last, { undo: true, depth: 3 }), false)
-  // undo でない変更（打った・redo）では閉じない
-  assert.equal(undidTask(last, { undo: false, depth: 2 }), false)
-  assert.equal(undidTask(null, { undo: true, depth: 0 }), false)
+test('Cmd+Z・Cmd+Shift+Z で足したリンクが消えたか・戻ったか：文書で決める', () => {
+  const path = 'Tasks/2026-11-25-目標.md'
+  const linked = '- 目標 ' + taskLinkText(path) + '\n- メモ'
+  const plain = '- 目標\n- メモ'
+  assert.equal(hasTaskLink(linked, path), true)
+  assert.equal(hasTaskLink(plain, path), false)
+  // undo でリンクが消えた（「タスクにする」の変更まで戻った）
+  assert.equal(historyLinkChange(path, { undo: true, before: linked, after: plain }), 'removed')
+  // リンクに関係のない undo（あとで打った文字を戻しただけ）
+  assert.equal(historyLinkChange(path, { undo: true, before: linked + 'x', after: linked }), null)
+  // undo・redo でリンクが戻った（「取り消す」のあとの Cmd+Z、Cmd+Z のあとの Cmd+Shift+Z）
+  assert.equal(historyLinkChange(path, { undo: true, before: plain, after: linked }), 'restored')
+  assert.equal(historyLinkChange(path, { redo: true, before: plain, after: linked }), 'restored')
+  // redo でリンクが消えても 'removed' にしない（undo で戻ったときだけ）
+  assert.equal(historyLinkChange(path, { redo: true, before: linked, after: plain }), null)
+  // undo・redo でない変更（打った・消した）には反応しない
+  assert.equal(historyLinkChange(path, { before: linked, after: plain }), null)
+  assert.equal(historyLinkChange(path, { before: plain, after: linked }), null)
+  // 選んだ範囲だけの undo（文書は変わらない）
+  assert.equal(historyLinkChange(path, { undo: true, before: linked, after: linked }), null)
+  // 行を写してリンクが2つあるとき、片方が消えてもまだ文書にある
+  assert.equal(historyLinkChange(path, { undo: true, before: linked + '\n' + linked, after: linked }), null)
+  // 別のタスクのリンクには反応しない
+  assert.equal(historyLinkChange('Tasks/2026-11-25-別.md', { undo: true, before: linked, after: plain }), null)
+  assert.equal(historyLinkChange('', { undo: true, before: linked, after: plain }), null)
+})
+
+test('長く編集したノート：履歴が切り詰められても、関係のない Cmd+Z では作ったときの知らせを閉じない', () => {
+  // エディターの dispatch と同じように、変更ごとに undo・redo か、前と後の文書を記録する。
+  const path = 'Tasks/2026-11-25-目標.md'
+  const link = ' ' + taskLinkText(path)
+  let state = EditorState.create({ doc: '- 目標\n- メモ', extensions: [history()] })
+  const steps = []
+  const view = {
+    get state() { return state },
+    dispatch(spec) {
+      const tr = spec instanceof Transaction ? spec : state.update(spec)
+      steps.push({ undo: tr.isUserEvent('undo'), redo: tr.isUserEvent('redo'), before: tr.startState.doc.toString(), after: tr.state.doc.toString() })
+      state = tr.state
+    },
+  }
+  const judge = () => historyLinkChange(path, steps.at(-1))
+  let time = 0
+  // 打つたびに別の履歴になるよう、時刻を空ける。
+  const type = () => view.dispatch({ changes: { from: state.doc.length, insert: 'x' }, annotations: [Transaction.userEvent.of('input.type'), Transaction.time.of((time += 10000))] })
+  for (let i = 0; i < 110; i++) type()
+  // 「タスクにする」：1行目の末尾にリンクを足す（main.mjs と同じく、1つの履歴にする）
+  view.dispatch({ changes: { from: '- 目標'.length, insert: link }, annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.task'), Transaction.time.of((time += 10000))] })
+  const taskDepth = undoDepth(state)
+  view.dispatch({ selection: EditorSelection.cursor(1), annotations: [Transaction.userEvent.of('select'), Transaction.time.of((time += 10000))] })
+  for (let i = 0; i < 15; i++) type()
+  undo(view)
+  // 前提：履歴が切り詰められて、あとで打った文字を1つ戻しただけでも、深さは作った直後より浅い（深さで決めると、ここで閉じてしまう）
+  assert.ok(undoDepth(state) < taskDepth, `深さ ${undoDepth(state)} < ${taskDepth}`)
+  assert.ok(state.doc.toString().includes(link))
+  assert.equal(judge(), null)
+  // リンクが消える Cmd+Z まで、ほかの Cmd+Z には反応しない
+  let guard = 0
+  while (state.doc.toString().includes(link)) {
+    undo(view)
+    assert.ok(++guard < 50, '50回の undo でリンクが消えない')
+    if (state.doc.toString().includes(link)) assert.equal(judge(), null)
+  }
+  assert.equal(judge(), 'removed')
+  // Cmd+Shift+Z でリンクが戻る（取り消したあとの知らせを閉じる）
+  redo(view)
+  assert.ok(state.doc.toString().includes(link))
+  assert.equal(judge(), 'restored')
+  undo(view)
+  assert.equal(judge(), 'removed')
 })
 
 // エディターと同じ拡張（Markdown・ノートの情報・プレビュー・プロパティの欄を守る決まり・履歴）で、1回の変更にまとめて入れる。

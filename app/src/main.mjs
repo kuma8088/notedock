@@ -50,7 +50,7 @@ import { checkNewTask, dailyDateOf } from './task-buckets.mjs'
 import { createTaskSide } from './task-side.mjs'
 import { createTaskPanel } from './task-panel.mjs'
 import { collectDescendants, confirmedChildren, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkedTrashCheck, unlinkRange, unsavedBlockText } from './task-delete.mjs'
-import { MENU_HINT, canUndoDirectly, createFailedText, createLostText, createdText, expectedTaskPath, leftoverText, linkRemoval, menuForLine, moveChanges, moveUndoChange, movedBody, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody, undidTask, undoneText } from './task-convert.mjs'
+import { MENU_HINT, canUndoDirectly, createFailedText, createLostText, createdText, expectedTaskPath, leftoverText, linkRemoval, menuForLine, moveChanges, moveUndoChange, movedBody, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody, historyLinkChange, undoneText } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -1009,12 +1009,29 @@ function onUpdate(update) {
     syncToolbar()
   }
   if (foldsChanged(update)) rememberFolds()
-  // 履歴の undo（Cmd+Z）で「タスクにする」の変更まで戻ったら、作ったときの知らせ（「取り消す」）を閉じる。
-  // 同じノートのときだけ（別のノートの履歴の深さとは比べない）。
-  if (lastTask && update.view === lastTask.view && lastTask.path === currentPath && undidTask(lastTask, { undo: update.transactions.some((tr) => tr.isUserEvent('undo')), depth: undoDepth(update.state) })) {
+  if (update.docChanged) taskNoticeAfterHistory(update)
+}
+
+// 履歴の undo・redo（Cmd+Z・Cmd+Shift+Z）のあとに、タスクの知らせを文書に合わせる。履歴の深さではなく、足したリンクがあるかで決める。
+// - undo で「タスクにする」の変更まで戻った（リンクが消えた）：「取り消す」の相手を忘れる。作ったときの知らせが出ていれば、
+//   取り消したあとの知らせ（「取り消す」のボタンと同じ中身）に差し替える。ほかの知らせ（タスクの削除など）はそのままにする。
+// - 取り消したあとの知らせが出ている間に、undo か redo でリンクが戻った（行が移った状態に戻った）：その知らせを閉じる。
+// どちらも、作ったノートを開いているときだけ（エディターはノートを切り替えても同じ画面を使い回すため）。
+function taskNoticeAfterHistory(update) {
+  const undo = update.transactions.some((tr) => tr.isUserEvent('undo'))
+  const redo = update.transactions.some((tr) => tr.isUserEvent('redo'))
+  if (!undo && !redo) return
+  const sameNote = (task) => Boolean(task) && update.view === task.view && task.path === currentPath
+  const undone = taskNotice?.kind === 'undone' ? taskNotice.task : null
+  if (!sameNote(lastTask) && !sameNote(undone)) return
+  const step = { undo, redo, before: update.startState.doc.toString(), after: update.state.doc.toString() }
+  if (sameNote(lastTask) && historyLinkChange(lastTask.taskPath, step) === 'removed') {
+    const last = lastTask
     lastTask = null
-    hideTaskNotice()
+    if (taskNotice?.kind === 'created') showTaskNotice(undoneText({ moved: Boolean(last.removedText) }), { undo: false, task: last })
+    return
   }
+  if (sameNote(undone) && historyLinkChange(undone.taskPath, step) === 'restored') hideTaskNotice()
 }
 
 function rememberFolds() {
@@ -2991,8 +3008,13 @@ function makeTaskAtCursor() {
 
 let taskBusy = false
 // 最後に作ったタスクの「取り消す」に使う。{ view, path, taskPath, doc, depth, removedText }
+// doc・depth は作った直後の文書と履歴の深さ（「取り消す」で履歴の undo をそのまま使えるかを見るため）。
 // removedText：タスクのノートへ移した子の行（元のノートから消した文字。先頭の改行を含む）。移していなければ null。
 let lastTask = null
+// 出ているタスクの知らせ（#task-notice）の種類。'created'（作ったとき。「取り消す」あり）・'undone'（取り消したあと）・
+// 'deleted'（タスクを削除したあと）。閉じていれば null。undone のときは、取り消したタスク（task: { view, path, taskPath }）も覚える
+// （undo・redo でリンクが戻ったら閉じるため）。
+let taskNotice = null
 
 async function makeTask(lineNumber) {
   if (taskBusy) return
@@ -3086,11 +3108,12 @@ function undoLastTask() {
   saver?.save()
   tasksSaved()
   // 取り消してもタスクのノートは残る（移した行も入ったまま）ので、消し方といっしょに知らせる。
-  showTaskNotice(undoneText({ moved: Boolean(last.removedText) }), { undo: false })
+  showTaskNotice(undoneText({ moved: Boolean(last.removedText) }), { undo: false, task: last })
 }
 
-// undo: false なら「取り消す」のボタンを出さない（取り消したあとの知らせ）。
-function showTaskNotice(text, { undo = true } = {}) {
+// undo: false なら「取り消す」のボタンを出さない（取り消したあとの知らせ）。そのときの task は、取り消したタスク。
+function showTaskNotice(text, { undo = true, task = null } = {}) {
+  taskNotice = undo ? { kind: 'created' } : { kind: 'undone', task: task && { view: task.view, path: task.path, taskPath: task.taskPath } }
   const notice = $('task-notice')
   notice.replaceChildren(
     document.createTextNode(text),
@@ -3101,6 +3124,7 @@ function showTaskNotice(text, { undo = true } = {}) {
 }
 
 function hideTaskNotice() {
+  taskNotice = null
   $('task-notice').hidden = true
 }
 
@@ -3206,6 +3230,7 @@ async function afterTaskTrash({ title, rootPath, result, undo, unlinked, sourceN
 }
 
 function showDeleteNotice(text) {
+  taskNotice = { kind: 'deleted' }
   const notice = $('task-notice')
   notice.replaceChildren(document.createTextNode(text), bannerButton('閉じる', hideTaskNotice))
   notice.hidden = false
