@@ -1010,7 +1010,8 @@ function onUpdate(update) {
   }
   if (foldsChanged(update)) rememberFolds()
   // 履歴の undo（Cmd+Z）で「タスクにする」の変更まで戻ったら、作ったときの知らせ（「取り消す」）を閉じる。
-  if (lastTask && update.view === lastTask.view && undidTask(lastTask, { undo: update.transactions.some((tr) => tr.isUserEvent('undo')), depth: undoDepth(update.state) })) {
+  // 同じノートのときだけ（別のノートの履歴の深さとは比べない）。
+  if (lastTask && update.view === lastTask.view && lastTask.path === currentPath && undidTask(lastTask, { undo: update.transactions.some((tr) => tr.isUserEvent('undo')), depth: undoDepth(update.state) })) {
     lastTask = null
     hideTaskNotice()
   }
