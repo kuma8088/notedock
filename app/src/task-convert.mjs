@@ -1,6 +1,8 @@
 // 「タスクにする」の画面の操作（段階1-C2）のうち、DOM に頼らない部分。
 // 行の判定は task-line.mjs の taskFromLine。ここでは、エディターの文書との突き合わせ、リンクの文字、知らせの文を決める。
-import { taskFromLine } from './task-line.mjs'
+import { compileMoves, relinkText } from './relink.mjs'
+import { TASK_FOLDER } from './tasks.mjs'
+import { childrenOf, taskFileName, taskFromLine } from './task-line.mjs'
 
 export const TASK_LINK_LABEL = '→タスク'
 
@@ -59,6 +61,39 @@ export function linkChange({ from, lineText }, path) {
   return { from: from + body.length, to: from + body.length, insert: ' ' + taskLinkText(path) }
 }
 
+// 作るタスクのノートの、予想のパス（Tasks/作成日-目標の文.md）。サーバーは、同じ名前があれば -2 を付け、Tasks の大文字小文字が
+// 違えば実際の名前を使うが、どれも同じフォルダーの同じ深さなので、本文のリンクの直し方は変わらない。
+export function expectedTaskPath(found, created) {
+  return TASK_FOLDER + '/' + taskFileName(found.title, created)
+}
+
+// 移す子の行（found.children.lines）から、タスクのノートの本文を作る。行を改行でつなぎ、末尾に改行を1つ足す。
+// リンクは、元のノート（notePath）から新しいノート（taskPath）へ動いたものとして直す（relinkText。相対のリンクと、
+// 名前だけで別のノートを指すようになるリンク）。known は Vault のノートの一覧（Set か配列）。子がなければ ''。
+export function movedBody(found, { notePath, taskPath, known }) {
+  const lines = found?.children?.lines
+  if (!lines?.length) return ''
+  const before = [...(known ?? [])]
+  const after = before.includes(taskPath) ? before : [...before, taskPath]
+  const { text } = relinkText(lines.join('\n'), { note: notePath, after: taskPath, move: compileMoves([]), knownBefore: before, knownAfter: after })
+  return text + '\n'
+}
+
+// 1回の変更（dispatch）に入れる changes。行末にリンクを足し、子の行（children の from〜to。行の終わりから最後の子の行の終わりまで）を消す。
+// どちらも変更の前の文書の位置で書く。リンクは行の終わり以下に入り、消すのは行の終わりから先なので、重ならない。
+// at・children は planAfterCreate が返したもの。children がなければリンクだけ。
+export function moveChanges(at, taskPath, children) {
+  const link = linkChange(at, taskPath)
+  return children ? [link, { from: children.from, to: children.to, insert: '' }] : [link]
+}
+
+// 文書の lineNumber 行目の子の行が、覚えた子の行（kids.text）とちょうど同じなら、今の文書での位置を返す。違えば null。
+// 前から同じ文字で始まるだけでは足りない（最後の子の行に書き足した・子の行を足したときに、行の途中で消してしまうため）。
+function sameChildren(doc, lineNumber, kids) {
+  const now = childrenOf(doc.toString(), lineNumber - 1)
+  return now && now.text === kids.text ? { from: now.from, to: now.to, text: now.text } : null
+}
+
 // POST /api/tasks のあと、覚えた行がまだ同じ場所に同じ文字であるか。
 export function lineStillThere(doc, { from, to, lineText }) {
   if (!doc || to > doc.length) return false
@@ -72,17 +107,26 @@ export function lineStillThere(doc, { from, to, lineText }) {
 //   { action: 'trash', reason }：リンクは足さず、作ったノートをゴミ箱へ。reason は 'switched'（別のノートを開いた）・
 //     'stopped'（保存が止まった・書き換えられない）・'changed'（行が書き換わった、または同じ文字の行が見つからない・2つ以上ある）。
 // 位置がずれただけ（上で行を足した・消したなど）なら、同じ文字の行がちょうど1つあるときだけ、そこへ足す。
+// 子の行を移すとき（found.children がある）は、行のすぐ下の子の行もちょうど同じであることを確かめ、今の位置を children で返す
+// （{ action: 'link', at, moved, children: { from, to, text } }）。子の行が書き換わった・足された・減ったときは 'changed'。
 export function planAfterCreate({ sameNote, canWrite, doc, found }) {
   if (!sameNote) return { action: 'trash', reason: 'switched' }
   if (!canWrite) return { action: 'trash', reason: 'stopped' }
-  if (lineStillThere(doc, found)) return { action: 'link', at: { from: found.from, to: found.to, lineText: found.lineText }, moved: false }
+  const kids = found.children ?? null
+  const link = (line, moved) => {
+    if (!kids) return { action: 'link', at: { from: line.from, to: line.to, lineText: line.text }, moved }
+    const children = sameChildren(doc, line.number, kids)
+    return children ? { action: 'link', at: { from: line.from, to: line.to, lineText: line.text }, moved, children } : null
+  }
+  const changed = { action: 'trash', reason: 'changed' }
+  if (lineStillThere(doc, found)) return link(doc.lineAt(found.from), false) ?? changed
   const same = []
   for (let n = 1; n <= doc.lines && same.length < 2; n++) {
     const line = doc.line(n)
     if (line.text === found.lineText) same.push(line)
   }
-  if (same.length === 1) return { action: 'link', at: { from: same[0].from, to: same[0].to, lineText: same[0].text }, moved: true }
-  return { action: 'trash', reason: 'changed' }
+  if (same.length === 1) return link(same[0], true) ?? changed
+  return changed
 }
 
 const NOT_LINKED_WHY = {
@@ -108,18 +152,22 @@ export function leftoverText(taskPath) {
 export const MENU_HINT = 'Shift+右クリックでいつものメニュー'
 
 // 送る中身（作成日は画面の今日）。
-export function taskRequestBody(found, created) {
+// text は本文（movedBody の結果）。空なら送らない。
+export function taskRequestBody(found, created, text = '') {
   const body = { title: found.title, created }
   if (found.due) body.due = found.due
   if (found.goal) body.goal = found.goal
   if (found.parent) body.parent = found.parent
+  if (text) body.body = text
   return body
 }
 
 // 作ったあとの知らせ。期日は M/D で出す（年は出さない）。
-export function createdText(due) {
+// moved は、タスクのノートへ移した子の行の数（空の行は数えない）。1以上なら、移したことと、取り消すと戻ることを書く。
+export function createdText(due, { moved = 0 } = {}) {
   const m = /^\d{4}-(\d{2})-(\d{2})$/.exec(due ?? '')
   const head = m ? `期日 ${Number(m[1])}/${Number(m[2])} で作りました。` : '期日なしで作りました。'
+  if (moved > 0) return head + `下の行${moved}行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して移した行を戻します（タスクのノートは Tasks に残ります）。`
   return head + '「取り消す」を押すと、行のリンクだけを外します（タスクのノートは Tasks に残ります）。'
 }
 
@@ -135,4 +183,15 @@ export function linkRemoval(text, path) {
   const first = text.indexOf(insert)
   if (first < 0 || text.indexOf(insert, first + 1) >= 0) return null
   return { from: first, to: first + insert.length, insert: '' }
+}
+
+// 子の行を移したあとで、履歴の undo を使えないとき（あとで打った文字がある）に、足したリンクを外し、消した子の行
+// （removedText。先頭の改行を含む）をその行のすぐ下へ戻す changes。linkRemoval の子のある版。
+// 足した文字（「 リンク」）が文書にちょうど1つあるときだけ。見つからない・2つ以上なら null。
+export function moveUndoChange(text, path, removedText) {
+  const removal = linkRemoval(text, path)
+  if (!removal) return null
+  const next = text.indexOf('\n', removal.to)
+  const end = next < 0 ? text.length : next
+  return [removal, { from: end, to: end, insert: removedText }]
 }

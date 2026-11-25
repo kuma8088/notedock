@@ -357,6 +357,53 @@ test('POST /api/tasks：受け取る中身を確かめる', async () => {
   })
 })
 
+test('POST /api/tasks：本文（移した子の行）があれば、プロパティのあとにそのまま書く', async () => {
+  await withApp(null, async ({ dir, url, post }) => {
+    const body = '- [ ] 下書き\n\t- [x] 構図 [[90_Periodic/2026/Monthly/same]]\n\n> 引用\n'
+    const { status, data } = await post({ ...sample, title: '本文つき', body })
+    assert.equal(status, 201)
+    const text = fs.readFileSync(path.join(dir, data.path), 'utf8')
+    assert.equal(text, '---\ntitle: "本文つき"\ntype: task\nstatus: 未着手\nstart:\ndue: 2026-05-10\ngoal: "[[90_Periodic/2026/Monthly/2026-05]]"\n---\n' + body)
+    // 末尾に改行がなければ1つ足す
+    const bare = await post({ ...sample, title: '改行なし', body: '- a\n  - b' })
+    assert.ok(fs.readFileSync(path.join(dir, bare.data.path), 'utf8').endsWith('---\n- a\n  - b\n'))
+    // 本文が空・null なら、今までと同じ（プロパティだけ）
+    for (const empty of ['', null]) {
+      const plain = await post({ ...sample, title: '本文なし', body: empty })
+      assert.equal(plain.status, 201)
+      assert.ok(fs.readFileSync(path.join(dir, plain.data.path), 'utf8').endsWith('goal: "[[90_Periodic/2026/Monthly/2026-05]]"\n---\n'))
+    }
+    // 一覧には本文つきのノートも出る
+    const tasks = await (await fetch(url + '/api/tasks')).json()
+    assert.ok(tasks.tasks.some((t) => t.title === '本文つき'))
+  })
+})
+
+test('POST /api/tasks：本文が文字でない・CR か NUL を含む・長すぎるときは断り、ノートを作らない', async () => {
+  await withApp(null, async ({ dir, post }) => {
+    const bad = [5, ['- a'], { a: 1 }, true, '- a\r\n- b', '- a\r', 'a\x00b', 'a'.repeat(1000001)]
+    for (const body of bad) {
+      const result = await post({ ...sample, body })
+      assert.equal(result.status, 400, JSON.stringify(body).slice(0, 40))
+      assert.deepEqual(result.data, { error: 'body' })
+    }
+    assert.equal(fs.existsSync(path.join(dir, 'Tasks')), false)
+    // ちょうど上限の長さは作れる
+    assert.equal((await post({ ...sample, body: 'a'.repeat(1000000) })).status, 201)
+  })
+})
+
+test('GET /api/tasks：閉じの --- の行末に空白があるタスクのノートも一覧に出る', async () => {
+  await withApp((dir) => {
+    fs.mkdirSync(path.join(dir, 'Tasks'))
+    fs.writeFileSync(path.join(dir, 'Tasks', '2026-05-01-親.md'), '---\ntitle: "親"\ntype: task\nstatus: 未着手\ndue: 2026-06-04\n--- \n- [ ] 下の行\n')
+    fs.writeFileSync(path.join(dir, 'Tasks', '2026-05-02-子.md'), '--- \ntitle: "子"\ntype: task\nstatus: 進行中\nparent: "[[Tasks/2026-05-01-親]]"\n---\t\n')
+  }, async ({ url }) => {
+    const data = await (await fetch(url + '/api/tasks')).json()
+    assert.deepEqual(data.tasks.map((t) => [t.title, t.status, t.due, t.parentTitle]), [['親', '未着手', '2026-06-04', ''], ['子', '進行中', '', '親']])
+  })
+})
+
 // ---- リンクが外れたか（段階1-E2）とキャッシュ ----
 
 test('GET /api/tasks の unlinked：goal のノートのリンクを消して保存すると外れた、戻すと外れていない。読み直しは変わったものだけ', async () => {

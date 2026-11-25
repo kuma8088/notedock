@@ -80,6 +80,11 @@ test('組み立てたノートを読み直すと同じ値になる（題名の�
   assert.deepEqual(readTaskProps(text), props)
   assert.equal(readTaskProps('---\ntype: note\n---\n'), null)
   assert.equal(buildTaskNote({ title: 'z' }), '---\ntitle: "z"\ntype: task\nstatus: 未着手\nstart:\ndue:\n---\n')
+  // 本文の末尾は改行1つで終える（改行で終わっていれば足さない）。頭の改行は外す。改行だけの本文は本文なしと同じ
+  assert.ok(buildTaskNote({ title: 'z' }, '- a').endsWith('---\n- a\n'))
+  assert.ok(buildTaskNote({ title: 'z' }, '\n\n- a\n').endsWith('---\n- a\n'))
+  assert.ok(buildTaskNote({ title: 'z' }, '- a\n\n').endsWith('---\n- a\n\n'))
+  assert.equal(buildTaskNote({ title: 'z' }, '\n\n'), buildTaskNote({ title: 'z' }))
 })
 
 // YAML として読み違えやすい題名。引用符なしだと、リスト・真偽値・数・null・日付・別の項目として読まれうる。

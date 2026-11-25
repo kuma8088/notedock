@@ -305,6 +305,28 @@ test('タスクのノートの行：goal を引き継ぎ、parent にそのノ�
   assert.equal(at('TASKS/t.md', bare, '下の行').parent, '[[TASKS/t]]')
 })
 
+test('サブタスクの作成：parent が自分を指す・輪になった親・親の due がない／日付でない・親の goal がない', () => {
+  // parent が自分を指すタスクのノート：goal は写すだけで、parent はたどらない（止まらない）
+  const self = buildTaskNote({ title: '自分', due: '2026-06-04', goal: '[[90_Periodic/2026/Monthly/2026-05]]', parent: '[[Tasks/self]]' }) + '- [ ] 下の行\n  - 孫\n'
+  const fromSelf = at('Tasks/self.md', self, '下の行')
+  assert.equal(fromSelf.ok, true)
+  assert.equal(fromSelf.parent, '[[Tasks/self]]')
+  assert.equal(fromSelf.goal, '[[90_Periodic/2026/Monthly/2026-05]]')
+  assert.equal(fromSelf.due, '2026-06-04')
+  assert.deepEqual(fromSelf.children.lines, ['- 孫'])
+  // A.parent=B・B.parent=A の輪：A の行から作れる。goal は A の値をそのまま
+  const a = buildTaskNote({ title: 'A', goal: '[[g]]', parent: '[[Tasks/B]]' }) + '- [ ] Aの行\n'
+  assert.deepEqual([at('Tasks/A.md', a, 'Aの行').parent, at('Tasks/A.md', a, 'Aの行').goal], ['[[Tasks/A]]', '[[g]]'])
+  // 親の due が日付でなければ空（期日なし）
+  const odd = '---\ntitle: "親"\ntype: task\nstatus: 未着手\ndue: あした\n---\n- [ ] 下の行\n'
+  assert.equal(at('Tasks/odd.md', odd, '下の行').due, '')
+  assert.equal(at('Tasks/odd.md', '---\ntitle: "親"\ntype: task\ndue: 2026-02-30\n---\n- [ ] 下の行\n', '下の行').due, '')
+  // 親の goal がなければ parent だけで作る
+  const noGoal = at('Tasks/odd.md', odd, '下の行')
+  assert.equal(noGoal.goal, '')
+  assert.equal(noGoal.parent, '[[Tasks/odd]]')
+})
+
 test('週・月・四半期・タスクのノート以外では作れない', () => {
   const text = '- [ ] 行'
   const reason = (path, periodicRoot = ROOT) => taskFromLine({ path, text, line: 1, periodicRoot }).reason

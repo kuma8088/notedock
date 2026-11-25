@@ -269,6 +269,15 @@ function linkField(value, name) {
   return text
 }
 
+// 本文（移した子の行）。中身は解釈せず、そのまま書く。改行とタブは本文の一部なので通す。
+// エディターの文書は改行が LF にそろっているので、CR は来ないはず（来たら断る。混ざると編集できないノートになるため）。NUL も断る。
+export const TASK_BODY_MAX = 1000000
+function bodyField(value) {
+  if (value === undefined || value === null || value === '') return ''
+  if (typeof value !== 'string' || value.includes('\r') || value.includes('\0') || value.length > TASK_BODY_MAX) throw bad('body')
+  return value
+}
+
 function dateField(value, name) {
   if (value === undefined || value === null || value === '') return ''
   if (!isValidDate(value)) throw bad(name)
@@ -292,6 +301,7 @@ export function checkTaskInput(input) {
     due: dateField(input.due, 'due'),
     goal: linkField(input.goal, 'goal'),
     parent: linkField(input.parent, 'parent'),
+    body: bodyField(input.body),
   }
 }
 
@@ -310,8 +320,8 @@ function ensureTaskFolder(root, folder) {
 // Tasks/ にタスクのノートを1つ作る。名前が重なったら -2、-3 … を付けて作り直す（wx で作るので、大文字小文字や
 // 濁点の持ち方だけが違う名前も、OS が重なりとして断る）。folder は実際のフォルダーの名前（なければ Tasks）。
 export function createTaskNote(root, input, { folder = TASK_FOLDER, maxTries = 100 } = {}) {
-  const props = checkTaskInput(input)
-  const text = buildTaskNote(props)
+  const { body, ...props } = checkTaskInput(input)
+  const text = buildTaskNote(props, body)
   ensureTaskFolder(root, folder)
   for (let n = 1; n <= maxTries; n++) {
     const rel = `${folder}/${taskFileName(props.title, props.created, n)}`

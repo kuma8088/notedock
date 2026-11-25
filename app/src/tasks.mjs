@@ -129,10 +129,13 @@ export function buildTaskFrontmatter({ title = '', status = TASK_DEFAULT_STATUS,
   return source
 }
 
-// タスクのノートを1つ作るときの中身。本文は空、または渡されたもの。
+// タスクのノートを1つ作るときの中身。本文は空、または渡されたもの。本文があれば、末尾を改行1つで終える形にそろえる
+// （もう改行で終わっていれば足さない）。
 export function buildTaskNote(props = {}, body = '') {
   const text = buildTaskFrontmatter(props) + '\n'
-  return body ? text + body.replace(/^\n+/, '') : text
+  const rest = body ? String(body).replace(/^\n+/, '') : ''
+  if (!rest) return text
+  return text + (rest.endsWith('\n') ? rest : rest + '\n')
 }
 
 // タスクのノートのプロパティを読む。type: task でなければ null。
