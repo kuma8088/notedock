@@ -67,3 +67,17 @@ test('返事の待ち：同じ id の返事だけで解ける。切れたあと�
   // 読み込み直した枠（別に作った控え）の id とも重ならない
   assert.notEqual(createReplyWaiters({ setTimer: () => 0, clearTimer: () => {} }).wait(1, null).id, second.id)
 })
+
+test('返事の待ち：answerAll は、待っているものを全部同じ結果で解く（枠を閉じて、もう返事が来ないとき）', async () => {
+  const timers = []
+  const waiters = createReplyWaiters({ setTimer: (fn) => timers.push(fn) - 1, clearTimer: (index) => (timers[index] = null) })
+  const a = waiters.wait(5000, { dirty: true })
+  const b = waiters.wait(5000, { dirty: true })
+  waiters.answerAll({ dirty: true, closed: true })
+  assert.deepEqual(await a.promise, { dirty: true, closed: true })
+  assert.deepEqual(await b.promise, { dirty: true, closed: true })
+  assert.equal(waiters.size, 0)
+  assert.deepEqual(timers, [null, null])
+  // 解いたあとの返事は何もしない
+  assert.equal(waiters.answer(a.id, { dirty: false }), false)
+})

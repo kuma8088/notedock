@@ -1,7 +1,9 @@
 // 「タスクを削除」（段階1-E1）のうち、DOM に頼らない部分。
 // 子孫の集め方、リンクを外す位置、goal・parent のノートの中のリンクの数え方、知らせの文を決める。
-import { analyzeLines, closesFence, lineShape } from './task-line.mjs'
+import { parser as markdownParser } from '@lezer/markdown'
+
 import { isExternal, parseWikiLink, resolveHref, resolveWikiTarget } from './links.mjs'
+import { noteSyntaxExtensions } from './markdown-syntax.mjs'
 import { TASK_FOLDER } from './tasks.mjs'
 
 // パスを比べるときのキー。濁点の持ち方（NFC と NFD）と大文字小文字、.md の有無をそろえる。
@@ -72,169 +74,45 @@ export function unlinkRange(lineText, lineFrom, from, to) {
 const WIKI = /!?\[\[([^\[\]\n]+)\]\]/g
 const MD_LINK = /!?\[[^\]\n]*\]\(([^()\s]+)(?:\s+"[^"]*")?\)/g
 
-// HTML のコメントを、CommonMark（プレビューの読み方）に合わせて見分ける。
-// - 行頭（引用の > と3つまでの字下げのあと。箇条書きの記号のすぐ後ろも）の <!-- は、HTML のかたまり。--> がある行まで
-//   （その行は全部）がコメント。空行をまたいでもよく、閉じなければ文書の終わりまで。ただし、入っている引用や箇条書きの項目が
-//   終わったところで終わる（> の数が減った行、項目の中身より浅く字下げした行）。
-// - 行の途中の <!-- は、閉じる --> が同じ段落の中（空行・見出し・区切り線・箇条書きの次の項目・コードの囲み・行頭の <!-- の前まで）に
-//   あるときだけコメント。なければ、ただの文字。
-// 字下げ4つ以上のコードのかたまりは、ここでは見分けない（前からそのまま）。
-const OPEN = '<!--'
-const CLOSE = '-->'
-
-// 行頭の <!-- で始まる HTML のかたまりか。始まるなら { quote, col }（終わる目安。col は入っている箇条書きの項目の中身の位置）。
-function blockStart(shape, listCol) {
-  if (shape.kind === 'list') {
-    return !shape.checkbox && shape.body.startsWith(OPEN) ? { quote: shape.quote, col: shape.indent + shape.mark.length } : null
-  }
-  if (shape.kind !== 'text' || !shape.rest.startsWith(OPEN)) return null
-  const col = listCol !== null && shape.indent >= listCol ? listCol : 0
-  return shape.indent - col < 4 ? { quote: shape.quote, col } : null
-}
-
-// 前の行の段落の続きか（> や字下げを省いて続けた行）。段落の外なら paraQuote は null。
-function lazyLine(shape, paraQuote) {
-  return shape.kind === 'text' && paraQuote !== null && shape.quote <= paraQuote && !shape.fence && !shape.rest.startsWith(OPEN)
-}
-
-// 行の途中の <!--（k 行目の at から）を閉じる --> が、同じ段落の中にあるか。
-// quote は段落の始まりの行の > の数（> を省いて続けた行でも、段落は引用の中のまま）。
-// memo：次の行から先を調べた答え（閉じない <!-- の多い長い段落でも、同じ行を何度も調べないように）。
-function closesInParagraph({ rows, shapes, memo }, k, at, quote, listCol) {
-  if (rows[k].text.indexOf(CLOSE, at + 2) >= 0) return true
-  if (shapes[k].kind === 'heading') return false
-  const seen = []
-  let found = false
-  for (let j = k + 1; j < rows.length; j++) {
-    const key = j + ':' + quote + ':' + listCol
-    if (memo.has(key)) {
-      found = memo.get(key)
-      break
-    }
-    seen.push(key)
-    const next = shapes[j]
-    if (rows[j].kind === 'front' || next.kind !== 'text' || next.fence || next.quote > quote || blockStart(next, listCol)) break
-    if (rows[j].text.includes(CLOSE)) {
-      found = true
-      break
-    }
-  }
-  for (const key of seen) memo.set(key, found)
-  return found
-}
-
-// リンクを探す行。先頭のプロパティとコードの囲みの中の行は除き、行内コード（`…`）と HTML のコメントの中は空白に置き換えた
-// scan を付ける（長さは変えないので、見つけた位置はそのまま文書の位置に使える）。
+// リンクを探す行。中のリンクがプレビューでリンクにならない部分（HTML のコメント・コードの囲み・字下げのコード・行内コード・
+// 先頭のプロパティ・HTML のかたまり）を空白に置き換えた scan を付ける（長さは変えないので、見つけた位置はそのまま文書の位置に使える）。
+// どこがその部分かは、プレビューと同じ Markdown の読み取り（@lezer/markdown と markdown-syntax.mjs の広げ方）で決める。
 // リンクが外れたかの判定（task-unlinked.mjs）と、外すリンクを探すとき（taskLinksIn）で同じものを使う。
+// 返り値：[{ from, text, scan }]（1行ずつ。from は文書の中の行の頭の位置）。
+const linkParser = markdownParser.configure(noteSyntaxExtensions)
+const HIDDEN = new Set(['Comment', 'CommentBlock', 'CodeBlock', 'FencedCode', 'InlineCode', 'CodeText', 'Frontmatter', 'HTMLBlock'])
+
 export function linkRows(text) {
-  const rows = analyzeLines(text)
-  const shapes = rows.map((row) => lineShape(row.text))
-  const memo = new Map()
-  const out = []
-  let fence = null
-  // 行頭から始まった HTML のかたまりの中か（{ quote, col }）。
-  let block = null
-  // 行の途中で始まったコメントが、次の行へ続いているか（閉じるのは確かめてある）。
-  let inComment = false
-  // 今の箇条書きの項目の中身の位置（なければ null）。
-  let listCol = null
-  // 今の段落の始まりの行の > の数（段落の外なら null）。
-  let paraQuote = null
-  for (let k = 0; k < rows.length; k++) {
-    const row = rows[k]
-    if (row.kind === 'front') continue
-    const line = row.text
-    const shape = shapes[k]
-    // コードの囲みは、HTML のかたまりの中では始まらないので、ここで数え直す（analyzeLines の 'code' は使わない）。
-    if (fence) {
-      if (closesFence(shape.restRaw, fence)) fence = null
-      paraQuote = null
-      continue
-    }
-    if (block && shape.kind !== 'blank' && (shape.quote < block.quote || shape.indent < block.col)) block = null
-    if (block) {
-      if (line.includes(CLOSE)) block = null
-      paraQuote = null
-      out.push({ ...row, kind: shape.kind, scan: ' '.repeat(line.length) })
-      continue
-    }
-    if (shape.kind !== 'blank') {
-      if (shape.kind === 'list') listCol = shape.indent + shape.mark.length
-      // 浅い行でも、段落の続き（> や字下げを省いて続けた行）なら、項目は終わっていない。
-      else if (listCol !== null && shape.indent < listCol && !lazyLine(shape, paraQuote)) listCol = null
-    }
-    if (!inComment) {
-      if (shape.fence) {
-        fence = shape.fence
-        paraQuote = null
-        continue
-      }
-      const start = blockStart(shape, listCol)
-      if (start) {
-        if (line.indexOf(CLOSE, line.indexOf(OPEN) + 2) < 0) block = start
-        paraQuote = null
-        out.push({ ...row, kind: shape.kind, scan: ' '.repeat(line.length) })
-        continue
-      }
-    }
-    if (shape.kind === 'list' || (shape.kind === 'text' && (paraQuote === null || shape.quote > paraQuote))) paraQuote = shape.quote
-    else if (shape.kind !== 'text') paraQuote = null
-    let scan = ''
-    let i = 0
-    while (i < line.length) {
-      if (inComment) {
-        const end = line.indexOf(CLOSE, i)
-        const stop = end < 0 ? line.length : end + CLOSE.length
-        scan += ' '.repeat(stop - i)
-        i = stop
-        if (end >= 0) inComment = false
-        continue
-      }
-      // <!--> と <!---> も、閉じたコメント（CommonMark）。
-      if (line.startsWith(OPEN, i) && closesInParagraph({ rows, shapes, memo }, k, i, paraQuote ?? shape.quote, listCol)) {
-        const end = line.indexOf(CLOSE, i + 2)
-        const stop = end < 0 ? line.length : end + CLOSE.length
-        scan += ' '.repeat(stop - i)
-        i = stop
-        if (end < 0) inComment = true
-        continue
-      }
-      if (line[i] === '`') {
-        let n = 1
-        while (line[i + n] === '`') n++
-        // 同じ数の ` が続くところで閉じる。閉じなければ、ただの文字。
-        let close = -1
-        for (let j = i + n; j < line.length; ) {
-          if (line[j] !== '`') {
-            j++
-            continue
-          }
-          let m = 1
-          while (line[j + m] === '`') m++
-          if (m === n) {
-            close = j
-            break
-          }
-          j += m
+  const source = String(text ?? '')
+  let scan = source
+  // リンクの形（[[ か ](）がなければ、何も見つからないので読み取りを省く（多くのノートはこちら）。
+  if (source.includes('[[') || source.includes('](')) {
+    const parts = []
+    let at = 0
+    linkParser.parse(source).iterate({
+      enter(node) {
+        if (!HIDDEN.has(node.name)) return undefined
+        if (node.to > at) {
+          parts.push(source.slice(at, Math.max(at, node.from)), source.slice(Math.max(at, node.from), node.to).replace(/[^\n]/g, ' '))
+          at = node.to
         }
-        if (close < 0) {
-          scan += line.slice(i, i + n)
-          i += n
-          continue
-        }
-        scan += ' '.repeat(close + n - i)
-        i = close + n
-        continue
-      }
-      scan += line[i]
-      i++
-    }
-    out.push({ ...row, kind: shape.kind, scan })
+        return false
+      },
+    })
+    parts.push(source.slice(at))
+    scan = parts.join('')
   }
-  return out
+  const rows = []
+  for (let from = 0; ; ) {
+    const end = source.indexOf('\n', from)
+    const to = end < 0 ? source.length : end
+    rows.push({ from, text: source.slice(from, to), scan: scan.slice(from, to) })
+    if (end < 0) return rows
+    from = end + 1
+  }
 }
 
-// ノートの本文から、taskPath を指すリンクを全部探す（先頭のプロパティとコード・行内コード・HTML のコメントの中は見ない。画像などの埋め込み ![[…]] も数えない）。
+// ノートの本文から、taskPath を指すリンクを全部探す（先頭のプロパティとコード・行内コード・HTML のコメントと HTML のかたまりの中は見ない。画像などの埋め込み ![[…]] も数えない）。
 // 返り値：[{ from, to, text, lineFrom, lineText }]（from・to は text の中の位置）。
 export function taskLinksIn(text, notePath, taskPath, known) {
   const want = pathKey(taskPath)

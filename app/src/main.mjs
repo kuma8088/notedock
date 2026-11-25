@@ -4033,7 +4033,7 @@ async function receiveFromLeft(data) {
       if (saver && !CLEAN_STATES.has($('status').dataset.state)) saver.keepDraft()
     } finally {
       // 保存が止まっているとき（ぶつかった、見つからないなど）は flush しても書けないので、まだ書きかけがあると返す。
-      toLeft({ type: MSG.SAVED, dirty: Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state) })
+      toLeft({ type: MSG.SAVED, id: data.id, dirty: Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state) })
     }
   }
 }

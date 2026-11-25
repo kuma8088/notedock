@@ -132,9 +132,13 @@ if [ "${NOTEDOCK_DEV_BUILD:-}" = "1" ]; then
 fi
 
 mkdir -p dist
+# node_modules は丸ごとは入れない（200MB を超える）。サーバーが読み込む部品（リンクの数え方に使う Markdown の読み取り、
+# src/markdown-syntax.mjs）だけを入れる。サーバーが読み込む部品を増やしたら、ここにも足す（足りないと、起動したときに止まる）。
+SERVER_MODULES="--include node_modules/@lezer/markdown --include node_modules/@lezer/common --include node_modules/@lezer/highlight"
 for target in $TARGETS; do
   e="$(ext_of "$target")"
-  "$DENO" compile --allow-all --no-check --include public --exclude node_modules \
+  # shellcheck disable=SC2086
+  "$DENO" compile --allow-all --no-check --include public --exclude node_modules $SERVER_MODULES \
     --target "$target" --output "dist/notedock-server-$target$e" server/main.mjs
   "$DENO" compile --allow-all --no-check --exclude node_modules \
     --target "$target" --output "dist/notedock-smoke-$target$e" test/smoke/binary.mjs

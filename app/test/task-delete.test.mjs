@@ -304,3 +304,46 @@ test('一覧の「ゴミ箱へ」：止めるのは、判定に関わるノー�
   assert.match(check([{ pane: 'left', path: MONTH }, { pane: 'right', path: 'Tasks/a.md' }]), /^左の枠の「2026-11」と、右の枠の「a」に、/)
   assert.match(check([{ pane: 'left', path: MONTH }], { split: false }), /^開いている「2026-11」に、/)
 })
+
+// ---- E2 の3回目のレビュー：リンクの数え方を、プレビューと同じ Markdown の読み取り（@lezer/markdown）に合わせる ----
+
+test('リンクの数え方はプレビューの読み取りと同じ：引用・HTML のかたまり・下線の見出し・表・\\<!-- ・箇条書きの中の引用', () => {
+  const count = (text) => taskLinksIn(text, MONTH, 'Tasks/a.md', known).length
+  const refs = (text) => linkRefsIn(text).filter((ref) => ref.wiki === 'Tasks/a').length
+  const cases = [
+    // 1. 引用の中で始まったコメントのかたまりは、> のない空行で終わる（引用が終わる）
+    ['> <!-- x\n\n> [[Tasks/a]]\n', 1],
+    // 2. <div> などの HTML のかたまりの中の行頭の <!-- は、コメントの始まりではない（かたまりは空行で終わる）
+    ['<div>\n<!-- x\n\n[[Tasks/a]]\n', 1],
+    // HTML のかたまりの中のリンクは、プレビューでもリンクにならない（文字のまま）
+    ['<div>\n[[Tasks/a]]\n</div>\n', 0],
+    // 3. = の下線の見出しと、段落を切る <div> の行で段落が終わる（行の途中の <!-- は閉じない）
+    ['a <!-- x\n===\n[[Tasks/a]] -->', 1],
+    ['a <!-- x [[Tasks/a]]\n<div>\n-->', 1],
+    // 4. 表は、セルごとに読む。セルをまたぐ <!-- はコメントにならない
+    ['| <!-- x | [[Tasks/a]] |\n| --- | --- |\n| --> | y |\n', 1],
+    ['| a | b |\n| --- | --- |\n| <!-- x | [[Tasks/a]] |\n| --> | y |\n', 1],
+    // 区切りの行（| --- |）がなければ表ではなく段落。段落の中では、行をまたいで閉じたコメント
+    ['| <!-- x | [[Tasks/a]] |\n| --> | y |', 0],
+    // 5. \\ の付いた <!-- は、ただの文字
+    ['\\<!-- x [[Tasks/a]] -->', 1],
+    // 6. 箇条書きの中の引用で始まったコメントのかたまりは、次の行の引用に続く
+    ['- > <!-- x\n  > [[Tasks/a]]', 0],
+    // 字下げ4つのコードの中は数えない。箇条書きの中の字下げは、コードではない
+    ['    [[Tasks/a]]\n', 0],
+    ['- a\n    [[Tasks/a]]\n', 1],
+  ]
+  for (const [text, want] of cases) {
+    assert.equal(count(text), want, JSON.stringify(text))
+    assert.equal(refs(text), want, JSON.stringify(text))
+  }
+  // 6. 隠れたリンクは外さない（見えるリンクがなければ、外すものは0）
+  assert.deepEqual(planUnlinkInNote('- > <!-- x\n  > [[Tasks/a]]', MONTH, 'Tasks/a.md', known), { count: 0, change: null })
+  // 見えるリンクだけを外す（隠れたほうはそのまま）
+  const text = '- > <!-- x\n  > [[Tasks/a]]\n  > -->\n- 見る [[Tasks/a]]\n'
+  const plan = planUnlinkInNote(text, MONTH, 'Tasks/a.md', known)
+  assert.equal(plan.count, 1)
+  assert.equal(text.slice(0, plan.change.from) + text.slice(plan.change.to), '- > <!-- x\n  > [[Tasks/a]]\n  > -->\n- 見る\n')
+  // scan の長さは行のまま
+  for (const row of linkRows('> <!-- x\n\n> [[Tasks/a]]\n\x60\x60\x60\n[[Tasks/a]]\n\x60\x60\x60\n')) assert.equal(row.scan.length, row.text.length)
+})

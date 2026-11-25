@@ -2,8 +2,8 @@
 // 出すのは、goal や parent があるのに、そのノート（parent があれば親、なければ goal）からのリンクがないものだけ。
 // Tasks/ のどれかのノート（自分は除く）からリンクされていれば、外れていないとする（入れ子ごと移したタスクのため）。
 // goal も parent もないタスク（サイドバーの「新しいタスク」から作ったもの）は出さない。
-// リンクの数え方は task-delete.mjs の taskLinksIn と同じ（先頭のプロパティ・コード・行内コード・HTML のコメントの中と、
-// 埋め込みの ![[…]] は数えない。どちらも linkRows を使う）。
+// リンクの数え方は task-delete.mjs の taskLinksIn と同じ（先頭のプロパティ・コード・行内コード・HTML のコメントと HTML のかたまりの中と、
+// 埋め込みの ![[…]] は数えない。どちらも linkRows を使い、どこがその部分かはプレビューと同じ Markdown の読み取りで決める）。
 import { isExternal, parseWikiLink, resolveHref, resolveWikiTarget } from './links.mjs'
 import { linkRows, pathKey, sourceNoteOf } from './task-delete.mjs'
 

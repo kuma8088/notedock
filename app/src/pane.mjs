@@ -12,8 +12,8 @@ export const MSG = {
   HISTORY: 'pane:history',
   SEARCH: 'pane:search',
   THEME: 'pane:theme',
+  // SAVE は { id }（左から右へ）。SAVED（右から左へ）は { id, dirty }。id は頼みごとと同じ。保存を試したあと、まだ保存できていない書きかけがあれば dirty: true。
   SAVE: 'pane:save',
-  // SAVED は { dirty }。保存を試したあと、まだ保存できていない書きかけがあれば true。
   SAVED: 'pane:saved',
   CLOSE: 'pane:close',
   // タスクのノートを保存した。反対の枠のタスクのパネルも読み直す。
@@ -87,6 +87,10 @@ export function createReplyWaiters({ setTimer = setTimeout, clearTimer = clearTi
       if (!done) return false
       done(result)
       return true
+    },
+    // 待っているものを全部、result で解く（枠を閉じたので、もう返事が来ないとき）。
+    answerAll(result) {
+      for (const done of [...waiting.values()]) done(result)
     },
     get size() {
       return waiting.size
