@@ -51,6 +51,32 @@ export function keyEndsQuiet(event) {
   return true
 }
 
+// ノートを開いたときに、最初のカーソルを置く位置。pos（本文の最初の行の頭）が行頭の記号で始まるなら、その記号のすぐあと。
+// 見出しの「# 」、箇条書きの「- 」、チェックボックスの「- [ ] 」、引用の「> 」、番号の「1. 」など（入れ子の「> - [ ] 」も）。
+// 開いた直後は印（quiet）で記号を隠すので、カーソルは記号のあとに描かれる。実際の位置もそこにそろえ、打った文字が見た目どおりに入るようにする。
+// 記号でないもの（先頭の [[ ]] のリンクや太字の ** など）の前では止まる（リンクの中にカーソルを入れない）。
+// コールアウトの1行目（「> [!note]」）は1行まるごと部品で出すので、次の行（コールアウトの中身）で同じように決める。
+const LINE_MARKS = new Set(['QuoteMark', 'HeaderMark', 'ListMark', 'TaskMarker', 'AlphaMark'])
+export function typingStart(state, pos) {
+  const doc = state.doc
+  const line = doc.lineAt(pos)
+  // 行の途中（frontmatter の終わりの行など）では動かさない。
+  if (pos !== line.from) return pos
+  const tree = ensureSyntaxTree(state, line.to, 200) ?? syntaxTree(state)
+  const callout = findCallouts(state).find((c) => c.from === line.from)
+  if (callout) return line.to < callout.to && line.number < doc.lines ? typingStart(state, line.to + 1) : line.to
+  let at = line.from
+  for (;;) {
+    let next = at
+    while (next < line.to && /[ \t]/.test(doc.sliceString(next, next + 1))) next += 1
+    const node = tree.resolveInner(next, 1)
+    if (!LINE_MARKS.has(node.name) || node.from !== next || node.to > line.to) break
+    at = node.to
+    if (doc.sliceString(at, at + 1) === ' ') at += 1
+  }
+  return at
+}
+
 // 印が付いているか（previewField のない状態では false）。
 export function cursorQuiet(state) {
   return state.field(previewField, false)?.quiet === true

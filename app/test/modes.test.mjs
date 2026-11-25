@@ -6,8 +6,8 @@ import { EditorSelection, EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 
 import { noteMarkdown } from '../src/markdown-ext.mjs'
-import { editableExtensions, pasteOpensNote, pastePlace } from '../src/modes.mjs'
-import { cursorQuiet, hiddenRanges, keyEndsQuiet, noteContext, previewField, quietAfter, setComposing, setCursorQuiet, setMode, togglePropsPanel } from '../src/preview.mjs'
+import { editableExtensions, endQuietAfterClick, pasteOpensNote, pastePlace } from '../src/modes.mjs'
+import { cursorQuiet, hiddenRanges, keyEndsQuiet, noteContext, previewField, quietAfter, setComposing, setCursorQuiet, setMode, togglePropsPanel, typingStart } from '../src/preview.mjs'
 import { WikiLinkWidget } from '../src/widgets.mjs'
 
 // 閲覧の表示をなくした（2026-11-25）。画面に、閲覧へ切り替えるボタンやキーの案内が戻っていないことを確かめる。
@@ -63,14 +63,22 @@ test('貼り付けた先がどこか（入力欄か、本文か）を調べる',
   assert.deepEqual(pastePlace(null), { inField: false, inText: false })
 })
 
-// 開いた直後の印（quiet）。
-function opened(doc, cursor = 0, { editable = true } = {}) {
-  const state = EditorState.create({
+// 開いた直後の印（quiet）。main.mjs の openNote と同じく、本文の最初の行の頭から typingStart で最初のカーソルを決める。
+const FRONT = /^---\n[\s\S]*?\n---(?:\n|$)/
+function opened(doc, { editable = true } = {}) {
+  const front = doc.match(FRONT)
+  let state = EditorState.create({
     doc,
-    selection: EditorSelection.cursor(cursor),
+    selection: EditorSelection.cursor(front ? Math.min(front[0].length, doc.length) : 0),
     extensions: [noteMarkdown(), noteContext.of({ path: 'a/b.md', known: new Set(['b.md']), editable }), previewField, editableExtensions(editable)],
   })
+  state = state.update({ selection: { anchor: typingStart(state, state.selection.main.head) } }).state
   return state.update({ effects: setCursorQuiet.of(true) }).state
+}
+// 開いてすぐ text を打ったときの本文（カーソルの位置に入る）。
+function typeNow(state, text, userEvent = 'input.type') {
+  const at = state.selection.main.head
+  return state.update({ changes: { from: at, insert: text }, selection: { anchor: at + text.length }, userEvent }).state
 }
 const wikiWidgets = (state) => {
   const found = []
@@ -99,12 +107,12 @@ test('印は、選択が変わる変更（クリック・文字の入力・タ�
   const moved = opened(text).update({ selection: { anchor: 1 } }).state
   assert.equal(cursorQuiet(moved), false)
   assert.deepEqual(hiddenRanges(moved), [])
-  // 開いてすぐ文字を打った（カーソルの位置に入り、記号が見える）。
-  const typed = opened(text).update({ changes: { from: 0, insert: 'a' }, selection: { anchor: 1 }, userEvent: 'input.type' }).state
-  assert.equal(typed.doc.toString(), 'a# 見出し\n\n本文')
+  // 開いてすぐ文字を打った（記号のあとのカーソルの位置に入り、記号が見える）。
+  const typed = typeNow(opened(text), 'a')
+  assert.equal(typed.doc.toString(), '# a見出し\n\n本文')
   assert.equal(cursorQuiet(typed), false)
   // 同じ位置への選択でも、選択を変える変更なら外れる。
-  assert.equal(cursorQuiet(opened(text).update({ selection: { anchor: 0 } }).state), false)
+  assert.equal(cursorQuiet(opened(text).update({ selection: { anchor: 2 } }).state), false)
   // 印を外す効果（同じ位置をクリックした、キーを押した）。
   const asked = opened(text).update({ effects: setCursorQuiet.of(false) }).state
   assert.equal(cursorQuiet(asked), false)
@@ -130,10 +138,10 @@ test('印は、選択を変えない変更では外れない（外からの書�
 test('開いてすぐ日本語の変換で打っても、変換が終われば印は外れている', () => {
   let state = opened('# 見出し\n\n本文')
   state = state.update({ effects: setComposing.of(true) }).state
-  state = state.update({ changes: { from: 0, insert: 'あ' }, selection: { anchor: 1 }, userEvent: 'input.type.compose' }).state
+  state = typeNow(state, '亜', 'input.type.compose')
   assert.equal(cursorQuiet(state), false)
   state = state.update({ effects: setComposing.of(false) }).state
-  assert.equal(state.doc.toString(), 'あ# 見出し\n\n本文')
+  assert.equal(state.doc.toString(), '# 亜見出し\n\n本文')
   assert.deepEqual(hiddenRanges(state), [])
 })
 
@@ -147,4 +155,79 @@ test('印を外すキー：ふつうのキーは外し、Cmd・Ctrl・Shift な�
   assert.equal(keyEndsQuiet({ key: 'a', isComposing: true }), false)
   assert.equal(keyEndsQuiet({ key: 'Unidentified', keyCode: 229 }), false)
   assert.equal(keyEndsQuiet(undefined), false)
+})
+
+test('開いたときの最初のカーソルは、本文の最初の行の、隠れた行頭の記号のすぐあと', () => {
+  const head = (doc) => opened(doc).selection.main.head
+  const cases = [
+    ['# 見出し\n本文', 2],
+    ['### 小見出し', 4],
+    ['- 箇条書き', 2],
+    ['* 箇条書き', 2],
+    ['- [ ] やること', 6],
+    ['- [x] 済んだこと', 6],
+    ['> 引用', 2],
+    ['1. 番号', 3],
+    ['12) 番号', 4],
+    ['> - [ ] 引用の中のやること', 8],
+    ['  - 字下げした箇条書き', 4],
+    // 記号でないものの前では止まる。先頭の [[ ]] のリンクの中には入れない。
+    ['[[b]] で始まる行', 0],
+    ['- [[b]] の箇条書き', 2],
+    ['**太字**で始まる行', 0],
+    ['ふつうの段落', 0],
+    ['#タグ で始まる行', 0],
+    ['', 0],
+  ]
+  for (const [doc, pos] of cases) assert.equal(head(doc), pos, JSON.stringify(doc))
+  // frontmatter があれば、その次の本文の行で決める。
+  const fm = '---\ntitle: a\n---\n# 見出し\n本文'
+  assert.equal(head(fm), fm.indexOf('# ') + 2)
+  // 本文の最初の行が空なら、その空の行のまま（記号はない）。
+  const blank = '---\ntitle: a\n---\n\n# 見出し'
+  assert.equal(head(blank), blank.indexOf('\n\n') + 1)
+  // frontmatter だけのノートは、frontmatter の終わりのまま（frontmatter の中に戻さない）。
+  const only = '---\ntitle: a\n---'
+  assert.equal(head(only), only.length)
+  // コールアウトは1行目が部品なので、中身の行の「> 」のあと。
+  const callout = '> [!note]\n> 中身'
+  assert.equal(head(callout), callout.indexOf('中身'))
+  // 行の途中の位置は動かさない。
+  const state = opened('# 見出し')
+  assert.equal(typingStart(state, 1), 1)
+})
+
+test('開いてすぐ打った文字は、隠れた記号のあと（見た目どおりの位置）に入る', () => {
+  const after = (doc, text = 'x') => typeNow(opened(doc), text).doc.toString()
+  assert.equal(after('# 見出し'), '# x見出し')
+  assert.equal(after('- 箇条書き'), '- x箇条書き')
+  assert.equal(after('- [ ] やること'), '- [ ] xやること')
+  assert.equal(after('> 引用'), '> x引用')
+  assert.equal(after('1. 番号'), '1. x番号')
+  assert.equal(after('---\ntitle: a\n---\n# 見出し', '亜'), '---\ntitle: a\n---\n# 亜見出し')
+  assert.equal(after('[[b]] で始まる行'), 'x[[b]] で始まる行')
+  // 開いた直後は、カーソルの行でも記号を隠したまま（先頭の [[b]] はリンクの部品のまま）。
+  assert.deepEqual(hiddenRanges(opened('# 見出し')), ['# '])
+  assert.deepEqual(wikiWidgets(opened('[[b]] で始まる行')), ['[[b]]'])
+})
+
+test('クリックのあとで印を外す処理は、その間に別のノートを開いていたら、新しいノートの印を外さない', () => {
+  // 使い回す view の代わり。dispatch で state を入れ替える。
+  const fakeView = (state) => ({ state, dispatch(spec) { this.state = this.state.update(spec).state } })
+  let round = 1
+  const pending = []
+  const later = (fn) => pending.push(fn)
+  // 同じノートのまま：外れる。
+  const same = fakeView(opened('# 見出し'))
+  endQuietAfterClick(same, () => round, later)
+  pending.shift()()
+  assert.equal(cursorQuiet(same.state), false)
+  // 外す前に別のノートを開いた（setState で中身が入れ替わり、開いた回が変わった）：新しいノートの印は残る。
+  const reused = fakeView(opened('# A'))
+  endQuietAfterClick(reused, () => round, later)
+  reused.state = opened('# B')
+  round += 1
+  pending.shift()()
+  assert.equal(cursorQuiet(reused.state), true)
+  assert.deepEqual(hiddenRanges(reused.state), ['# '])
 })

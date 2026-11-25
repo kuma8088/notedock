@@ -36,8 +36,8 @@ import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { editableExtensions, pasteOpensNote, pastePlace } from './modes.mjs'
-import { cursorQuiet, keyEndsQuiet, noteContext, noteMode, previewField, setComposing, setCursorQuiet, setMode, setNoteBusy, togglePropsPanel } from './preview.mjs'
+import { editableExtensions, endQuietAfterClick, pasteOpensNote, pastePlace } from './modes.mjs'
+import { cursorQuiet, keyEndsQuiet, noteContext, noteMode, previewField, setComposing, setCursorQuiet, setMode, setNoteBusy, togglePropsPanel, typingStart } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
 import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
@@ -352,6 +352,8 @@ let known = null
 let currentPath = null
 // ノートは編集の表示（live）で開く。上の「ソース」で Markdown の文字のままの表示（source）に切り替えられる。
 let mode = 'live'
+// ノートを開いた回の番号（openNote で中身を入れ替えるたびに1つ増やす）。
+let openRound = 0
 let rootPaths = []
 let platform = 'darwin'
 let vaultLabel = ''
@@ -794,10 +796,8 @@ const quietEnders = EditorView.domEventObservers({
     if (event.button !== 0 || !cursorQuiet(target.state)) return
     // チェックボックスや箇条書きの記号、ノートの情報の欄などの部品を押したときは、その操作のためなので外さない。
     if (event.target?.closest?.('[contenteditable="false"]')) return
-    // エディターがクリックの位置を決めてから外す。先に外すと、先頭の行の見た目が変わって、押した位置がずれる。
-    setTimeout(() => {
-      if (cursorQuiet(target.state)) target.dispatch({ effects: setCursorQuiet.of(false) })
-    }, 0)
+    // エディターがクリックの位置を決めてから外す。その間に別のノートを開いていたら外さない（modes.mjs）。
+    endQuietAfterClick(target, () => openRound)
   },
   keydown(event, target) {
     if (cursorQuiet(target.state) && keyEndsQuiet(event)) target.dispatch({ effects: setCursorQuiet.of(false) })
@@ -2061,11 +2061,16 @@ async function openNote(path, { push = true, anchor = '', startMode = 'live' } =
   mode = nextMode
   // YAMLの中にカーソルを置くと文字で見えてしまうので、本文の先頭から始める。
   const front = note.text.match(/^---\n[\s\S]*?\n---(?:\n|$)/)
-  const state = EditorState.create({
+  let state = EditorState.create({
     doc: note.text,
     selection: { anchor: front ? Math.min(front[0].length, note.text.length) : 0 },
     extensions: extensionsFor(path, editable),
   })
+  // 本文の最初の行が見出しの # や箇条書きの - などで始まるなら、その記号のあとから始める（開いた直後は記号を隠すので、見た目の位置にそろえる）。
+  const start = typingStart(state, state.selection.main.head)
+  if (start !== state.selection.main.head) state = state.update({ selection: { anchor: start }, annotations: Transaction.addToHistory.of(false) }).state
+  // 開いた回を数える。クリックのあとで印を外す処理が、次に開いたノートの印を外さないように使う。
+  openRound += 1
   if (view) view.setState(state)
   else view = new EditorView({ state, parent: $('editor') })
   // 開いた直後は、カーソルが先頭にあっても記号を出さない（本人がクリックするかキーを押すまで）。
@@ -3736,7 +3741,11 @@ function bindChrome() {
     $('history').close()
   })
   for (const button of $('modes').querySelectorAll('button')) {
-    button.addEventListener('click', () => applyMode(button.dataset.mode))
+    // 切り替えたあとは、本文にフォーカスを戻す。ボタンに残ると、そのあとの Cmd+V が、貼り付けでなくノートを開く操作になる。
+    button.addEventListener('click', () => {
+      applyMode(button.dataset.mode)
+      if (currentPath) view?.focus()
+    })
   }
   // 書式の付いたリンクは、マウスを押した時点で開く。離す前にカーソルが入ると表示が変わるため。
   $('editor').addEventListener(
