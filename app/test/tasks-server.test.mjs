@@ -540,7 +540,7 @@ test('unlinked：goal のノートを一時的に読めなかったことは覚�
 
 // ---- 段階1-D：入れ子ごと作ったサブタスクの子孫の数え方（T13） ----
 
-test('T13：親 P の行から入れ子ごと作った子 C と、C の行から作った孫 G。P を消すときの子孫は C と G。parent の輪でも止まる', async () => {
+test('T13：親 P の行から入れ子ごと作った子 C と、C の行から作った孫 G。P を消すときの子孫は C と G。parent の輪（3つ・2つ）でも止まる', async () => {
   const P = 'Tasks/2026-11-01-段取りを組む.md'
   const pText = task({ title: '"段取りを組む"', type: 'task', status: '未着手', due: '2026-11-30', goal: '"[[90_Periodic/2026/Monthly/2026-11]]"' }, '- 準備する\n\t- 下書き\n\t\t- 構図\n')
   await withApp((dir) => put(dir, P, pText), async ({ dir, url, post }) => {
@@ -575,5 +575,15 @@ test('T13：親 P の行から入れ子ごと作った子 C と、C の行から
     assert.equal(after.find((t) => t.path === P).parentPath, g.path)
     assert.deepEqual(paths(collectDescendants(after, P)), [c.path, g.path])
     assert.deepEqual(paths(collectDescendants(after, g.path)), [P, c.path])
+    // P.parent = C（2つのノートが互いを親にする輪）。どちらから数えても止まる
+    fs.writeFileSync(path.join(dir, P), pText.replace('status: 未着手', 'status: 未着手\nparent: "[[' + c.path.replace(/\.md$/, '') + ']]"'))
+    let mutual = await list()
+    for (let i = 0; i < 20 && mutual.find((t) => t.path === P)?.parentPath !== c.path; i++) {
+      await new Promise((r) => setTimeout(r, 100))
+      mutual = await list()
+    }
+    assert.equal(mutual.find((t) => t.path === P).parentPath, c.path)
+    assert.deepEqual(paths(collectDescendants(mutual, P)).sort(), [c.path, g.path].sort())
+    assert.deepEqual(paths(collectDescendants(mutual, c.path)).sort(), [P, g.path].sort())
   })
 })
