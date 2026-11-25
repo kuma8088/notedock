@@ -2,12 +2,13 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { test } from 'node:test'
 
-import { EditorSelection, EditorState, Transaction } from '@codemirror/state'
+import { ChangeSet, EditorSelection, EditorState, Transaction } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { deleteMarkupBackward } from '@codemirror/lang-markdown'
+import { history, undo } from '@codemirror/commands'
 
 import { noteMarkdown } from '../src/markdown-ext.mjs'
-import { breaksFrontmatter, editableExtensions, endQuietAfterClick, focusEndsQuiet, frontmatterEnd, frontmatterGuard, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, propsBlankAt, refocusesBody } from '../src/modes.mjs'
+import { breaksFrontmatter, editableExtensions, endQuietAfterClick, focusEndsQuiet, frontmatterDamage, frontmatterEnd, frontmatterGuard, frontmatterRepair, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, propsBlankAt, refocusesBody } from '../src/modes.mjs'
 import { cursorQuiet, hiddenRanges, keyEndsQuiet, noteContext, previewField, quietAfter, setComposing, setCursorQuiet, setMode, togglePropsPanel, typingStart } from '../src/preview.mjs'
 import { WikiLinkWidget } from '../src/widgets.mjs'
 
@@ -320,11 +321,19 @@ test('部品を押して本文に入ったときのカーソルの位置は、�
   assert.equal(partCursor(opened(front + '# 見出し\n本文'), { pos: 0, kind: 'props' }), front.length + 2)
   assert.equal(partCursor(opened(front + 'T\n'), { pos: 0, kind: 'props' }), front.length)
   assert.equal(partCursor(opened(front), { pos: 0, kind: 'props' }), front.length)
-  // 欄のあとに行がない（閉じの --- で終わる）ノートでは動かさない。
-  assert.equal(partCursor(opened('---\ntitle: a\n---'), { pos: 0, kind: 'props' }), null)
-  // 最後の表：ノートの終わりより後ろには置かない。
+  // 欄のあとに行がない（閉じの --- で終わる）ノートでは、閉じの --- のすぐあと（そこで打つと、改行を1つ足して次の行に入る）。
+  assert.equal(partCursor(opened('---\ntitle: a\n---'), { pos: 0, kind: 'props' }), '---\ntitle: a\n---'.length)
+  // 欄のないノートでは動かさない。
+  assert.equal(partCursor(opened('本文'), { pos: 0, kind: 'props' }), null)
+  // 最後の表で後ろに改行がない：表のすぐ後ろ（ノートの終わり）は表の中になるので、表の前の空の行に置く。
   const last = opened('本文\n\n| a |\n|---|')
-  assert.equal(partCursor(last.state ?? last, { pos: 4, kind: 'table', length: 11 }), last.doc.length)
+  assert.equal(partCursor(last, { pos: 4, kind: 'table', length: 11 }), 3)
+  // 最後の表の後ろに改行があれば、その次の行の頭（表の外）。
+  assert.equal(partCursor(opened('本文\n\n| a |\n|---|\n'), { pos: 4, kind: 'table', length: 11 }), 16)
+  // 表のすぐ前が空の行でない（見出し・欄の閉じの --- のすぐ下）、表がノートの先頭：表の外に置ける所がないので動かさない。
+  assert.equal(partCursor(opened('# T\n| a |\n|---|'), { pos: 4, kind: 'table', length: 11 }), null)
+  assert.equal(partCursor(opened('---\na: 1\n---\n| a |\n|---|'), { pos: 13, kind: 'table', length: 11 }), null)
+  assert.equal(partCursor(opened('| a |\n|---|'), { pos: 0, kind: 'table', length: 11 }), null)
 })
 
 test('部品を押したあと：本文にフォーカスが入ったらカーソルを部品の所へ動かして印を外し、入らなかったら印を残す', () => {
@@ -487,10 +496,17 @@ test('欄を壊す変更を止めるのは編集の表示だけ。ソースの�
   assert.equal(state.update({ changes: { from: 0, to: TASK.length, insert: 'x' }, userEvent: 'input.type' }).state.doc.toString(), 'x')
   const next = TASK.slice(0, end).replace('未着手', '進行中')
   assert.equal(state.update({ changes: { from: 0, to: end, insert: next } }).state.doc.toString(), TASK.replace('未着手', '進行中'))
-  // 欄だけ・欄と本文の先頭を選んで打ち換える・消す（Shift+上の矢印で本文の先頭から選んだときなど）は止める。
-  assert.equal(state.update({ changes: { from: 0, to: end + 1, insert: 'x' }, userEvent: 'input.type' }).state.doc.toString(), TASK)
-  assert.equal(del(state, 0, end + 1), TASK)
-  assert.equal(del(state, 0, end), TASK)
+  // 欄をまるごと含む範囲（ノートの先頭から閉じの --- まで、またはその先まで）を選んで打ち換える・消すのは、欄ごと消す意図とみなして止めない。
+  assert.equal(state.update({ changes: { from: 0, to: end + 1, insert: 'x' }, userEvent: 'input.type' }).state.doc.toString(), 'xT\n')
+  assert.equal(del(state, 0, end + 1), 'T\n')
+  assert.equal(del(state, 0, end), '\nT\n')
+  // 別のノートの欄と本文を貼り付けて置き換える（正しい欄で始まる）のもよい。
+  assert.equal(state.update({ changes: { from: 0, to: end + 1, insert: '---\nb: 2\n---\nU' }, userEvent: 'input.paste' }).state.doc.toString(), '---\nb: 2\n---\nUT\n')
+  // 置き換えた結果、閉じの --- が本文の行とつながる（「---T」）ものは止める。欄の一部だけを選んだものも止める。
+  assert.equal(state.update({ changes: { from: 0, to: end + 1, insert: '---\nb: 2\n---' }, userEvent: 'input.paste' }).state.doc.toString(), TASK)
+  assert.equal(state.update({ changes: { from: 0, to: end + 1, insert: '---\nb: 2' }, userEvent: 'input.paste' }).state.doc.toString(), TASK)
+  assert.equal(del(state, 4, end + 1), TASK)
+  assert.equal(del(state, 0, end - 1), TASK)
   // 項目を足した欄に置き換える（Cmd+; と同じ変更）。
   const added = TASK.slice(0, end).replace('due:', 'due:\nmemo:')
   assert.equal(state.update({ changes: { from: 0, to: end, insert: added } }).state.doc.toString(), TASK.replace('due:', 'due:\nmemo:'))
@@ -514,4 +530,121 @@ test('エディターに欄を守る決まりを入れ、欄の何もない所�
   const down = main.slice(main.indexOf("document.addEventListener(\n  'mousedown',"), main.indexOf('let pressingEditor'))
   assert.match(down, /if \(event\.button !== 0 \|\| !view \|\| !view\.contentDOM\.contains\(event\.target\)\) return/)
   assert.ok(down.indexOf("partKind(part) === 'props' && propsBlankAt(event.target)") < down.indexOf('if (!cursorQuiet(target.state)) return'))
+})
+
+test('欄だけのノート：閉じの --- のすぐあとで打った文字は、改行を1つ足して次の行に入る（開いただけではファイルを変えない）', () => {
+  const only = '---\na: 1\n---'
+  const state = guarded(only, only.length)
+  for (const userEvent of ['input.type', 'input.paste', 'input.drop', undefined]) {
+    const tr = state.update({ changes: { from: only.length, insert: 'abc' }, selection: { anchor: only.length + 3 }, userEvent })
+    assert.equal(tr.state.doc.toString(), only + '\nabc', String(userEvent))
+    assert.equal(tr.state.selection.main.head, only.length + 4)
+  }
+  // Enter（改行）はそのまま。閉じの --- の行の後ろの空白があっても同じ。
+  assert.equal(ins(state, only.length, '\n', 'input'), only + '\n')
+  const spaced = '---\na: 1\n---  '
+  assert.equal(ins(guarded(spaced, spaced.length), spaced.length, 'x'), spaced + '\nx')
+  // 本文の行があるノートで閉じの --- のすぐあとに打つのは、今までどおり止める。
+  const end = TASK.indexOf('---\nT') + 3
+  assert.equal(ins(guarded(TASK, end), end, 'x'), TASK)
+})
+
+// 日本語の変換中の変更を止めると、エディターの「変換中」の状態が戻らず、自動保存が止まり続けた（再レビューの指摘）。
+// 変換中は止めずに覚えておき、変換が終わったとき（setComposing(false) と同じ変更）に、欄を壊していたら取り消す。
+function composeEditor(doc, anchor) {
+  return EditorState.create({ doc, selection: { anchor }, extensions: [noteMarkdown(), noteContext.of({ path: 'a.md', known: new Set() }), previewField, frontmatterGuard, history()] })
+}
+// エディターの変換（compositionstart で setComposing(true)、DOM の変更は input.type.compose、終わりに frontmatterRepair と setComposing(false)）と同じ順の変更。
+function compose(state, steps) {
+  state = state.update({ effects: setComposing.of(true) }).state
+  for (const spec of steps) state = state.update({ ...spec, userEvent: spec.userEvent ?? 'input.type.compose' }).state
+  return state.update({ ...(frontmatterRepair(state) ?? {}), effects: setComposing.of(false) }).state
+}
+test('日本語の変換：変換中の変更は止めず、終わったときに欄を壊していたら取り消す', () => {
+  const end = TASK.indexOf('---\nT') + 3
+  // 閉じの --- の行末で変換して確定：変換中は止めない（エディターの中身と画面が食い違わない）。
+  let state = composeEditor(TASK, end).update({ effects: setComposing.of(true) }).state
+  const mid = state.update({ changes: { from: end, insert: 'あ' }, selection: { anchor: end + 1 }, userEvent: 'input.type.compose' })
+  assert.equal(mid.state.doc.toString(), TASK.replace('---\nT', '---あ\nT'))
+  // previewField の変換中の印だけでも止めない（エディターが userEvent を付けない変更）。
+  assert.equal(breaksFrontmatter(state.update({ changes: { from: end, insert: 'あ' } })), false)
+  // 終わったとき：取り消して、カーソルは本文の最初の行（開いたときと同じ位置）。
+  state = compose(composeEditor(TASK, end), [
+    { changes: { from: end, insert: 'a' }, selection: { anchor: end + 1 } },
+    { changes: { from: end, to: end + 1, insert: 'あ' }, selection: { anchor: end + 1 } },
+  ])
+  assert.equal(state.doc.toString(), TASK)
+  assert.equal(state.selection.main.head, end + 1)
+  assert.equal(state.field(previewField).composing, false)
+  // Cmd+Z で壊れた文字が戻らない。
+  let undone = state
+  undo({ state, dispatch: (tr) => (undone = tr.state) })
+  assert.equal(undone.doc.toString().includes('---あ'), false)
+  // 開きの --- の前で変換しても同じ。
+  assert.equal(compose(composeEditor(TASK, 0), [{ changes: { from: 0, insert: 'い' }, selection: { anchor: 1 } }]).doc.toString(), TASK)
+  // 欄の中の項目の値や本文で変換したものは、そのまま残す。
+  const at = TASK.indexOf('未着手')
+  assert.equal(compose(composeEditor(TASK, at), [{ changes: { from: at, insert: 'う' } }]).doc.toString(), TASK.replace('未着手', 'う未着手'))
+  assert.equal(compose(composeEditor(TASK, end + 2), [{ changes: { from: end + 2, insert: 'え' } }]).doc.toString(), TASK.replace('\nT\n', '\nTえ\n'))
+  // 変換を取りやめた（文字が残らなかった）ときは何もしない。
+  assert.equal(compose(composeEditor(TASK, end), [{ changes: { from: end, insert: 'a' } }, { changes: { from: end, to: end + 1 } }]).doc.toString(), TASK)
+  // 欄のないノートでは何も覚えない。
+  assert.equal(frontmatterRepair(composeEditor('# a', 3).update({ effects: setComposing.of(true) }).state.update({ changes: { from: 3, insert: 'x' }, userEvent: 'input.type.compose' }).state), null)
+})
+
+test('日本語の変換：欄だけのノートで閉じの --- のすぐあとに確定した文字は、改行を1つ足して次の行に入れる', () => {
+  const only = '---\na: 1\n---'
+  const state = compose(composeEditor(only, only.length), [{ changes: { from: only.length, insert: 'あ' }, selection: { anchor: only.length + 1 } }])
+  assert.equal(state.doc.toString(), only + '\nあ')
+  assert.equal(state.selection.main.head, only.length + 2)
+  // 続けて打った文字もそのまま入る（止まったままにならない）。
+  assert.equal(state.update({ changes: { from: state.doc.length, insert: 'Z' }, userEvent: 'input.type' }).state.doc.toString(), only + '\nあZ')
+})
+
+test('日本語の変換の記録は、変換と関係のない変更が入ったら忘れる（あとで別の変更を取り消さない）', () => {
+  const end = TASK.indexOf('---\nT') + 3
+  let state = composeEditor(TASK, end).update({ effects: setComposing.of(true) }).state
+  state = state.update({ changes: { from: end, insert: 'あ' }, userEvent: 'input.type.compose' }).state
+  state = state.update({ effects: setComposing.of(false) }).state
+  // 変換が終わったあとの、ふつうの変更。
+  state = state.update({ changes: { from: state.doc.length, insert: 'Z' }, annotations: Transaction.addToHistory.of(false) }).state
+  assert.equal(frontmatterRepair(state), null)
+})
+
+test('frontmatterDamage：止める決まりと、変換のあとの取り消しで同じ見分け方', () => {
+  const doc = (text) => EditorState.create({ doc: text }).doc
+  const check = (text, spec) => {
+    const changes = ChangeSet.of(spec, text.length)
+    return frontmatterDamage(doc(text), changes, changes.apply(doc(text)))
+  }
+  const end = TASK.indexOf('---\nT') + 3
+  assert.equal(check(TASK, { from: end, insert: 'x' }), true)
+  assert.equal(check(TASK, { from: end, to: end + 1 }), true)
+  assert.equal(check(TASK, { from: end + 1, insert: 'x' }), false)
+  assert.equal(check(TASK, { from: 0, to: TASK.length }), false)
+  assert.equal(check(TASK, { from: 0, to: end, insert: '' }), false)
+  assert.equal(check(TASK, { from: 0, to: end + 1, insert: '---\nb: 2\n---' }), true)
+  assert.equal(check('# a', { from: 0, insert: 'x' }), false)
+})
+
+test('Cmd+; の項目の追加とノートを開いたときのカーソルは、欄を守る決まりと同じ見分け方（閉じの --- の行の後ろの空白も許す）', () => {
+  const main = fs.readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8')
+  const add = main.slice(main.indexOf('function applyNewProperty'), main.indexOf('function saveNow'))
+  assert.match(add, /frontmatterEnd\(target\.state\.doc\)/)
+  assert.equal(/\^---\\n/.test(main), false)
+  // 変換が終わったとき（と変換中にフォーカスが外れたとき）に、欄を壊した変換を取り消す。
+  assert.equal(main.match(/frontmatterRepair\(target\.state\) \?\? \{\}\), effects: setComposing\.of\(false\)/g)?.length, 2)
+})
+
+test('部品を押したあと：表の外に置ける所がないときは、カーソルを表の終わりへ動かして印を残す（マスの編集を続けられる）', () => {
+  const doc = '| a |\n|---|'
+  const view = { state: opened(doc), dispatch(spec) { this.state = this.state.update(spec).state } }
+  view.dispatch({ effects: setCursorQuiet.of(true) })
+  const pending = []
+  endQuietAfterClick(view, () => 1, (fn) => pending.push(fn), { focus: () => 'inside', cursor: () => ({ anchor: doc.length, quiet: true }) })
+  pending.forEach((fn) => fn())
+  assert.equal(view.state.selection.main.head, doc.length)
+  assert.equal(cursorQuiet(view.state), true)
+  const main = fs.readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8')
+  assert.match(main, /if \(at === null && kind === 'table' && head >= pos && head <= pos \+ length\) return \{ anchor: pos \+ length, quiet: true \}/)
 })

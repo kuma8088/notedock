@@ -36,7 +36,7 @@ import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { editableExtensions, endQuietAfterClick, focusEndsQuiet, frontmatterGuard, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, propsBlankAt, refocusesBody } from './modes.mjs'
+import { editableExtensions, endQuietAfterClick, focusEndsQuiet, frontmatterEnd, frontmatterGuard, frontmatterRepair, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, propsBlankAt, refocusesBody } from './modes.mjs'
 import { cursorQuiet, keyEndsQuiet, noteContext, noteMode, previewField, setComposing, setCursorQuiet, setMode, setNoteBusy, togglePropsPanel, typingStart } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
@@ -670,10 +670,10 @@ function addProperty(target) {
 
 function applyNewProperty(target, name) {
   if (!name?.trim()) return
-  const doc = target.state.doc.toString()
-  const front = doc.match(/^---\n[\s\S]*?\n---(?=\n|$)/)
-  if (front) {
-    target.dispatch({ changes: { from: 0, to: front[0].length, insert: setProperty(front[0], name.trim(), '') } })
+  // 欄の見分け方は、欄を守る決まりと同じ（modes.mjs の frontmatterEnd。--- の行の後ろの空白も許す）。
+  const end = frontmatterEnd(target.state.doc)
+  if (end !== null) {
+    target.dispatch({ changes: { from: 0, to: end, insert: setProperty(target.state.sliceDoc(0, end), name.trim(), '') } })
   } else {
     target.dispatch({ changes: { from: 0, insert: `---\n${name.trim()}:\n---\n` } })
   }
@@ -758,14 +758,15 @@ const editorEvents = EditorView.domEventHandlers({
     setTimeout(() => {
       // 確定と同時に次の変換が始まっていたら、その変換が終わるまで待つ。
       if (target.compositionStarted) return
-      target.dispatch({ effects: setComposing.of(false) })
+      // 変換で入った文字がノートの情報の欄を壊していたら、同じ変更で取り消す（modes.mjs の frontmatterRepair）。
+      target.dispatch({ ...(frontmatterRepair(target.state) ?? {}), effects: setComposing.of(false) })
       saver?.compositionEnded()
       syncToolbar()
     }, 0)
     return false
   },
   blur(_, target) {
-    if (target.state.field(previewField).composing) target.dispatch({ effects: setComposing.of(false) })
+    if (target.state.field(previewField).composing) target.dispatch({ ...(frontmatterRepair(target.state) ?? {}), effects: setComposing.of(false) })
     return false
   },
   // 箇条書きの記号（•）や番号を押すと、その項目の子を開閉する。たためない項目では何もせず、今までどおりカーソルを置く。
@@ -847,7 +848,14 @@ document.addEventListener(
         // 本文の中の入力の場所（表のマス、ノートの情報の欄の入力など）に入ったときは、表のときだけ表のすぐ後ろへ動かす（表には触れないので、マスの編集は続く）。
         if (focus !== 'body' && kind !== 'table') return null
         const box = kind === 'table' ? part.closest('.cm-table-wrap') : part
-        return partCursor(state, { pos: target.posAtDOM(box), kind, length: box.noteSource?.length ?? 0 })
+        const pos = target.posAtDOM(box)
+        const length = box.noteSource?.length ?? 0
+        const at = partCursor(state, { pos, kind, length })
+        // 表の外にカーソルを置ける所がなく、今のカーソルが表に触れているときは、印を残す（外すと表が文字に戻って、マスの編集が終わる）。
+        // カーソルは表の終わり（最後の行の後ろ）へ動かす。表の頭のままだと、マスを出たあとに打った文字で見出しの行が壊れるため。
+        const head = state.selection.main.head
+        if (at === null && kind === 'table' && head >= pos && head <= pos + length) return { anchor: pos + length, quiet: true }
+        return at
       },
     })
   },
@@ -2127,13 +2135,10 @@ async function openNote(path, { push = true, anchor = '', startMode = 'live', fo
   editable = note.editable
   const nextMode = sourceOnly ? 'source' : noteMode(startMode)
   mode = nextMode
-  // YAMLの中にカーソルを置くと文字で見えてしまうので、本文の先頭から始める。
-  const front = note.text.match(/^---\n[\s\S]*?\n---(?:\n|$)/)
-  let state = EditorState.create({
-    doc: note.text,
-    selection: { anchor: front ? Math.min(front[0].length, note.text.length) : 0 },
-    extensions: extensionsFor(path, editable),
-  })
+  // YAMLの中にカーソルを置くと文字で見えてしまうので、本文の先頭から始める。本文の行がないときは閉じの --- のすぐあと（modes.mjs の partCursor と同じ）。
+  let state = EditorState.create({ doc: note.text, extensions: extensionsFor(path, editable) })
+  const front = frontmatterEnd(state.doc)
+  if (front !== null) state = state.update({ selection: { anchor: Math.min(front + 1, state.doc.length) }, annotations: Transaction.addToHistory.of(false) }).state
   // 本文の最初の行が見出しの # や箇条書きの - などで始まるなら、その記号のあとから始める（開いた直後は記号を隠すので、見た目の位置にそろえる）。
   const start = typingStart(state, state.selection.main.head)
   if (start !== state.selection.main.head) state = state.update({ selection: { anchor: start }, annotations: Transaction.addToHistory.of(false) }).state
