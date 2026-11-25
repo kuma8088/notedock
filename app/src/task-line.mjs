@@ -62,8 +62,9 @@ export function analyzeLines(text) {
   const raw = String(text ?? '').split('\n')
   const out = []
   let offset = 0
-  // 先頭のプロパティの囲み（--- と ...）は、行末の CR を外して比べる。
-  const bareOf = (line) => line.replace(/\r$/, '')
+  // 先頭のプロパティの囲み（--- と ...）は、行末の空白（CR を含む）を外して比べる。エディターの frontmatterEnd と同じく、「--- 」も囲みにする。
+  // '...' を閉じにすることと、閉じがなければ最後まで全部プロパティにすることは、エディターと違うが、段階1-C の動きのまま残す。
+  const bareOf = (line) => line.trimEnd()
   let front = bareOf(raw[0]) === '---' ? 'open' : 'none'
   let fence = null
   for (let i = 0; i < raw.length; i++) {
@@ -215,13 +216,85 @@ export function ancestorsOf(rows, index) {
   return out
 }
 
+// ---- 入れ子の行（子の行） ----
+
+// 引用の > を除くと空白だけの行か（kind は問わない。コードの囲みの中の空の行は 'code' になるため）。
+const isBlankRow = (row) => LINE.exec(row.text)[3].trim() === ''
+
+// rows[index] の子の行の範囲。字下げで決める（lezer の ListItem は使わない。字下げのない「怠惰な続きの行」まで
+// 項目の一部になってしまうため）。index の次の行から順に見て、
+//   空白だけの行（引用の > だけの行も）は、とりあえず飛ばす（あとに深い行が来れば範囲に入る）、
+//   先頭のプロパティの行・引用の深さが違う行・字下げが rows[index] 以下の行で止まる、
+//   それ以外（字下げが深い行）は種類を問わず子。
+// 返り値: { first, last }（rows の番号。末尾の空白だけの行は含めない）。子がなければ null。
+export function childRange(rows, index) {
+  const self = rows?.[index]
+  if (!self) return null
+  let last = -1
+  for (let i = index + 1; i < rows.length; i++) {
+    const row = rows[i]
+    if (isBlankRow(row)) continue
+    if (row.kind === 'front' || row.quote !== self.quote || row.indent <= self.indent) break
+    last = i
+  }
+  return last < 0 ? null : { first: index + 1, last }
+}
+
+// 字下げ indent（文字）から、幅 width の列ぶんを外した残り。
+// タブが境目をまたぐときや、外したあとにタブの止まる位置がずれるときは、残りの幅を空白で書く（見た目の字下げの幅を保つ）。
+function stripIndent(indent, width) {
+  const want = widthOf(indent) - width
+  let col = 0
+  let i = 0
+  while (i < indent.length && col < width) {
+    col = indent[i] === '\t' ? col + TAB - (col % TAB) : col + 1
+    i++
+  }
+  const rest = indent.slice(i)
+  return col === width && widthOf(rest) === want ? rest : ' '.repeat(want)
+}
+
+// 子の行を、タスクのノートの本文に置く形にする。行の配列を返す。
+//   行頭の引用の >（quote の数。> の後ろの空白かタブ1つも > の一部）を外し、
+//   空でない行のうちいちばん浅い字下げの幅（列）を、どの行からも外す（1段ではなく、いちばん浅い行が字下げなしになるまで）。
+//   空白だけの行（引用の > だけの行も）は空にする。
+export function dedentChildren(lines, quote = 0) {
+  const marks = new RegExp('^(?:[\\t ]*>[\\t ]?){0,' + Math.max(0, Number(quote) || 0) + '}')
+  const parts = lines.map((line) => {
+    const [, indent, rest] = /^([\t ]*)([\s\S]*)$/.exec(line.replace(marks, ''))
+    return { indent, rest, blank: LINE.exec(line)[3].trim() === '' }
+  })
+  const widths = parts.filter((part) => !part.blank).map((part) => widthOf(part.indent))
+  const width = widths.length ? Math.min(...widths) : 0
+  return parts.map((part) => (part.blank ? '' : stripIndent(part.indent, width) + part.rest))
+}
+
+// text の rows[index] の子の行。子がなければ null。
+//   from: rows[index] の行の終わり、to: 最後の子の行の終わり。text: text.slice(from, to)（先頭の改行を含む。元のノートから消す文字）。
+//   lines: 本文に置く形（dedentChildren）。count: 空でない子の行の数。
+export function childrenOf(text, index, rows = analyzeLines(text)) {
+  const range = childRange(rows, index)
+  if (!range) return null
+  const kids = rows.slice(range.first, range.last + 1)
+  const from = rows[index].to
+  const to = rows[range.last].to
+  return {
+    from,
+    to,
+    text: String(text).slice(from, to),
+    lines: dedentChildren(kids.map((row) => row.text), rows[index].quote),
+    count: kids.filter((row) => !isBlankRow(row)).length,
+  }
+}
+
 // ---- まとめ ----
 
 // 行（1 から数える）からタスクを作れるか。作れれば中身、作れなければ reason を返す。
 // reason: 'no-source'（週・月・四半期・タスクのノートでない）・'no-line'・'front'・'code'・'heading'・'not-list'・
 //         'empty'・'week-link'・'struck'・'has-task-link'・'callout'
-// 作れるとき: { ok: true, line, from, to, lineText, title, due, goal, parent, source }
+// 作れるとき: { ok: true, line, from, to, lineText, title, due, goal, parent, source, children }
 //   from・to は行の位置（text の中の文字の位置。改行は含まない）。画面は、書き換える前に lineText と同じか確かめる。
+//   children: その行の子の行（childrenOf の結果）。子がなければ null。
 export function taskFromLine({ path, text, line, periodicRoot, known }) {
   const source = taskSourceOf({ path, text, periodicRoot })
   if (!source) return { ok: false, reason: 'no-source' }
@@ -248,7 +321,7 @@ export function taskFromLine({ path, text, line, periodicRoot, known }) {
     due = source.due
     parent = source.parent
   }
-  return { ok: true, line: row.index + 1, from: row.from, to: row.to, lineText: row.text, title: goalTextOf(row.text), due, goal, parent, source: source.kind }
+  return { ok: true, line: row.index + 1, from: row.from, to: row.to, lineText: row.text, title: goalTextOf(row.text), due, goal, parent, source: source.kind, children: childrenOf(text, row.index, rows) }
 }
 
 // ---- ファイル名 ----

@@ -19,10 +19,28 @@ export function isTaskItems(items) {
   return typeof type?.value === 'string' && type.value.trim() === TASK_TYPE
 }
 
+// 先頭のプロパティの部分（開きの --- の行から閉じの --- の行の終わりまで）の文字。なければ null。
+// 見分け方はエディター（modes.mjs の frontmatterEnd、markdown-syntax.mjs の Frontmatter）と同じ：
+// 1行目の行末の空白を外すと '---'、2行目から先で最初に行末の空白を外すと '---' になる行が閉じ。閉じがなければ null。'...' は閉じにしない。
+export function frontmatterBlock(text) {
+  const source = String(text ?? '')
+  const firstEnd = source.indexOf('\n')
+  if (firstEnd < 0 || source.slice(0, firstEnd).trimEnd() !== '---') return null
+  let from = firstEnd + 1
+  while (from <= source.length) {
+    const next = source.indexOf('\n', from)
+    const end = next < 0 ? source.length : next
+    if (source.slice(from, end).trimEnd() === '---') return source.slice(0, end)
+    if (next < 0) break
+    from = next + 1
+  }
+  return null
+}
+
 // ノート全体（またはプロパティの部分だけ）の文字から見分ける。
 export function isTaskNote(text) {
-  const front = String(text ?? '').match(/^---\n[\s\S]*?\n---(?=\n|$)/)
-  return front ? isTaskItems(parseFrontmatter(front[0]).items) : false
+  const front = frontmatterBlock(text)
+  return front ? isTaskItems(parseFrontmatter(front).items) : false
 }
 
 // タスクのノートで、その項目をどの欄で出すか。null なら、ほかのノートと同じ決め方にする。
@@ -119,9 +137,9 @@ export function buildTaskNote(props = {}, body = '') {
 
 // タスクのノートのプロパティを読む。type: task でなければ null。
 export function readTaskProps(text) {
-  const front = String(text ?? '').match(/^---\n[\s\S]*?\n---(?=\n|$)/)
+  const front = frontmatterBlock(text)
   if (!front) return null
-  const { items } = parseFrontmatter(front[0])
+  const { items } = parseFrontmatter(front)
   if (!isTaskItems(items)) return null
   const get = (key) => {
     const value = items.find((item) => item.key === key)?.value

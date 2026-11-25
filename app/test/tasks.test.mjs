@@ -8,6 +8,7 @@ import {
   buildTaskFrontmatter,
   buildTaskNote,
   dateFieldStep,
+  frontmatterBlock,
   isDateTypingKey,
   isTaskDone,
   isTaskNote,
@@ -153,4 +154,29 @@ test('日付の欄の確定：選んだらすぐ、打ったら欄を離れる�
   assert.deepEqual(run([{ type: 'keydown', key: 'Backspace' }, { type: 'change', focused: false }]).commits, [1])
   // Backspace で空にして離れる：空の値を確定する（日付を消す手段として、仕様として残す）。
   assert.deepEqual(run([{ type: 'keydown', key: 'Backspace' }, { type: 'change', focused: true }, { type: 'blur' }]).commits, [2])
+})
+
+test('先頭のプロパティの部分（frontmatterBlock）：行末の空白を許し、閉じは --- だけ', () => {
+  assert.equal(frontmatterBlock('---\ntype: task\n---\n本文'), '---\ntype: task\n---')
+  assert.equal(frontmatterBlock('---\ntype: task\n---'), '---\ntype: task\n---')
+  // 開き・閉じの行末の空白・タブ
+  assert.equal(frontmatterBlock('--- \ntype: task\n---\t \n本文'), '--- \ntype: task\n---\t ')
+  // 閉じがない・'...' は閉じにしない・1行目が --- でない
+  assert.equal(frontmatterBlock('---\ntype: task\n本文'), null)
+  assert.equal(frontmatterBlock('---\ntype: task\n...\n本文'), null)
+  assert.equal(frontmatterBlock('---\ntype: task\n...\n---\n'), '---\ntype: task\n...\n---')
+  assert.equal(frontmatterBlock(' ---\ntype: task\n---'), null)
+  assert.equal(frontmatterBlock('---x\ntype: task\n---'), null)
+  assert.equal(frontmatterBlock('---\ntype: task\n---x\n'), null)
+  assert.equal(frontmatterBlock('---'), null)
+  assert.equal(frontmatterBlock(''), null)
+  assert.equal(frontmatterBlock(undefined), null)
+  // 閉じは最初の --- の行
+  assert.equal(frontmatterBlock('---\na: 1\n---\n---\n'), '---\na: 1\n---')
+  // 閉じの --- の行末に空白があっても、タスクのノートとして読める
+  assert.equal(isTaskNote('---\ntitle: a\ntype: task\n--- \n本文'), true)
+  assert.equal(isTaskNote('--- \ntype: task\n---\n'), true)
+  assert.equal(isTaskNote('---\ntype: task\n...\n'), false)
+  assert.deepEqual(readTaskProps('---\ntitle: "a"\ntype: task\nstatus: 進行中\ndue: 2026-06-04\ngoal: "[[g]]"\n---  \n本文'), { title: 'a', status: '進行中', start: '', due: '2026-06-04', goal: '[[g]]', parent: '' })
+  assert.equal(readTaskProps('---\ntype: task\n'), null)
 })

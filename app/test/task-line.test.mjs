@@ -4,7 +4,10 @@ import test from 'node:test'
 import {
   analyzeLines,
   ancestorsOf,
+  childRange,
+  childrenOf,
   cutBytes,
+  dedentChildren,
   goalTextOf,
   hasTaskLink,
   isStruck,
@@ -17,6 +20,9 @@ import {
   weekLinksOf,
 } from '../src/task-line.mjs'
 import { buildTaskNote, readTaskProps } from '../src/tasks.mjs'
+import { compareNesting, markdown } from './nesting-lezer.mjs'
+import { frontmatterEnd } from '../src/modes.mjs'
+import { Text } from '@codemirror/state'
 
 const ROOT = '90_Periodic'
 const lineOf = (text, needle) => text.split('\n').findIndex((line) => line.includes(needle)) + 1
@@ -505,4 +511,324 @@ test('区切り線と、チェックボックスの記号', () => {
   assert.equal(taskFromLine({ path, text: '- - -', line: 1, periodicRoot: ROOT }).reason, 'not-list')
   assert.equal(taskFromLine({ path, text: '* * *', line: 1, periodicRoot: ROOT }).reason, 'not-list')
   assert.equal(goalTextOf('- [?] 問い'), '[?] 問い')
+})
+
+// ---- 入れ子の行（段階1-D1） ----
+
+// needle を含む行の子の行（文字の配列）。子がなければ null。
+const kidsOf = (text, needle) => {
+  const rows = analyzeLines(text)
+  const index = rows.findIndex((row) => row.text.includes(needle))
+  assert.ok(index >= 0, '見つからない行：' + needle)
+  const range = childRange(rows, index)
+  return range ? rows.slice(range.first, range.last + 1).map((row) => row.text) : null
+}
+
+test('子の行の範囲：タブ・2スペース・混在・空の行・見出し', () => {
+  assert.deepEqual(kidsOf('- a\n\t- b\n\t\t- c\n- d', '- a'), ['\t- b', '\t\t- c'])
+  assert.deepEqual(kidsOf('- a\n\t- b\n\t\t- c\n- d', '- b'), ['\t\t- c'])
+  assert.deepEqual(kidsOf('- a\n  - b\n    - c\n- d', '- a'), ['  - b', '    - c'])
+  // タブ1つとスペース4つは同じ幅。タブのあとのスペースもそろえて数える
+  assert.deepEqual(kidsOf('\t- a\n    - 兄弟\n\t\t- c\n  \t- d\n- e', '- a'), null)
+  assert.deepEqual(kidsOf('\t- a\n    - 兄弟\n\t\t- c\n  \t\t- d\n- e', '兄弟'), ['\t\t- c', '  \t\t- d'])
+  // 字下げした続きの文も子（目標の文は1行目だけ）
+  assert.deepEqual(kidsOf('- a\n  続き\n  - b\n- c', '- a'), ['  続き', '  - b'])
+  // 字下げのない続きの文（怠惰な続きの行）は子ではない
+  assert.deepEqual(kidsOf('- a\n続き\n- c', '- a'), null)
+  // あいだの空の行は含め、空の行のあとの浅い行で止まる。末尾の空の行は含めない
+  assert.deepEqual(kidsOf('- a\n  - b\n\n  - c\n- d', '- a'), ['  - b', '', '  - c'])
+  assert.deepEqual(kidsOf('- a\n  - b\n\n次の段落', '- a'), ['  - b'])
+  assert.deepEqual(kidsOf('- a\n  - b\n\n\n## 見出し', '- a'), ['  - b'])
+  assert.deepEqual(kidsOf('- a\n  - b\n  \n\t\n', '- a'), ['  - b'])
+  // 見出しで止まる。字下げした見出しと「  ---」は子
+  assert.deepEqual(kidsOf('- a\n  - b\n## 見出し\n  - c', '- a'), ['  - b'])
+  assert.deepEqual(kidsOf('- a\n  ## 小見出し\n  - b\n  ---\n- c', '- a'), ['  ## 小見出し', '  - b', '  ---'])
+  // ファイルの終わり（改行なし）
+  assert.deepEqual(kidsOf('- a\n  - b', '- a'), ['  - b'])
+  assert.equal(kidsOf('- a', '- a'), null)
+  assert.equal(kidsOf('- a\n- b', '- a'), null)
+})
+
+test('子の行の範囲：注記・分野の行・取り消し行・番号の項目・英字の項目', () => {
+  // 字下げした ※ の行は子。字下げが同じ ※ の行は兄弟（子ではない）。字下げなしの ※ の行も子ではない
+  assert.deepEqual(kidsOf('- a\n\t- b\n\t\t※ 注記\n- c', '- b'), ['\t\t※ 注記'])
+  assert.equal(kidsOf('- a\n\t- b\n\t※ 注記\n- c', '- b'), null)
+  assert.deepEqual(kidsOf('- a\n\t- b\n\t※ 注記\n- c', '- a'), ['\t- b', '\t※ 注記'])
+  assert.equal(kidsOf('- [ ] a\n※ 注記', '- [ ] a'), null)
+  // チェックボックスのない分野の行の子
+  assert.deepEqual(kidsOf('- 分野\n\t- [ ] x\n\t- [x] y\n- 次の分野', '分野'), ['\t- [ ] x', '\t- [x] y'])
+  assert.deepEqual(kidsOf('- a\n\t~~- [ ] x~~\n- b', '- a'), ['\t~~- [ ] x~~'])
+  // 番号の項目の下の2スペース（プレビューでは入れ子にならないが、見た目どおり子にする）・1スペース・6スペース
+  assert.deepEqual(kidsOf('1. a\n  - b\n2. c', '1. a'), ['  - b'])
+  assert.deepEqual(kidsOf('1. a\n   - b\n2. c', '1. a'), ['   - b'])
+  assert.deepEqual(kidsOf('- a\n - b', '- a'), [' - b'])
+  assert.deepEqual(kidsOf('- a\n      - b\n- c', '- a'), ['      - b'])
+  assert.deepEqual(kidsOf('- a\n  a. x\n  b. y\n- b', '- a'), ['  a. x', '  b. y'])
+})
+
+test('子の行の範囲：引用の中', () => {
+  assert.deepEqual(kidsOf('> - a\n> \t- b\n> \t\t- c\n> - d', '- a'), ['> \t- b', '> \t\t- c'])
+  // 引用の「>」だけの行は空の行と同じ。末尾なら含めない
+  assert.deepEqual(kidsOf('> - a\n>   - b\n>\n>   - c\n> - d', '- a'), ['>   - b', '>', '>   - c'])
+  assert.deepEqual(kidsOf('> - a\n>   - b\n>\n> - d', '- a'), ['>   - b'])
+  // 引用の深さが違う行で止まる
+  assert.deepEqual(kidsOf('> - a\n>   - b\n- c', '- a'), ['>   - b'])
+  assert.deepEqual(kidsOf('> - a\n>>   - b', '- a'), null)
+  assert.deepEqual(kidsOf('- a\n>   - b', '- a'), null)
+  assert.deepEqual(kidsOf('>\t- a\n>\t\t- b', '- a'), ['>\t\t- b'])
+})
+
+test('子の行の範囲：コードの囲み・数式・コメント・先頭のプロパティ', () => {
+  const fence = '\x60\x60\x60'
+  assert.deepEqual(kidsOf('- a\n  ' + fence + '\n  code\n  ' + fence + '\n- b', '- a'), ['  ' + fence, '  code', '  ' + fence])
+  // 中に空の行があるコードの囲み（analyzeLines は空の行を 'code'・字下げ0にする）でも、囲みの途中で切れない
+  assert.deepEqual(kidsOf('- a\n  ' + fence + '\n  x\n\n  y\n  ' + fence + '\n- b', '- a'), ['  ' + fence, '  x', '', '  y', '  ' + fence])
+  // 字下げのないコードの囲みは子ではない
+  assert.equal(kidsOf('- a\n' + fence + '\n- x\n' + fence + '\n- b', '- a'), null)
+  assert.deepEqual(kidsOf('- a\n  $$\n  x\n  $$\n- b', '- a'), ['  $$', '  x', '  $$'])
+  assert.deepEqual(kidsOf('- a\n  %% c\n  %%\n- b', '- a'), ['  %% c', '  %%'])
+  // 先頭のプロパティの中には入らない（閉じのないプロパティは最後まで 'front'）
+  const rows = analyzeLines('---\ntags:\n  - a\n---\n- x\n  - y')
+  assert.deepEqual(childRange(rows, 4), { first: 5, last: 5 })
+  assert.equal(childRange(rows, 99), null)
+})
+
+test('字下げの外し方：いちばん浅い行の幅をそろえて外す・引用の > を外す・空の行', () => {
+  assert.deepEqual(dedentChildren(['\t- b', '\t\t- c']), ['- b', '\t- c'])
+  assert.deepEqual(dedentChildren(['\t\t- [x] b', '\t\t- [x] c']), ['- [x] b', '- [x] c'])
+  assert.deepEqual(dedentChildren(['  - b', '    - c', '  続き']), ['- b', '  - c', '続き'])
+  // タブが境目をまたぐときは、はみ出した分を空白で書く。外したあとにタブの止まる位置がずれる行も、幅を空白で書く
+  assert.deepEqual(dedentChildren(['  - b', '\t- c', '\t\t- d']), ['- b', '  - c', '      - d'])
+  assert.deepEqual(dedentChildren(['  - b', '  \t- c']), ['- b', '  - c'])
+  // 幅がタブの止まる位置（4の倍数）なら、残りのタブはそのまま
+  assert.deepEqual(dedentChildren(['    - b', '    \t- c', '\t\t- d']), ['- b', '\t- c', '\t- d'])
+  // 引用の >（> の後ろの空白かタブ1つも）を、選んだ行と同じ数だけ外す
+  assert.deepEqual(dedentChildren(['> \t- b', '>', '> \t\t- c'], 1), ['- b', '', '\t- c'])
+  assert.deepEqual(dedentChildren(['>> \t- b', '> > \t\t- c', '>>'], 2), ['- b', '\t- c', ''])
+  assert.deepEqual(dedentChildren(['>\t\t- b'], 1), ['- b'])
+  // 空の行は空にする（空白だけの行も）
+  assert.deepEqual(dedentChildren(['  - b', '   ', '', '  - c']), ['- b', '', '', '- c'])
+  // 子の行の中身（コードの中の空白など）は変えない
+  assert.deepEqual(dedentChildren(['  \x60\x60\x60', '    x\t= 1', '  \x60\x60\x60']), ['\x60\x60\x60', '  x\t= 1', '\x60\x60\x60'])
+})
+
+test('childrenOf と taskFromLine の children', () => {
+  const text = '- [ ] 目標\n\t- [ ] 下書き\n\n\t\t- [x] 構図\n\n- [ ] 次'
+  const kids = childrenOf(text, 0)
+  assert.deepEqual(kids, { from: 8, to: 31, text: '\n\t- [ ] 下書き\n\n\t\t- [x] 構図', lines: ['- [ ] 下書き', '', '\t- [x] 構図'], count: 2 })
+  assert.equal(text.slice(0, kids.from) + text.slice(kids.to), '- [ ] 目標\n\n- [ ] 次')
+  assert.equal(childrenOf(text, 5), null)
+  const path = '90_Periodic/2026/Monthly/2026-03.md'
+  const found = taskFromLine({ path, text, line: 1, periodicRoot: ROOT })
+  assert.deepEqual(found.children, kids)
+  assert.equal(taskFromLine({ path, text, line: 6, periodicRoot: ROOT }).children, null)
+  // 引用の中
+  const quoted = '> - [ ] 目標\n> \t- 子\n>\n> - 兄弟'
+  assert.deepEqual(taskFromLine({ path, text: quoted, line: 1, periodicRoot: ROOT }).children, { from: 10, to: 17, text: '\n> \t- 子', lines: ['- 子'], count: 1 })
+  // タスクのノートの行でも子を返す
+  const note = buildTaskNote({ title: '親', due: '2026-06-04' }) + '\n- [ ] 下の行\n  - 孫\n'
+  const sub = at('Tasks/2026-05-01-親.md', note, '下の行')
+  assert.equal(sub.parent, '[[Tasks/2026-05-01-親]]')
+  assert.deepEqual(sub.children.lines, ['- 孫'])
+})
+
+// 実物（2026-03・2026-05・Q1・W10・W11）の書き方をまねた入れ子の例。中身は架空の文に置き換えた。
+// 字下げで決めた範囲と lezer の違いが出る形（怠惰な続きの行・引用の > だけの行）を全部入れてある。
+const NESTED = [
+  '---',
+  'month: 2026-03',
+  'tags:',
+  '  - monthly-plan',
+  '---',
+  '',
+  '## Target',
+  '',
+  '> [!収益目標]',
+  '> - [x] 💰**収益目標：1万円(教室: ¥6K)**',
+  '> ',
+  '',
+  '### 1. 🎨 絵の練習',
+  '',
+  '- [[2026-W10]] (3/2-3/8)',
+  '\t- [ ] 下描きを3枚',
+  '\t\t- [x] 構図',
+  '\t\t- [x] 線画',
+  '\t- [ ] 画材の通販を調べる',
+  '\t※ 練習が続いてから考える。',
+  '- 教室',
+  '\t- [x] 1本目の公開',
+  '\t- [x] 2本目の公開',
+  '- ~~画材の通販を調べる~~',
+  '※ 今月は練習を優先する。',
+  '',
+  '### 2. 教室',
+  '',
+  '- [ ] 全作品に **下描き3段階** を当てる',
+  '  - Phase 1: 構図（0:00-0:15）',
+  '  - Phase 2: 線画（0:15-0:45）',
+  '    - [ ] 道具をそろえる',
+  '',
+  '  - [ ] 空の行のあとの子',
+  '- [ ] 6/4 作品展へ出す。',
+  '  続きの文（字下げした行）',
+  '',
+  '> [!Result]',
+  '> - 売上の活動',
+  '> \t- 教室の活動',
+  '> \t\t- [x] 体験会を1回追加',
+  '> \t\t~~- [ ] 別の会も視野~~',
+  '> \t\t- [x] 案内を2つ',
+  '> \t\t~~- [ ] 案内を4つ~~',
+  '> \t\t- [x] **月の成果: ¥5,000** > 結果: **¥8,000**',
+  '> ~~- [ ] 作品20枚~~',
+  '> \t\t~~- [ ] 動画の調査も視野~~',
+  '',
+  '## Weekly',
+  '',
+  '- [x] #絵 練習の流れを簡単にする',
+  '3/2(mon): 終日外出',
+  '- [ ] 4枚目を仕上げる',
+  '\t- [ ] 構図',
+  '※ 来週は夜の予定が多いので、週末にまとめて描く。',
+  '',
+  '\x60\x60\x60text',
+  '- [ ] コードの中の行',
+  '\x60\x60\x60',
+].join('\n')
+
+// 字下げと lezer の読み方がもともと違う形（あらかじめ挙げた例）。lezer に項目がない行や、入れ子にならない行。
+const ODD = [
+  '\t- 文書の頭のタブ',
+  '\t\t- 子',
+  '',
+  '1. 番号の項目',
+  '  - 2スペースの行',
+  '2. 次',
+  '',
+  '- 1スペース',
+  ' - 子',
+  '',
+  '- 6スペース',
+  '      - 子',
+  '- 兄弟',
+  '',
+  '>\t- 引用のすぐ後ろのタブ',
+  '>\t\t- 子',
+].join('\n')
+
+// 行の番号（0 から）→ その行で始まる項目の入れ子の深さ（1 が いちばん外側）。
+const itemDepths = (text) => {
+  const starts = [0]
+  for (let i = 0; i < text.length; i++) if (text[i] === '\n') starts.push(i + 1)
+  const lineOf = (pos) => starts.findLastIndex((start) => start <= pos)
+  const out = new Map()
+  let depth = 0
+  const codes = []
+  markdown.parse(text).iterate({
+    enter(node) {
+      if (node.name === 'CodeBlock') codes.push(lineOf(node.from))
+      if (node.name !== 'ListItem' && node.name !== 'AlphaItem') return
+      depth++
+      if (!out.has(lineOf(node.from))) out.set(lineOf(node.from), depth)
+    },
+    leave(node) {
+      if (node.name === 'ListItem' || node.name === 'AlphaItem') depth--
+    },
+  })
+  return { depths: out, codes }
+}
+
+test('字下げで決めた範囲と lezer の ListItem の違いは、怠惰な続きの行と空の行だけ（実物の書き方をまねた例）', () => {
+  const result = compareNesting(NESTED)
+  assert.equal(result.lists, 24)
+  assert.equal(result.withChildren, 9)
+  const count = (kind) => result.diffs.filter((diff) => diff.kind === kind).length
+  assert.equal(count('lazy'), 10)
+  assert.equal(count('blank'), 1)
+  assert.equal(result.diffs.length, 11, JSON.stringify(result.diffs.filter((diff) => diff.kind !== 'lazy' && diff.kind !== 'blank')))
+  // 怠惰な続きの行で始まる違い：注記（字下げが同じ ※・字下げなしの ※）、日付の行、行頭が ~~ の行、引用の中の取り消し行
+  const lazyNext = result.diffs.filter((diff) => diff.kind === 'lazy').map((diff) => diff.next)
+  assert.ok(lazyNext.includes('3/2(mon): 終日外出'))
+  assert.ok(lazyNext.includes('\t※ 練習が続いてから考える。'))
+  assert.ok(lazyNext.includes('> ~~- [ ] 作品20枚~~'))
+  // lezer の範囲がその先の深い行まで伸びる形（実物の Q1 の形）
+  assert.deepEqual(result.diffs.find((diff) => diff.text === '> - 売上の活動'), { line: 39, kind: 'lazy', text: '> - 売上の活動', mine: 45, lezer: 47, next: '> ~~- [ ] 作品20枚~~' })
+})
+
+test('字下げと lezer の読み方がもともと違う形は、あらかじめ挙げた行だけが違う', () => {
+  const result = compareNesting(ODD)
+  assert.equal(result.lists, 12)
+  assert.equal(result.withChildren, 5)
+  assert.deepEqual(result.diffs.map((diff) => [diff.line, diff.mine, diff.lezer]), [
+    [1, 2, null], // 文書の頭のタブ：lezer は字下げのコード
+    [2, 2, null],
+    [4, 5, 4], // 番号の項目の下の2スペース：lezer では入れ子にならない
+    [5, 5, 6], // （その行の段落に「2. 次」が続きとして入る）
+    [6, 6, null],
+    [8, 9, 8], // 1スペース：lezer では兄弟
+    [12, 12, null], // 6スペース：lezer では「- 子」は項目ではなく、上の行の文の続き
+    [16, 16, null], // > のすぐ後ろのタブ：lezer では項目ではない
+  ])
+})
+
+test('移したあとの形：字下げを外した子の行に字下げのコードがなく、入れ子の深さが元と同じ。元のノートからは子の行だけが消える', () => {
+  for (const [name, text] of Object.entries({ NESTED, ODD })) {
+    const rows = analyzeLines(text)
+    const original = itemDepths(text)
+    let checked = 0
+    let compared = 0
+    for (const row of rows) {
+      if (row.kind !== 'list') continue
+      const kids = childrenOf(text, row.index, rows)
+      if (!kids) continue
+      checked++
+      const label = name + ' ' + (row.index + 1) + '行目'
+      const body = kids.lines.join('\n') + '\n'
+      const moved = itemDepths(body)
+      assert.deepEqual(moved.codes, [], label)
+      // 元で項目だった子の行は、移したあとも項目で、深さの差（いちばん浅い子との差）が同じ
+      const range = childRange(rows, row.index)
+      const pairs = []
+      for (let i = range.first; i <= range.last; i++) {
+        if (!original.depths.has(i)) continue
+        pairs.push([original.depths.get(i), moved.depths.get(i - range.first)])
+      }
+      const base = Math.min(...pairs.map(([before]) => before))
+      const baseAfter = Math.min(...pairs.map(([, after]) => after))
+      for (const [before, after] of pairs) assert.equal(after - baseAfter, before - base, label)
+      // 実物をまねた例では、子の行の深さは「元の深さ − 選んだ行の深さ」になる（いちばん外側が 1）
+      if (name === 'NESTED') for (const [before, after] of pairs) assert.equal(after, before - original.depths.get(row.index), label)
+      compared += pairs.length
+      // 元のノートから from〜to を消すと、子の行だけがなくなる
+      const rest = rows.filter((r) => r.index < range.first || r.index > range.last).map((r) => r.text).join('\n')
+      assert.equal(text.slice(0, kids.from) + text.slice(kids.to), rest, label)
+      assert.equal(kids.text, '\n' + rows.slice(range.first, range.last + 1).map((r) => r.text).join('\n'), label)
+    }
+    assert.equal(checked, name === 'NESTED' ? 9 : 5)
+    assert.equal(compared, name === 'NESTED' ? 21 : 2)
+  }
+})
+
+test('先頭のプロパティの閉じの --- の行末に空白があっても、エディターと同じ範囲をプロパティにする', () => {
+  const frontRows = (text) => analyzeLines(text).filter((row) => row.kind === 'front')
+  const editorEnd = (text) => frontmatterEnd(Text.of(text.split('\n')))
+  for (const text of ['---\ntags:\n  - a\n--- \n- [ ] x', '--- \ntags: a\n---\t\n- [ ] x\n', '---\t\na: 1\n---  \n\n- x']) {
+    const rows = frontRows(text)
+    assert.equal(rows.at(-1).to, editorEnd(text), JSON.stringify(text))
+    assert.equal(rows.length, text.slice(0, editorEnd(text)).split('\n').length)
+  }
+  // 行末に空白のある --- の後ろの行は、プロパティではなく選べる行
+  const path = '90_Periodic/2026/Monthly/2026-03.md'
+  assert.equal(taskFromLine({ path, text: '---\ntags: a\n--- \n- [ ] x', line: 4, periodicRoot: ROOT }).ok, true)
+  assert.equal(taskFromLine({ path, text: '---\ntags: a\n--- \n- [ ] x', line: 2, periodicRoot: ROOT }).reason, 'front')
+})
+
+test('閉じの --- の行末に空白があるタスクのノートでも、行からサブタスクを作れる', () => {
+  const text = '---\ntitle: "親"\ntype: task\nstatus: 未着手\ndue: 2026-06-04\ngoal: "[[90_Periodic/2026/Monthly/2026-05]]"\n--- \n- [ ] 下の行\n'
+  const source = taskSourceOf({ path: 'Tasks/2026-05-01-親.md', text, periodicRoot: ROOT })
+  assert.deepEqual(source, { kind: 'task', goal: '[[90_Periodic/2026/Monthly/2026-05]]', parent: '[[Tasks/2026-05-01-親]]', due: '2026-06-04' })
+  const found = at('Tasks/2026-05-01-親.md', text, '下の行')
+  assert.equal(found.ok, true)
+  assert.equal(found.parent, '[[Tasks/2026-05-01-親]]')
+  assert.equal(found.due, '2026-06-04')
 })
