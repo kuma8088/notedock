@@ -218,32 +218,75 @@ export function ancestorsOf(rows, index) {
 
 // ---- 入れ子の行（子の行） ----
 
-// 引用の > を除くと空白だけの行か（kind は問わない。コードの囲みの中の空の行は 'code' になるため）。
-const isBlankRow = (row) => LINE.exec(row.text)[3].trim() === ''
+// 引用の > を quote 個まで外す正規表現（> の後ろの空白かタブ1つも > の一部。LINE と同じ分け方）。exact なら、ちょうど quote 個。
+const quoteMarks = (quote, exact = false) => new RegExp('^(?:[\\t ]*>[\\t ]?){' + (exact ? '' : '0,') + Math.max(0, Number(quote) || 0) + '}')
+
+// 選んだ行の引用の深さ（quote）から見て、空白だけの行か。選んだ行と同じ数の > を外すと空白だけになる行（引用の「>」だけの行も）。
+// kind は問わない（コードの囲みの中の空の行は 'code' になるため）。選んだ行より深い引用の「>」だけの行は、空ではない（引用の中身の一部）。
+const isBlankIn = (text, quote) => text.replace(quoteMarks(quote), '').trim() === ''
+
+// コードの囲み。開きの行の番号 → 閉じの行の番号（閉じがなければ -1）。analyzeLines が 'code' にした行を、同じ決まりで分ける。
+const fenceCache = new WeakMap()
+function fencesOf(rows) {
+  let spans = fenceCache.get(rows)
+  if (spans) return spans
+  spans = new Map()
+  let open = -1
+  let fence = null
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].kind !== 'code') continue
+    const shape = lineShape(rows[i].text)
+    if (fence) {
+      if (closesFence(shape.restRaw, fence)) {
+        spans.set(open, i)
+        fence = null
+      }
+      continue
+    }
+    fence = shape.fence
+    open = i
+    spans.set(open, -1)
+  }
+  fenceCache.set(rows, spans)
+  return spans
+}
 
 // rows[index] の子の行の範囲。字下げで決める（lezer の ListItem は使わない。字下げのない「怠惰な続きの行」まで
 // 項目の一部になってしまうため）。index の次の行から順に見て、
-//   空白だけの行（引用の > だけの行も）は、とりあえず飛ばす（あとに深い行が来れば範囲に入る）、
-//   先頭のプロパティの行・引用の深さが違う行・字下げが rows[index] 以下の行で止まる、
-//   それ以外（字下げが深い行）は種類を問わず子。
+//   空白だけの行（選んだ行と同じ深さの引用の > だけの行も）は、とりあえず飛ばす（あとに深い行が来れば範囲に入る）、
+//   先頭のプロパティの行・選んだ行より引用が浅い行で止まる、
+//   選んだ行と同じ数の > を外したあとの字下げが rows[index] 以下の行で止まる、
+//   それ以外（字下げが深い行）は種類を問わず子。字下げしたあとに > がある行（項目の下に字下げして書いた引用）も子。
+//   子の行がコードの囲みを開くなら、閉じの行まで囲みごと子にする（中の行の字下げや > は見ない）。
 // 返り値: { first, last }（rows の番号。末尾の空白だけの行は含めない）。子がなければ null。
 export function childRange(rows, index) {
   const self = rows?.[index]
   if (!self) return null
+  const marks = quoteMarks(self.quote, true)
+  const fences = fencesOf(rows)
   let last = -1
   for (let i = index + 1; i < rows.length; i++) {
     const row = rows[i]
-    if (isBlankRow(row)) continue
-    if (row.kind === 'front' || row.quote !== self.quote || row.indent <= self.indent) break
+    if (isBlankIn(row.text, self.quote)) continue
+    if (row.kind === 'front') break
+    const mark = marks.exec(row.text)
+    if (!mark || widthOf(/^[\t ]*/.exec(row.text.slice(mark[0].length))[0]) <= self.indent) break
     last = i
+    const close = fences.get(i)
+    if (close !== undefined && close > i) {
+      last = close
+      i = close
+    }
   }
   return last < 0 ? null : { first: index + 1, last }
 }
 
 // 字下げ indent（文字）から、幅 width の列ぶんを外した残り。
 // タブが境目をまたぐときや、外したあとにタブの止まる位置がずれるときは、残りの幅を空白で書く（見た目の字下げの幅を保つ）。
+// 字下げが width より浅い行（コードの囲みの中の行）は、字下げを全部外す。
 function stripIndent(indent, width) {
   const want = widthOf(indent) - width
+  if (want <= 0) return ''
   let col = 0
   let i = 0
   while (i < indent.length && col < width) {
@@ -257,14 +300,15 @@ function stripIndent(indent, width) {
 // 子の行を、タスクのノートの本文に置く形にする。行の配列を返す。
 //   行頭の引用の >（quote の数。> の後ろの空白かタブ1つも > の一部）を外し、
 //   空でない行のうちいちばん浅い字下げの幅（列）を、どの行からも外す（1段ではなく、いちばん浅い行が字下げなしになるまで）。
-//   空白だけの行（引用の > だけの行も）は空にする。
-export function dedentChildren(lines, quote = 0) {
-  const marks = new RegExp('^(?:[\\t ]*>[\\t ]?){0,' + Math.max(0, Number(quote) || 0) + '}')
-  const parts = lines.map((line) => {
+//   loose（行の番号の Set。コードの囲みの中の行と閉じの行）は、いちばん浅い幅を決めるのに使わない（浅ければ字下げを全部外す）。
+//   空白だけの行（quote の数の > を外すと空白だけの行）は空にする。それより深い引用の「>」だけの行は残す。
+export function dedentChildren(lines, quote = 0, loose = new Set()) {
+  const marks = quoteMarks(quote)
+  const parts = lines.map((line, i) => {
     const [, indent, rest] = /^([\t ]*)([\s\S]*)$/.exec(line.replace(marks, ''))
-    return { indent, rest, blank: LINE.exec(line)[3].trim() === '' }
+    return { indent, rest, blank: rest.trim() === '', loose: loose.has(i) }
   })
-  const widths = parts.filter((part) => !part.blank).map((part) => widthOf(part.indent))
+  const widths = parts.filter((part) => !part.blank && !part.loose).map((part) => widthOf(part.indent))
   const width = widths.length ? Math.min(...widths) : 0
   return parts.map((part) => (part.blank ? '' : stripIndent(part.indent, width) + part.rest))
 }
@@ -275,15 +319,22 @@ export function dedentChildren(lines, quote = 0) {
 export function childrenOf(text, index, rows = analyzeLines(text)) {
   const range = childRange(rows, index)
   if (!range) return null
+  const quote = rows[index].quote
   const kids = rows.slice(range.first, range.last + 1)
+  // コードの囲みの中の行と閉じの行（いちばん浅い字下げの幅を決めるのに使わない）。
+  const loose = new Set()
+  for (const [open, close] of fencesOf(rows)) {
+    if (open < range.first || open > range.last || close < 0) continue
+    for (let i = open + 1; i <= close; i++) loose.add(i - range.first)
+  }
   const from = rows[index].to
   const to = rows[range.last].to
   return {
     from,
     to,
     text: String(text).slice(from, to),
-    lines: dedentChildren(kids.map((row) => row.text), rows[index].quote),
-    count: kids.filter((row) => !isBlankRow(row)).length,
+    lines: dedentChildren(kids.map((row) => row.text), quote, loose),
+    count: kids.filter((row) => !isBlankIn(row.text, quote)).length,
   }
 }
 

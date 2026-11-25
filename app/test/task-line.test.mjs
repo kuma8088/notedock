@@ -593,6 +593,38 @@ test('子の行の範囲：コードの囲み・数式・コメント・先頭�
   assert.equal(childRange(rows, 99), null)
 })
 
+test('子の行の範囲：項目の下に字下げして書いた引用と、コードの囲みの中の > の行（lezer の読み方と同じ）', () => {
+  const fence = '\x60\x60\x60'
+  // 項目の下に字下げして書いた引用は子。中の「>」だけの行も引用の一部（空の行として扱わない）
+  const quoted = '- a\n  > 引用\n  >\n  > 続き\n- b'
+  assert.deepEqual(kidsOf(quoted, '- a'), ['  > 引用', '  >', '  > 続き'])
+  assert.deepEqual(childrenOf(quoted, 0).lines, ['> 引用', '>', '> 続き'])
+  assert.equal(childrenOf(quoted, 0).count, 3)
+  assert.deepEqual(kidsOf('- a\n  > 引用\n  >\n- b', '- a'), ['  > 引用', '  >'])
+  // コードの囲みの中に「  > x」の行があっても、囲みの途中で切れない
+  const coded = '- a\n  ' + fence + '\n  > x\n\n  y\n  ' + fence + '\n- b'
+  assert.deepEqual(kidsOf(coded, '- a'), ['  ' + fence, '  > x', '', '  y', '  ' + fence])
+  assert.deepEqual(childrenOf(coded, 0).lines, [fence, '> x', '', 'y', fence])
+  // 選んだ行が引用の中でも同じ
+  const inQuote = '> - a\n>   > 引用\n>   >\n>   > 続き\n> - b'
+  assert.deepEqual(childrenOf(inQuote, 0).lines, ['> 引用', '>', '> 続き'])
+  const fenceInQuote = '> - a\n>   ' + fence + '\n>   > x\n>   ' + fence + '\n> - b'
+  assert.deepEqual(childrenOf(fenceInQuote, 0).lines, [fence, '> x', fence])
+  // 字下げのない引用・選んだ行と同じ字下げの引用は子ではない
+  assert.equal(kidsOf('- a\n> 引用', '- a'), null)
+  assert.equal(kidsOf('\t- a\n\t> 引用', '- a'), null)
+  // 囲みの中の行が浅くても、囲みごと子にする。いちばん浅い幅は囲みの中の行と閉じの行では決めない
+  const shallow = '\t- a\n\t\t- b\n\t\t' + fence + '\ncode\n\t' + fence + '\n- c'
+  assert.deepEqual(kidsOf(shallow, '- a'), ['\t\t- b', '\t\t' + fence, 'code', '\t' + fence])
+  assert.deepEqual(childrenOf(shallow, 0).lines, ['- b', fence, 'code', fence])
+  // 閉じのない囲みは、囲みとして扱わず、ほかの行と同じく字下げで止める
+  assert.deepEqual(kidsOf('- a\n  ' + fence + '\n  x\n- b\n  y', '- a'), ['  ' + fence, '  x'])
+  // 隣り合う2つの囲み：2つ目が字下げなしなら、そこで止まる
+  assert.deepEqual(kidsOf('- a\n  ' + fence + '\n  x\n  ' + fence + '\n' + fence + '\n- z\n' + fence, '- a'), ['  ' + fence, '  x', '  ' + fence])
+  // lezer の ListItem と同じ範囲になる
+  for (const text of [quoted, coded, inQuote, fenceInQuote]) assert.deepEqual(compareNesting(text).diffs, [], text)
+})
+
 test('字下げの外し方：いちばん浅い行の幅をそろえて外す・引用の > を外す・空の行', () => {
   assert.deepEqual(dedentChildren(['\t- b', '\t\t- c']), ['- b', '\t- c'])
   assert.deepEqual(dedentChildren(['\t\t- [x] b', '\t\t- [x] c']), ['- [x] b', '- [x] c'])
@@ -606,6 +638,11 @@ test('字下げの外し方：いちばん浅い行の幅をそろえて外す�
   assert.deepEqual(dedentChildren(['> \t- b', '>', '> \t\t- c'], 1), ['- b', '', '\t- c'])
   assert.deepEqual(dedentChildren(['>> \t- b', '> > \t\t- c', '>>'], 2), ['- b', '\t- c', ''])
   assert.deepEqual(dedentChildren(['>\t\t- b'], 1), ['- b'])
+  // 選んだ行より深い引用の「>」だけの行は空にしない（1つの引用が2つに分かれないように）
+  assert.deepEqual(dedentChildren(['  > a', '  >', '  > b']), ['> a', '>', '> b'])
+  assert.deepEqual(dedentChildren(['> \t> a', '> \t>', '>'], 1), ['> a', '>', ''])
+  // loose の行（コードの囲みの中の行）は、いちばん浅い幅を決めるのに使わず、浅ければ字下げを全部外す
+  assert.deepEqual(dedentChildren(['\t\t\x60\x60\x60', 'x', '  y', '\t\t\t z', '\t\t\x60\x60\x60'], 0, new Set([1, 2, 3, 4])), ['\x60\x60\x60', 'x', 'y', '\t z', '\x60\x60\x60'])
   // 空の行は空にする（空白だけの行も）
   assert.deepEqual(dedentChildren(['  - b', '   ', '', '  - c']), ['- b', '', '', '- c'])
   // 子の行の中身（コードの中の空白など）は変えない
