@@ -228,14 +228,14 @@ body[data-pane='right'] #copy-path { display: none !important; }
 }
 
 /* 右の枠（?pane=right）では、上の帯にノートの場所、保存の状態、表示の切り替え、閉じるボタンだけを出す。
-   右端の一覧、チャット、貼り付けの案内も出さない。書式のボタンは、編集のときに右の中に出す。 */
+   右端の一覧とチャットも出さない。書式のボタンは、編集のときに右の中に出す。
+   貼り付けの案内は出す（右の枠でも Cmd+V でコピーしたパスのノートを開けるため）。 */
 body[data-pane='right'] #bar > :not(#path-row, #status, .spacer, #modes, #pane-close),
 body[data-pane='right'] #side,
 body[data-pane='right'] #outline,
 body[data-pane='right'] #side-resize,
 body[data-pane='right'] #chat-panel,
-body[data-pane='right'] #chat-open,
-body[data-pane='right'] #paste-hint {
+body[data-pane='right'] #chat-open {
   display: none !important;
 }
 

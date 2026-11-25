@@ -27,7 +27,7 @@ import { periodInfo, todayButtonHidden } from './periodic.mjs'
 import { PRODUCT } from './product.mjs'
 import { askChoice, askConfirm, askNewNote, askNewTask, askPlace, askText, showCopyable, showMessage } from './dialogs.mjs'
 import { copyText } from './copy.mjs'
-import { keyLabel, localizeKeyHints } from './keys.mjs'
+import { isBodyKey, keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
 import { absolutePath, ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
 import { alphaChildEnter, alphaListEnter } from './alpha-list.mjs'
@@ -36,7 +36,7 @@ import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { editableExtensions, endQuietAfterClick, focusEndsQuiet, pasteOpensNote, pastePlace, refocusesBody } from './modes.mjs'
+import { editableExtensions, endQuietAfterClick, focusEndsQuiet, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, refocusesBody } from './modes.mjs'
 import { cursorQuiet, keyEndsQuiet, noteContext, noteMode, previewField, setComposing, setCursorQuiet, setMode, setNoteBusy, togglePropsPanel, typingStart } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
@@ -792,23 +792,55 @@ const editorEvents = EditorView.domEventHandlers({
 // 選択が変わる操作では、その変更で印が外れる（preview.mjs の quietAfter）。ここで外すのは、選択が変わらない場合の分。
 // フォーカスがあるときに、今のカーソルと同じ位置（開いた直後の本文の先頭）をクリックしても選択は変わらない。
 const quietEnders = EditorView.domEventObservers({
-  mousedown(event, target) {
-    if (event.button !== 0 || !cursorQuiet(target.state)) return
-    // チェックボックスや箇条書きの記号、ノートの情報の欄などの部品を押したときは、その操作のためなので外さない。
-    if (event.target?.closest?.('[contenteditable="false"]')) return
-    // エディターがクリックの位置を決めてから外す。その間に別のノートを開いていたら外さない（modes.mjs）。
-    endQuietAfterClick(target, () => openRound)
-  },
   keydown(event, target) {
     if (cursorQuiet(target.state) && keyEndsQuiet(event)) target.dispatch({ effects: setCursorQuiet.of(false) })
   },
-  // マウスで押した以外の方法で本文にフォーカスが入ったら（Tab、新しく作ったノート、「編集」「ソース」のボタンのあとなど）、印を外す。
+  // 本文にフォーカスが入ったら、必ず印を外す（Tab、Cmd+E、新しく作ったノート、「編集」「ソース」のボタンのあと、表のマスなど）。
   // 印があるとカーソルの行の記号が隠れたままなので、打った文字やEnter・Backspaceが、見た目と違う所に効く（見出しの # が消えるなど）。
-  // マウスで押したときは、押した位置にカーソルが動いてから外す（上の mousedown）。先に外すと、押した位置がずれる。
-  focus(event, target) {
-    if (focusEndsQuiet({ quiet: cursorQuiet(target.state), pressing: pressingEditor })) target.dispatch({ effects: setCursorQuiet.of(false) })
+  // マウスで押したときは、押した位置にカーソルが動いてから外す。先に外すと、押した位置がずれる。上の mousedown が先に予約した処理
+  // （部品を押したときのカーソルの移動）のあとに動くよう、同じ待ち方で予約する。mousedown が届かない押し方でも、これで外れる。
+  // focusin は、表のマスなど本文の中の場所にフォーカスが入ったときにも届く（focus は本文そのものだけ）。
+  focusin(event, target) {
+    if (!cursorQuiet(target.state)) return
+    if (focusEndsQuiet({ quiet: true, pressing: pressingEditor })) target.dispatch({ effects: setCursorQuiet.of(false) })
+    else endQuietAfterClick(target, () => openRound)
   },
 })
+
+// 本文を押したときに、開いた直後の印を外す。エディターがクリックの位置を決めてから外す。その間に別のノートを開いていたら外さない（modes.mjs）。
+// 本文の中の部品（コールアウトの題名、表、チェックボックス、箇条書きの記号など）を押したときは、本文にフォーカスが入ったときだけ外す。
+// そのときカーソルが開いたときの1行目のままなら、押した部品の所へ動かす（modes.mjs の endQuietAfterClick と partCursor）。
+// エディターは、押した操作を受け取らない部品（コールアウトの題名、表）では mousedown をこちらに回さないので、エディターの外（document）で受ける。
+// リンクは押した時点で開くので（bindChrome）、ここでは何もしない。
+document.addEventListener(
+  'mousedown',
+  (event) => {
+    if (event.button !== 0 || !view || !cursorQuiet(view.state) || !view.contentDOM.contains(event.target)) return
+    if (event.target.closest?.('[data-href]')) return
+    const target = view
+    const part = pressedPart(event.target, target.contentDOM)
+    if (!part) {
+      endQuietAfterClick(target, () => openRound)
+      return
+    }
+    const kind = partKind(part)
+    endQuietAfterClick(target, () => openRound, setTimeout, {
+      focus: () => {
+        const active = document.activeElement
+        if (active === target.contentDOM) return 'body'
+        return target.contentDOM.contains(active) ? 'inside' : null
+      },
+      cursor: (state, focus) => {
+        if (!target.contentDOM.contains(part)) return null
+        // 本文の中の入力の場所（表のマス、ノートの情報の欄の入力など）に入ったときは、表のときだけ表のすぐ後ろへ動かす（表には触れないので、マスの編集は続く）。
+        if (focus !== 'body' && kind !== 'table') return null
+        const box = kind === 'table' ? part.closest('.cm-table-wrap') : part
+        return partCursor(state, { pos: target.posAtDOM(box), kind, length: box.noteSource?.length ?? 0 })
+      },
+    })
+  },
+  true,
+)
 
 // エディターの中をマウスや指で押している最中か。押したときのフォーカスは、押した位置が決まる前に入るので、上の focus で印を外さない。
 // フォーカスは押したのと同じ流れの中で入るので、次の処理の順番が来たら戻す。
@@ -3756,10 +3788,22 @@ function openFromPaste(event) {
   }
 }
 
+// 「本文へ移る」（Cmd+E、WindowsはCtrl+E）。開いているノートが編集できるときに、本文にフォーカスを入れる。
+// 既にあるノートは開いても本文にフォーカスを入れないので、キーボードだけで使う人が Tab を何十回も押さずに書き始められるようにする。
+// 開いてからまだ本文に入っていなければ、カーソルは開いたときの位置（typingStart。見出しの # などの記号のあと）のまま。
+// フォーカスが入ると印が外れて記号が見える（quietEnders の focusin）。前に本文でカーソルを置いていれば、そこに戻る。本文にいるときは何もしない。
+function enterBody() {
+  if (!currentPath || !view || !editable) return
+  if (view.contentDOM.contains(document.activeElement)) return
+  view.focus()
+  view.dispatch({ effects: [setCursorQuiet.of(false), EditorView.scrollIntoView(view.state.selection.main.head, { y: 'nearest' })] })
+}
+
 function bindChrome() {
   bindToolbar()
   bindTaskContextMenu()
-  // 右の枠では、上のボタン列、ファイルの一覧、「探す」、貼り付けでノートを開く処理を使わない。
+  // 右の枠では、上のボタン列、ファイルの一覧、「探す」を使わない。貼り付けでノートを開く処理は、どちらの枠でも使う（その枠で開く）。
+  bindPasteOpen()
   if (PANE !== 'right') bindLeftChrome()
   else bindRightChrome()
   $('history-close').addEventListener('click', () => $('history').close())
@@ -3794,6 +3838,15 @@ function bindChrome() {
   $('editor').addEventListener('focusout', () => setTimeout(() => saver?.compositionEnded(), 0))
   window.addEventListener('keydown', (event) => {
     hoverWithMeta = event.metaKey || event.ctrlKey
+    // 本文へ移る。ダイアログ（「探す」など）を出している間は使わない。
+    // 本文にいるときも、ブラウザの同じキーの働き（WindowsのCtrl+Eはアドレス欄へ移る）が動かないように止める。
+    if (isBodyKey(event) && !document.querySelector('dialog[open]')) {
+      event.preventDefault()
+      // 左右に分けていて右の枠が操作中なら、右の枠の本文へ移ってもらう（一覧から右の枠に開いたノートなど）。
+      if (PANE !== 'right' && rightActive() && split?.isOpen()) split.post({ type: MSG.FOCUS })
+      else enterBody()
+      return
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'o') {
       event.preventDefault()
       // 右の枠では、左に「探す」を画面いっぱいに出してもらう。
@@ -3829,11 +3882,15 @@ function bindChrome() {
   })
 }
 
-function bindLeftChrome() {
+// Cmd+V でコピーしたパスのノートを開く処理と、その案内。左右どちらの枠でも同じ決まりで動き、押した枠で開く
+// （右の枠には split がないので、openFromPaste の openIn はその枠の openNote になる）。
+function bindPasteOpen() {
   document.addEventListener('paste', openFromPaste)
   document.addEventListener('click', (event) => {
-    // チェックやリンクを押したときは、その操作のためなので案内を出さない。
-    const onBody = event.target.closest?.('#editor') && !event.target.closest('.cm-task-box, [data-href], a, #task-panel')
+    // チェックやリンク、本文の中の部品（箇条書きの記号、コールアウトの題名、表など）を押したときは、その操作のためなので案内を出さない。
+    const content = view?.contentDOM
+    const onPart = Boolean(pressedPart(event.target, content)) || Boolean(event.target.closest?.('.cm-list-number'))
+    const onBody = event.target.closest?.('#editor') && !event.target.closest('.cm-task-box, [data-href], a, #task-panel') && !onPart
     showPasteHint(Boolean(onBody) && pasteOpensNoteAt(document.activeElement))
   })
   // 案内が最後の行に重なるので、読み進めるときは消す。
@@ -3842,6 +3899,9 @@ function bindLeftChrome() {
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') showPasteHint(false)
   })
+}
+
+function bindLeftChrome() {
   $('open-note').addEventListener('click', openSwitcher)
   $('new-note').addEventListener('click', () => newNoteFromButton())
   bindFilesPanel()
@@ -4049,6 +4109,8 @@ async function receiveFromLeft(data) {
     view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
   } else if (data.type === MSG.TASKS) {
     refreshAfterTasks()
+  } else if (data.type === MSG.FOCUS) {
+    enterBody()
   } else if (data.type === MSG.CHAT) {
     sendSelectionToChat()
   } else if (data.type === MSG.HISTORY) {

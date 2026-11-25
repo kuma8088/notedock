@@ -12,6 +12,8 @@ export const MSG = {
   HISTORY: 'pane:history',
   SEARCH: 'pane:search',
   THEME: 'pane:theme',
+  // 左の枠で「本文へ移る」キー（Cmd+E）を押したとき、右の枠が操作中なら、右の本文に移ってもらう（左から右へ）。
+  FOCUS: 'pane:focus',
   // SAVE は { id }（左から右へ）。SAVED（右から左へ）は { id, dirty }。id は頼みごとと同じ。保存を試したあと、まだ保存できていない書きかけがあれば dirty: true。
   SAVE: 'pane:save',
   SAVED: 'pane:saved',

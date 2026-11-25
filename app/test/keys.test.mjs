@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { historyKey, isCommandKey, keyLabel, localizeKeyHints } from '../src/keys.mjs'
+import { historyKey, isBodyKey, isCommandKey, keyLabel, localizeKeyHints } from '../src/keys.mjs'
 
 const press = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...mods })
 
@@ -14,6 +14,21 @@ test('MacではCmdだけをコマンドのキーとして扱う', () => {
 test('Mac以外ではCtrlだけをコマンドのキーとして扱う', () => {
   assert.equal(isCommandKey(press('e', { ctrlKey: true }), false), true)
   assert.equal(isCommandKey(press('e', { metaKey: true }), false), false)
+})
+
+test('本文へ移るキーは、MacではCmd+E、それ以外ではCtrl+Eだけ', () => {
+  assert.equal(isBodyKey(press('e', { metaKey: true }), true), true)
+  assert.equal(isBodyKey(press('E', { metaKey: true }), true), true)
+  // MacのCtrl+Eは行の終わりへの移動なので使わない。
+  assert.equal(isBodyKey(press('e', { ctrlKey: true }), true), false)
+  assert.equal(isBodyKey(press('e', { ctrlKey: true }), false), true)
+  assert.equal(isBodyKey(press('e', { metaKey: true }), false), false)
+  // Shift・Alt付き、日本語の変換中、ほかの文字、修飾キーなしは使わない。
+  assert.equal(isBodyKey(press('e', { metaKey: true, shiftKey: true }), true), false)
+  assert.equal(isBodyKey(press('e', { metaKey: true, altKey: true }), true), false)
+  assert.equal(isBodyKey(press('e', { metaKey: true, isComposing: true }), true), false)
+  assert.equal(isBodyKey(press('o', { metaKey: true }), true), false)
+  assert.equal(isBodyKey(press('e'), true), false)
 })
 
 test('取り消しとやり直しのキーを見分ける', () => {

@@ -1,7 +1,7 @@
 import { EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 
-import { cursorQuiet, setCursorQuiet } from './preview.mjs'
+import { cursorQuiet, setCursorQuiet, typingStart } from './preview.mjs'
 
 // ノートの表示まわりの決まりのうち、画面（DOM）に頼らずに決められるもの。main.mjs から使い、テストで動きを確かめる。
 
@@ -48,10 +48,52 @@ export function pasteOpensNote({ hasNote = false, editable = false, inField = fa
 // 先に外すと、先頭の行の見た目が変わって、押した位置がずれる。
 // 外すまでの間に別のノートを開いていたら（roundNow() の開いた回が変わったら）、新しいノートの印は外さない。
 // view は使い回す（ノートを開くたびに setState で中身を入れ替える）ので、view だけでは見分けられない。
-export function endQuietAfterClick(view, roundNow, later = setTimeout) {
+// part：本文の中の部品（コールアウトの題名、表など）を押したとき。{ focus, cursor }。
+// - focus() は、押したあとのフォーカスの場所。'body'（本文）、'inside'（表のマスなど、本文の中の入力の場所）、null（本文の外）。
+// - cursor(state, focus) は、カーソルを動かす先（動かさないときは null）。partCursor で決める。
+//   表のマスに入ったとき（'inside'）も、表のすぐ後ろへ動かす。マスの編集を Escape で終えると本文にフォーカスが戻るので、1行目に残さないため。
+// 部品を押すと、エディターは押した位置にカーソルを動かさないことがある（題名や表は押した操作をエディターに渡さない）。
+// 印が残っている（カーソルが開いたときの1行目のまま）のに本文にフォーカスが入っていたら、カーソルを部品の所へ動かしてから印を外す。
+// 1行目にカーソルが残ると、隠れた記号の前後で打つことになる（見出しで Backspace を押すと # のあとの空白が消える、など）。
+// 本文にフォーカスが入らなかったとき（チェックボックス、子を開閉した箇条書きの記号）は、その操作のためなので印を残す。
+export function endQuietAfterClick(view, roundNow, later = setTimeout, part = null) {
   const round = roundNow()
   later(() => {
     if (roundNow() !== round || !cursorQuiet(view.state)) return
-    view.dispatch({ effects: setCursorQuiet.of(false) })
+    if (!part) {
+      view.dispatch({ effects: setCursorQuiet.of(false) })
+      return
+    }
+    const focus = part.focus()
+    if (!focus) return
+    const anchor = part.cursor(view.state, focus)
+    view.dispatch(anchor === null ? { effects: setCursorQuiet.of(false) } : { selection: { anchor }, effects: setCursorQuiet.of(false) })
   }, 0)
+}
+
+// 押した所が、本文の中の部品（エディターが書き換えさせない [contenteditable="false"] の部分）なら、その部品を返す。
+// 編集できないノートでは本文そのもの（content）も contenteditable="false" なので、本文そのものは部品に数えない。
+export function pressedPart(target, content) {
+  const el = target?.closest ? target : target?.parentElement
+  const part = el?.closest?.('[contenteditable="false"]')
+  if (!part || !content || part === content || !content.contains(part)) return null
+  return part
+}
+
+// 部品の種類。props：ノートの情報の欄（先頭の --- の部分）。table：表。line：行の頭から始まる部品（コールアウトの題名など）。
+export function partKind(part) {
+  if (part?.closest?.('.cm-props, .cm-frontmatter')) return 'props'
+  if (part?.closest?.('.cm-table-wrap')) return 'table'
+  return 'other'
+}
+
+// 部品を押して本文にフォーカスが入ったときに、カーソルを置く位置。pos は部品の始まり（view.posAtDOM）。
+// - ノートの情報の欄：動かさない（null）。欄の中（--- の中）に置くと、欄が文字のまま見えてしまう。欄のすぐ下が本文の1行目なので、そのままでよい。
+// - 表：表のすぐ後ろ（次の行の頭）。表の中に置くと表が文字のまま見えて、マスの編集もできなくなる。length は表の文字数。
+// - 行の頭から始まる部品：ノートを開いたときと同じ決め方（typingStart）。コールアウトの題名なら、すぐ下の中身の行の頭（「> 」のあと）。
+// - それ以外：部品の前。
+export function partCursor(state, { pos, kind, length = 0 }) {
+  if (kind === 'props') return null
+  if (kind === 'table') return Math.min(state.doc.length, pos + length + 1)
+  return pos === state.doc.lineAt(pos).from ? typingStart(state, pos) : pos
 }

@@ -6,7 +6,7 @@ import { EditorSelection, EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 
 import { noteMarkdown } from '../src/markdown-ext.mjs'
-import { editableExtensions, endQuietAfterClick, focusEndsQuiet, pasteOpensNote, pastePlace, refocusesBody } from '../src/modes.mjs'
+import { editableExtensions, endQuietAfterClick, focusEndsQuiet, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, refocusesBody } from '../src/modes.mjs'
 import { cursorQuiet, hiddenRanges, keyEndsQuiet, noteContext, previewField, quietAfter, setComposing, setCursorQuiet, setMode, togglePropsPanel, typingStart } from '../src/preview.mjs'
 import { WikiLinkWidget } from '../src/widgets.mjs'
 
@@ -18,7 +18,10 @@ test('表示の切り替えのボタンは「編集」と「ソース」の2つ�
   const modes = [...group[0].matchAll(/data-mode="([^"]+)"[^>]*>([^<]*)</g)].map((m) => [m[1], m[2]])
   assert.deepEqual(modes, [['live', '編集'], ['source', 'ソース']])
   assert.equal(html.includes('閲覧'), false)
-  assert.equal(/Cmd\+E(?!nter)/.test(html), false)
+  // Cmd+E は「本文へ移る」キーとしてだけ案内する（閲覧へ切り替えるキーではない）。
+  const cmdE = [...html.matchAll(/Cmd\+E(?!nter)[^"<]*/g)].map((m) => m[0])
+  assert.ok(cmdE.length > 0)
+  for (const hint of cmdE) assert.match(hint, /^Cmd\+E で本文へ移/)
 })
 
 test('編集できるノートは画面も編集でき、編集できないノートは画面も読み取り専用になる', () => {
@@ -273,4 +276,132 @@ test('ノートを開いたときに本文にフォーカスを入れるのは�
   // 右の枠へは、左から届いた focus が true のときだけ。
   assert.match(main, /focus: data\.focus === true/)
   assert.match(main, /split\.post\(\{ type: MSG\.OPEN, path, anchor, startMode, focus \}\)/)
+})
+
+// 部品のクリック（2026-11-25 再レビューの指摘1）。開いた直後にコールアウトの題名などの部品を押すと、本文にフォーカスは入るのにカーソルが1行目のまま残り、
+// Backspace で見出しの # のあとの空白が消えていた。
+const fakeEl = (found) => ({ closest: (sel) => found[sel] ?? null })
+test('押した所が本文の中の部品かを見分ける。編集できないノートの本文そのものは部品に数えない', () => {
+  const part = { name: 'part' }
+  const content = { contains: (el) => el === part || el === content }
+  assert.equal(pressedPart(fakeEl({ '[contenteditable="false"]': part }), content), part)
+  // 部品の外（ふつうの文字）。
+  assert.equal(pressedPart(fakeEl({}), content), null)
+  // 編集できないノートでは本文そのもの（content）が contenteditable="false"。
+  assert.equal(pressedPart(fakeEl({ '[contenteditable="false"]': content }), content), null)
+  // 本文の外の部品（ほかのエディターなど）。
+  assert.equal(pressedPart(fakeEl({ '[contenteditable="false"]': { name: 'other' } }), content), null)
+  assert.equal(pressedPart(null, content), null)
+  // 文字のノード（closest がない）は、その親で調べる。
+  assert.equal(pressedPart({ parentElement: fakeEl({ '[contenteditable="false"]': part }) }, content), part)
+})
+
+test('部品の種類：ノートの情報の欄、表、それ以外', () => {
+  assert.equal(partKind(fakeEl({ '.cm-props, .cm-frontmatter': {} })), 'props')
+  assert.equal(partKind(fakeEl({ '.cm-table-wrap': {} })), 'table')
+  assert.equal(partKind(fakeEl({})), 'other')
+})
+
+test('部品を押して本文に入ったときのカーソルの位置は、押した部品の所', () => {
+  const doc = '# 見出し\n本文\n\n> [!note]\n> 中身\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- 項目\n画像 ![](a.png) のあと'
+  const state = opened(doc)
+  // コールアウトの題名（行の頭から始まる部品）：すぐ下の中身の行の「> 」のあと。1行目には残さない。
+  assert.equal(partCursor(state, { pos: doc.indexOf('> [!note]'), kind: 'other' }), doc.indexOf('中身'))
+  // 表：表のすぐ後ろ（次の行の頭）。表の中に置くと、表が文字のまま見えてしまう。
+  const table = '| a | b |\n|---|---|\n| 1 | 2 |'
+  assert.equal(partCursor(state, { pos: doc.indexOf(table), kind: 'table', length: table.length }), doc.indexOf(table) + table.length + 1)
+  // 箇条書きの記号（行の頭）：記号のあと。
+  assert.equal(partCursor(state, { pos: doc.indexOf('- 項目'), kind: 'other' }), doc.indexOf('項目'))
+  // 行の途中の部品（画像など）：部品の前。
+  assert.equal(partCursor(state, { pos: doc.indexOf('!['), kind: 'other' }), doc.indexOf('!['))
+  // ノートの情報の欄：動かさない。
+  assert.equal(partCursor(state, { pos: 0, kind: 'props' }), null)
+  // 最後の表：ノートの終わりより後ろには置かない。
+  const last = opened('本文\n\n| a |\n|---|')
+  assert.equal(partCursor(last.state ?? last, { pos: 4, kind: 'table', length: 11 }), last.doc.length)
+})
+
+test('部品を押したあと：本文にフォーカスが入ったらカーソルを部品の所へ動かして印を外し、入らなかったら印を残す', () => {
+  const fakeView = (state) => ({ state, dispatch(spec) { this.state = this.state.update(spec).state } })
+  const doc = '# 見出し\n本文\n\n> [!note]\n> 中身'
+  const run = (focus, prepare) => {
+    const view = fakeView(opened(doc))
+    prepare?.(view)
+    const pending = []
+    endQuietAfterClick(view, () => 1, (fn) => pending.push(fn), { focus: () => focus, cursor: (s, f) => (f === 'body' ? partCursor(s, { pos: doc.indexOf('> [!note]'), kind: 'other' }) : null) })
+    pending.shift()()
+    return view.state
+  }
+  // 本文にフォーカスが入った（コールアウトの題名を押した）：中身の行へ動き、印が外れる。
+  const body = run('body')
+  assert.equal(cursorQuiet(body), false)
+  assert.equal(body.selection.main.head, doc.indexOf('中身'))
+  assert.deepEqual(hiddenRanges(body).includes('# '), true, '1行目の見出しの記号は、カーソルが離れたので隠れたまま')
+  // 本文の中の入力の場所にフォーカスが入った：印は外す。カーソルを動かすかは cursor が決める（ここでは動かさない）。
+  const inside = run('inside')
+  assert.equal(cursorQuiet(inside), false)
+  assert.equal(inside.selection.main.head, 2)
+  // 表のマスに入ったとき：表のすぐ後ろへ動かす（Escape でマスの編集を終えて本文に戻ったときに、1行目に残さない）。
+  const tdoc = '# 見出し\n\n| a |\n|---|\n\n本文'
+  const table = '| a |\n|---|'
+  const tview = fakeView(opened(tdoc))
+  const tpending = []
+  endQuietAfterClick(tview, () => 1, (fn) => tpending.push(fn), { focus: () => 'inside', cursor: (s) => partCursor(s, { pos: tdoc.indexOf(table), kind: 'table', length: table.length }) })
+  tpending.shift()()
+  assert.equal(cursorQuiet(tview.state), false)
+  assert.equal(tview.state.selection.main.head, tdoc.indexOf(table) + table.length + 1)
+  // 本文にフォーカスが入らなかった（チェックボックス、子を開閉した箇条書きの記号）：印を残す。
+  const none = run(null)
+  assert.equal(cursorQuiet(none), true)
+  assert.equal(none.selection.main.head, 2)
+  // エディターが押した位置にカーソルを動かしていた（画像、数式など）：その位置のまま（印は動かしたときに外れている）。
+  const moved = run('body', (view) => view.dispatch({ selection: { anchor: doc.indexOf('本文') } }))
+  assert.equal(moved.selection.main.head, doc.indexOf('本文'))
+  assert.equal(cursorQuiet(moved), false)
+})
+
+test('本文にフォーカスが入ったら印を外す処理は、押している最中でも、押した位置が決まったあとに必ず外す', () => {
+  const main = fs.readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8')
+  const enders = main.slice(main.indexOf('const quietEnders = EditorView.domEventObservers({'), main.indexOf('let pressingEditor = false'))
+  const press = enders.slice(enders.indexOf("document.addEventListener(\n  'mousedown',"))
+  assert.ok(press.length > 0, 'エディターが受け取らない部品の mousedown も受けるよう、document で受ける')
+  // 表のマスなどに入ったときにも届くよう、focusin で受ける。
+  assert.match(enders, /focusin\(event, target\) \{/)
+  assert.match(enders, /else endQuietAfterClick\(target, \(\) => openRound\)/)
+  // 部品を押したときも、早く戻らずに endQuietAfterClick に部品を渡す。
+  assert.match(press, /const part = pressedPart\(event\.target, target\.contentDOM\)/)
+  assert.match(press, /endQuietAfterClick\(target, \(\) => openRound, setTimeout, \{/)
+  // 本文の中の入力の場所に入ったときにカーソルを動かすのは、表のときだけ。
+  assert.match(press, /if \(focus !== 'body' && kind !== 'table'\) return null/)
+  assert.equal(enders.includes("closest?.('[contenteditable=\"false\"]')) return"), false)
+})
+
+// キーボードだけで本文に入る（再レビューの指摘2）。Cmd+E（Windows は Ctrl+E）。
+test('Cmd+E で本文へ移る：編集できるノートで本文の外にいるときだけ。右の枠が操作中なら右の本文へ', () => {
+  const main = fs.readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8')
+  const enter = main.slice(main.indexOf('function enterBody() {'), main.indexOf('function bindChrome() {'))
+  assert.match(enter, /if \(!currentPath \|\| !view \|\| !editable\) return/)
+  assert.match(enter, /if \(view\.contentDOM\.contains\(document\.activeElement\)\) return/)
+  // 選択は変えない（開いた直後なら開いたときの位置＝typingStart、前に本文でカーソルを置いていればそこ）。
+  assert.equal(/selection:/.test(enter), false)
+  assert.match(enter, /view\.focus\(\)/)
+  assert.match(main, /if \(isBodyKey\(event\) && !document\.querySelector\('dialog\[open\]'\)\) \{/)
+  assert.match(main, /if \(PANE !== 'right' && rightActive\(\) && split\?\.isOpen\(\)\) split\.post\(\{ type: MSG\.FOCUS \}\)/)
+  assert.match(main, /data\.type === MSG\.FOCUS\) \{\n\s*enterBody\(\)/)
+})
+
+// 右の枠でも Cmd+V でノートを開く（再レビューの指摘3）。本文の中の部品を押したときは案内を出さない（指摘5）。
+test('Cmd+V でノートを開く処理は左右どちらの枠でも使い、部品を押したときは案内を出さない', () => {
+  const main = fs.readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8')
+  const chrome = main.slice(main.indexOf('function bindChrome() {'), main.indexOf("$('history-close')"))
+  assert.match(chrome, /bindPasteOpen\(\)\n\s*if \(PANE !== 'right'\) bindLeftChrome\(\)/)
+  const left = main.slice(main.indexOf('function bindLeftChrome() {'), main.indexOf('function bindLeftChrome() {') + 400)
+  assert.equal(left.includes("addEventListener('paste'"), false)
+  const paste = main.slice(main.indexOf('function bindPasteOpen() {'), main.indexOf('function bindLeftChrome() {'))
+  assert.match(paste, /document\.addEventListener\('paste', openFromPaste\)/)
+  assert.match(paste, /pressedPart\(event\.target, content\)/)
+  assert.match(paste, /&& !onPart/)
+  // 右の枠で案内を隠さない。
+  const css = fs.readFileSync(new URL('../src/style.css', import.meta.url), 'utf8')
+  assert.equal(/body\[data-pane='right'\] #paste-hint/.test(css), false)
 })
