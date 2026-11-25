@@ -158,16 +158,25 @@ export function frontmatterDamage(startDoc, changes, newDoc) {
   return startDoc.sliceString(end, end + 1) === '\n' && newDoc.sliceString(next, next + 1) !== '\n'
 }
 
-// 欄を守る決まりを当てる変更か。編集の表示で、本人の操作から来たもの（取り消し・やり直し、履歴に残さない変更（外からの変更の取り込み、
+// 欄を守る決まりを当てる表示か：編集の表示で、編集できるノート（読み取り専用でない）。
+// ソースの表示では欄も文字のまま見えていて、本人がそのまま直せるので守らない（英字の「---x」も日本語の「---あ」もそのまま入る）。
+// 大きいノートはソースの表示でしか開けない（server/notes.mjs の sourceOnly）。
+// 止める決まり（guarded）、変換の記録（composeRecord）、変換のあとの取り消し（frontmatterRepair）で同じ条件を使う。
+function guardsFrontmatter(state) {
+  return state.field(previewField, false)?.mode === 'live' && !state.readOnly
+}
+
+// 欄を守る決まりを当てる変更か。編集の表示の編集できるノートで、本人の操作から来たもの（取り消し・やり直し、履歴に残さない変更（外からの変更の取り込み、
 // 下の取り消しなど）、ソースの表示は除く）。
 function guarded(tr) {
   if (!tr.docChanged) return false
   if (tr.isUserEvent('undo') || tr.isUserEvent('redo') || tr.annotation(Transaction.addToHistory) === false) return false
-  return tr.startState.field(previewField, false)?.mode === 'live'
+  return guardsFrontmatter(tr.startState)
 }
 
 // 日本語の変換中の変更か。変換中の変更は止めない。止めると、エディターの「変換中」の状態が戻らなくなり、自動保存が止まり続けるため
 // （画面の文字とエディターの中身が食い違ったまま、変換の終わりが届かない）。変換が終わってから frontmatterRepair で取り消す。
+// 止めないのは、変換中の印が付いている間の変更すべて。あとで取り消すのは、そのうち変換の変更（input.type.compose）だけ（composeRecord）。
 function composingChange(tr) {
   return tr.startState.field(previewField, false)?.composing === true || tr.isUserEvent('input.type.compose')
 }
@@ -206,30 +215,39 @@ const frontmatterFilter = EditorState.transactionFilter.of((tr) => {
 
 // 日本語の変換が始まってから終わるまでの変更を覚えておく。変換が終わったときに、その変更が欄を壊していたら取り消すため（frontmatterRepair）。
 // 値：null か { start（変換が始まる前の状態）, changes（それからの変更をまとめたもの。まだなければ null）}。欄のないノートでは覚えない。
-// 変換が終わった（setComposing(false)）、取り消した、変換と関係のない変更が入った（外からの変更の取り込みなど）ときは忘れる。
+// 覚えるのは、欄を守る表示（編集の表示の編集できるノート。guardsFrontmatter）の間だけ。ソースの表示や読み取り専用では覚えず、
+// 変換中に編集の表示からソースの表示へ切り替えたら忘れる（ソースの表示で確定した文字は取り消さない）。ソースの表示から編集の表示へ
+// 切り替えたときは、切り替えたあとの変換の変更から覚える。
+// 覚えるのは変換の変更（input.type.compose）だけ。変換中の印が付いている間でも、それ以外の変更（チェックボックスの切り替え、
+// 表のマスや欄の書き戻し、外からの変更の取り込みなど）が入ったら、それまでの記録を忘れる。その時点までの変換は取り消さない
+// （変換と関係のない変更まで、まとめて取り消さないため）。そのあとの変換の変更は、その時点から新しく覚える。
+// 変換が終わった（setComposing(false)）、取り消したときも忘れる。
 const repairMark = Annotation.define()
 const composeRecord = StateField.define({
   create: () => null,
   update(value, tr) {
     if (tr.annotation(repairMark)) return null
+    if (!guardsFrontmatter(tr.state)) return null
     for (const effect of tr.effects) {
       if (!effect.is(setComposing)) continue
       if (effect.value !== true) return null
       if (!value && frontmatterEnd(tr.state.doc) !== null) return { start: tr.state, changes: null }
     }
     if (!tr.docChanged) return value
-    if (!composingChange(tr)) return null
-    if (!value) return frontmatterEnd(tr.startState.doc) === null ? null : { start: tr.startState, changes: tr.changes }
+    if (!tr.isUserEvent('input.type.compose')) return null
+    if (!value) return frontmatterEnd(tr.startState.doc) === null || !guardsFrontmatter(tr.startState) ? null : { start: tr.startState, changes: tr.changes }
     return { start: value.start, changes: value.changes ? value.changes.compose(tr.changes) : tr.changes }
   },
 })
 
 // 日本語の変換が終わったときに、変換で入った変更がノートの情報の欄を壊していたら、その変更を取り消す変更（なければ null）。
 // main.mjs の compositionend（と変換中に本文からフォーカスが外れたとき）で、setComposing(false) と同じ変更として使う。
+// 取り消すのは、欄を守る表示（編集の表示の編集できるノート）で覚えた変換だけ。ソースの表示では何もしない（composeRecord も覚えない）。
 // - 欄だけのノートで閉じの --- のすぐあとに打ったときは、取り消さずに改行を1つ足して次の行に入れる（ふつうの入力と同じ）。
 // - それ以外は、変換で入った変更を取り消して、カーソルを本文の最初の行（開いたときと同じ位置）に置く。
 // 取り消しの履歴には残さない。Cmd+Z で壊れた文字が戻らないように（履歴の変換の分は、この取り消しで消えた所に当たるので何も戻さない）。
 export function frontmatterRepair(state) {
+  if (!guardsFrontmatter(state)) return null
   const record = state.field(composeRecord, false)
   if (!record?.changes) return null
   const startDoc = record.start.doc

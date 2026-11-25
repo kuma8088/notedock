@@ -611,6 +611,74 @@ test('日本語の変換の記録は、変換と関係のない変更が入っ�
   assert.equal(frontmatterRepair(state), null)
 })
 
+// ソースの表示で閉じの --- の行末に日本語を確定すると、その文字が消えていた（再レビューの指摘。英字の「---x」はそのまま入る）。
+// 変換の記録と取り消しは、止める決まりと同じく、編集の表示の編集できるノートのときだけ。
+test('日本語の変換：ソースの表示と読み取り専用では、欄を壊す所で確定しても取り消さない（英字と同じ）', () => {
+  const end = TASK.indexOf('---\nT') + 3
+  const broken = TASK.replace('---\nT', '---あ\nT')
+  const source = composeEditor(TASK, end).update({ effects: setMode.of('source') }).state
+  // 英字はそのまま入る。
+  assert.equal(source.update({ changes: { from: end, insert: 'x' }, userEvent: 'input.type' }).state.doc.toString(), TASK.replace('---\nT', '---x\nT'))
+  // 日本語も同じ（変換が終わっても取り消さない）。
+  let state = source.update({ effects: setComposing.of(true) }).state
+  state = state.update({ changes: { from: end, insert: 'あ' }, selection: { anchor: end + 1 }, userEvent: 'input.type.compose' }).state
+  assert.equal(frontmatterRepair(state), null)
+  assert.equal(compose(source, [{ changes: { from: end, insert: 'あ' }, selection: { anchor: end + 1 } }]).doc.toString(), broken)
+  // 読み取り専用（編集できないノート）でも覚えない。
+  const locked = EditorState.create({ doc: TASK, selection: { anchor: end }, extensions: [noteMarkdown(), noteContext.of({ path: 'a.md', known: new Set() }), previewField, frontmatterGuard, history(), EditorState.readOnly.of(true)] })
+  assert.equal(compose(locked, [{ changes: { from: end, insert: 'あ' } }]).doc.toString(), broken)
+  // 編集の表示では、今までどおり取り消す。
+  assert.equal(compose(composeEditor(TASK, end), [{ changes: { from: end, insert: 'あ' }, selection: { anchor: end + 1 } }]).doc.toString(), TASK)
+})
+
+test('日本語の変換：変換中に表示を切り替えたとき（ソースへ切り替えたら取り消さない、同じ表示の知らせでは忘れない）', () => {
+  const end = TASK.indexOf('---\nT') + 3
+  const broken = TASK.replace('---\nT', '---あ\nT')
+  const start = (state) => state.update({ effects: setComposing.of(true) }).state.update({ changes: { from: end, insert: 'あ' }, selection: { anchor: end + 1 }, userEvent: 'input.type.compose' }).state
+  const finish = (state) => state.update({ ...(frontmatterRepair(state) ?? {}), effects: setComposing.of(false) }).state
+  // 編集の表示で変換を始めて、ソースの表示に切り替えてから確定：ソースの表示で確定した文字なので残す。
+  assert.equal(finish(start(composeEditor(TASK, end)).update({ effects: setMode.of('source') }).state).doc.toString(), broken)
+  // ソースへ切り替えて編集の表示へ戻っても、切り替える前の記録は使わない（ソースの表示の間に入った分を取り消さない）。
+  const back = start(composeEditor(TASK, end)).update({ effects: setMode.of('source') }).state.update({ effects: setMode.of('live') }).state
+  assert.equal(finish(back).doc.toString(), broken)
+  // ソースの表示で変換を始めて、編集の表示に切り替えたあとに確定：切り替えた時点で欄はもう壊れているので、取り消さない。
+  let state = start(composeEditor(TASK, end).update({ effects: setMode.of('source') }).state).update({ effects: setMode.of('live') }).state
+  state = state.update({ changes: { from: end, to: end + 1, insert: '亜' }, selection: { anchor: end + 1 }, userEvent: 'input.type.compose' }).state
+  assert.equal(finish(state).doc.toString(), TASK.replace('---\nT', '---亜\nT'))
+  // 表示が変わらない知らせ（配色の切り替えで同じ表示を送り直すなど）では忘れない。今までどおり取り消す。
+  assert.equal(finish(start(composeEditor(TASK, end)).update({ effects: setMode.of('live') }).state).doc.toString(), TASK)
+})
+
+// 変換中の印が付いている間に入った、日本語以外の変更まで記録されて、変換と一緒に取り消されていた（再レビューの指摘）。
+test('日本語の変換：変換中の印があっても、変換以外の変更が入ったら記録を忘れる（その変更も、それまでの変換も取り消さない）', () => {
+  const end = TASK.indexOf('---\nT') + 3
+  const finish = (state) => state.update({ ...(frontmatterRepair(state) ?? {}), effects: setComposing.of(false) }).state
+  const begin = (doc, anchor) => composeEditor(doc, anchor).update({ effects: setComposing.of(true) }).state
+  const ime = (state, from, text, to = from) => state.update({ changes: { from, to, insert: text }, selection: { anchor: from + text.length }, userEvent: 'input.type.compose' }).state
+  // 外からの変更の取り込み（履歴に残さない変更）。rv6 の probe の A と同じ順。
+  let state = ime(begin(TASK, end), end, 'あ')
+  state = state.update({ changes: { from: state.doc.length, insert: 'EXTERNAL\n' }, annotations: Transaction.addToHistory.of(false) }).state
+  assert.equal(frontmatterRepair(state), null)
+  assert.equal(finish(state).doc.toString(), TASK.replace('---\nT', '---あ\nT') + 'EXTERNAL\n')
+  // チェックボックスの切り替え（widgets.mjs。userEvent を付けない変更）。切り替えた [x] は残る。
+  const withBox = TASK + '- [ ] a\n'
+  // チェックボックスと同じ、[ ] の中の1文字を書き換える変更（位置は今の中身から探す）。
+  const toggle = (state) => { const box = state.doc.toString().indexOf('[ ]'); return state.update({ changes: { from: box + 1, to: box + 2, insert: 'x' } }).state }
+  state = ime(begin(withBox, end), end, 'あ')
+  state = toggle(state)
+  assert.equal(finish(state).doc.toString(), withBox.replace('---\nT', '---あ\nT').replace('- [ ] a', '- [x] a'))
+  // 表のマスや欄の書き戻し（userEvent を付けない、履歴に残る変更）も同じ。本文で変換した文字も残る。
+  const at = withBox.indexOf('\nT\n') + 2
+  state = ime(begin(withBox, at), at, 'か')
+  state = toggle(state)
+  assert.equal(finish(state).doc.toString(), withBox.replace('\nT\n', '\nTか\n').replace('- [ ] a', '- [x] a'))
+  // 忘れたあとの変換の変更は、その時点から新しく覚える：あとで欄を壊した変換だけを取り消し、ほかの変更は残す。
+  state = ime(begin(withBox, at), at, 'か')
+  state = toggle(state)
+  state = ime(state.update({ selection: { anchor: end } }).state, end, 'あ')
+  assert.equal(finish(state).doc.toString(), withBox.replace('\nT\n', '\nTか\n').replace('- [ ] a', '- [x] a'))
+})
+
 test('frontmatterDamage：止める決まりと、変換のあとの取り消しで同じ見分け方', () => {
   const doc = (text) => EditorState.create({ doc: text }).doc
   const check = (text, spec) => {
