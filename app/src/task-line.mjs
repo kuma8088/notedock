@@ -201,14 +201,24 @@ export function weekDue(name, range) {
 
 // 行の親にあたる箇条書きを、近いものから順に返す（何段上でも）。見出し・区切り線・先頭のプロパティ・引用の深さが違う行で止まる。
 // 箇条書きでない行（注記の ※ … など）は飛ばして続ける。
+// 項目の下に字下げして書いた引用の中の行（「- [[2026-W10]]」の次の「  > - 目標」）は、引用の外の、引用の &gt; より浅い
+// 字下げの箇条書きも親にする（lezer も、字下げした引用をその項目の中身として読む）。字下げのない引用（「> - 目標」）は今までどおり止まる。
 export function ancestorsOf(rows, index) {
   const self = rows[index]
   const out = []
   let limit = self.indent
-  for (let i = index - 1; i >= 0 && limit > 0; i--) {
+  let quote = self.quote
+  // 引用の最初の &gt; の前の字下げの幅。引用の外へ出たら、これを limit にする。
+  const outer = quote > 0 ? widthOf(/^[\t ]*/.exec(self.text)[0]) : 0
+  for (let i = index - 1; i >= 0 && (limit > 0 || (quote > 0 && outer > 0)); i--) {
     const row = rows[i]
     if (row.kind === 'blank' || row.kind === 'code') continue
-    if (row.kind === 'heading' || row.kind === 'rule' || row.kind === 'front' || row.quote !== self.quote) break
+    if (row.kind === 'heading' || row.kind === 'rule' || row.kind === 'front') break
+    if (row.quote !== quote) {
+      if (!(quote > 0 && outer > 0 && row.quote === 0)) break
+      quote = 0
+      limit = outer
+    }
     if (row.indent >= limit || row.kind !== 'list') continue
     out.push(row)
     limit = row.indent

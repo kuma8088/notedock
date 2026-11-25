@@ -351,6 +351,38 @@ test('行の種類の読み分け', () => {
   assert.deepEqual(ancestorsOf(analyzeLines('- [[2026-W10]]\n## 見出し\n\t- x'), 2), [])
 })
 
+test('期日：項目の下に字下げして書いた引用の中の行も、引用の外の親の週のリンクを使う', () => {
+  const path = '90_Periodic/2026/Monthly/2026-03.md'
+  const text = [
+    '- [[2026-W10]] (3/2-3/8)',
+    '  > - [ ] 引用の中の目標',
+    '  >   - [ ] 引用の中の子',
+    '\t> - [ ] タブの字下げの引用',
+    '- [[2026-W11]] (3/9-3/15)',
+    '  > メモ',
+    '  >',
+    '  > - [ ] 引用の中で間に行がある',
+    '- 週のない項目',
+    '  > - [ ] 引用の外の親に週のリンクがない',
+    '> - [ ] 字下げのない引用',
+    '',
+    '- [[2026-W12]] (3/16-3/22)',
+    '    > - [ ] 引用の外の親より4つ深い',
+  ].join('\n')
+  const due = (needle) => at(path, text, needle).due
+  assert.equal(due('引用の中の目標'), '2026-03-08')
+  assert.equal(due('引用の中の子'), '2026-03-08')
+  assert.equal(due('タブの字下げの引用'), '2026-03-08')
+  assert.equal(due('引用の中で間に行がある'), '2026-03-15')
+  assert.equal(due('引用の外の親に週のリンクがない'), '2026-03-31')
+  // 字下げのない引用は、前の項目の中身ではない（今までどおり、ノートの期間の最終日）
+  assert.equal(due('字下げのない引用'), '2026-03-31')
+  assert.equal(due('引用の外の親より4つ深い'), '2026-03-22')
+  const rows = analyzeLines(text)
+  assert.deepEqual(ancestorsOf(rows, 2).map((row) => row.body), ['引用の中の目標', '[[2026-W10]] (3/2-3/8)'])
+  assert.deepEqual(ancestorsOf(rows, 10), [])
+})
+
 test('目標の文の取り出し', () => {
   assert.equal(goalTextOf('> - [ ] **太字** [[リンク]] 🎨 ¥1,000 6/4 公開。'), '**太字** [[リンク]] 🎨 ¥1,000 6/4 公開。')
   assert.equal(goalTextOf('\t\t- [x] 済んだ'), '済んだ')
