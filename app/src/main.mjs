@@ -36,7 +36,7 @@ import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { editableExtensions, endQuietAfterClick, pasteOpensNote, pastePlace } from './modes.mjs'
+import { editableExtensions, endQuietAfterClick, focusEndsQuiet, pasteOpensNote, pastePlace, refocusesBody } from './modes.mjs'
 import { cursorQuiet, keyEndsQuiet, noteContext, noteMode, previewField, setComposing, setCursorQuiet, setMode, setNoteBusy, togglePropsPanel, typingStart } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
@@ -802,7 +802,28 @@ const quietEnders = EditorView.domEventObservers({
   keydown(event, target) {
     if (cursorQuiet(target.state) && keyEndsQuiet(event)) target.dispatch({ effects: setCursorQuiet.of(false) })
   },
+  // マウスで押した以外の方法で本文にフォーカスが入ったら（Tab、新しく作ったノート、「編集」「ソース」のボタンのあとなど）、印を外す。
+  // 印があるとカーソルの行の記号が隠れたままなので、打った文字やEnter・Backspaceが、見た目と違う所に効く（見出しの # が消えるなど）。
+  // マウスで押したときは、押した位置にカーソルが動いてから外す（上の mousedown）。先に外すと、押した位置がずれる。
+  focus(event, target) {
+    if (focusEndsQuiet({ quiet: cursorQuiet(target.state), pressing: pressingEditor })) target.dispatch({ effects: setCursorQuiet.of(false) })
+  },
 })
+
+// エディターの中をマウスや指で押している最中か。押したときのフォーカスは、押した位置が決まる前に入るので、上の focus で印を外さない。
+// フォーカスは押したのと同じ流れの中で入るので、次の処理の順番が来たら戻す。
+let pressingEditor = false
+document.addEventListener(
+  'pointerdown',
+  (event) => {
+    if (!$('editor')?.contains(event.target)) return
+    pressingEditor = true
+    setTimeout(() => {
+      pressingEditor = false
+    }, 0)
+  },
+  true,
+)
 
 async function uploadImage(file, target) {
   const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg').replace('svg+xml', 'svg') ?? 'png'
@@ -2022,7 +2043,9 @@ function commitOpenField() {
 
 let openRequest = 0
 
-async function openNote(path, { push = true, anchor = '', startMode = 'live' } = {}) {
+// focus：新しく作ったノートのときだけ true。本文にフォーカスを入れて、すぐ打てるようにする。
+// 既にあるノートは入れない。開いた直後のキーが本文に届くと、隠れた記号の前後で打った文字が見た目と違う所に入るため（見出しの # が消えるなど）。
+async function openNote(path, { push = true, anchor = '', startMode = 'live', focus = false } = {}) {
   openRequest += 1
   const thisRequest = openRequest
   let note
@@ -2033,7 +2056,7 @@ async function openNote(path, { push = true, anchor = '', startMode = 'live' } =
       const created = await request(noteUrl(path), { method: 'POST', body: JSON.stringify({ text: '' }) })
       if (created.ok) {
         await refreshNotes()
-        return openNote(path, { push, anchor, startMode: 'live' })
+        return openNote(path, { push, anchor, startMode: 'live', focus: true })
       }
       showMessage('このノートは作れません。')
       return
@@ -2073,7 +2096,7 @@ async function openNote(path, { push = true, anchor = '', startMode = 'live' } =
   openRound += 1
   if (view) view.setState(state)
   else view = new EditorView({ state, parent: $('editor') })
-  // 開いた直後は、カーソルが先頭にあっても記号を出さない（本人がクリックするかキーを押すまで）。
+  // 開いた直後は、カーソルが先頭にあっても記号を出さない（本人が本文をクリックするまで。マウス以外で本文にフォーカスが入ったときも外す）。
   view.dispatch({ effects: setCursorQuiet.of(true) })
   applyMode(nextMode)
   // タスクのノートは、開いたらすぐステータスや期日を直せるように、プロパティ欄を開いておく。
@@ -2119,7 +2142,10 @@ async function openNote(path, { push = true, anchor = '', startMode = 'live' } =
   jumpToAnchor(anchor)
   sendState()
   if (PANE === 'right') postOpened()
-  view.focus()
+  // 既にあるノートでは、本文をクリックしてから書き始める。view は使い回すので、前のノートで本文（や表のマスなど）にフォーカスがあると、
+  // そのまま残って開いた直後のキーが届く。残っていたら外す（リンクを押したとき、「探す」を閉じたとき、戻るボタンなど）。
+  if (focus) view.focus()
+  else if ($('editor').contains(document.activeElement)) document.activeElement.blur()
   if (restored && saver.isStopped() !== 'conflict') {
     showMessage('前回保存できなかった入力を戻して保存します。いらないときは、右上の「履歴」から前の内容に戻せます。')
   }
@@ -2176,16 +2202,16 @@ function openHref(href, newTab) {
 }
 
 // 左右どちらかの枠でノートを開く。右に開くときは、分けていなければ先に分ける。
-async function openIn(pane, path, { anchor = '', startMode = 'live' } = {}) {
+async function openIn(pane, path, { anchor = '', startMode = 'live', focus = false } = {}) {
   // 狭い画面では分けないので、左で開く。
-  if (pane !== 'right' || !split || isNarrow()) return openNote(path, { anchor, startMode })
+  if (pane !== 'right' || !split || isNarrow()) return openNote(path, { anchor, startMode, focus })
   if (!split.isOpen()) {
     // 右の枠の準備ができたら開いてもらう（READY のところで送る）。
-    rightWant = { path, anchor, startMode }
+    rightWant = { path, anchor, startMode, focus }
     await openSplit()
     return undefined
   }
-  split.post({ type: MSG.OPEN, path, anchor, startMode })
+  split.post({ type: MSG.OPEN, path, anchor, startMode, focus })
   return undefined
 }
 
@@ -2682,7 +2708,8 @@ async function openPeriodicNote(period, date, { ask = false, from = 'sidebar', m
     if (!result.ok) return refuse(result)
     const { path, created } = result.data
     if (created) await refreshNotes()
-    await openIn(targetPane({ meta, from, active: activePane() }), path)
+    // 今作ったノートだけ、すぐ打てるように本文にフォーカスを入れる。
+    await openIn(targetPane({ meta, from, active: activePane() }), path, { focus: created === true })
     drawCalendar()
   } catch {
     showMessage('このノートは作れません。')
@@ -3335,7 +3362,7 @@ async function createTaskFromSide() {
   }
   await refreshNotes()
   tasksSaved()
-  await openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), created.data.path)
+  await openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), created.data.path, { focus: true })
   closeSideIfNarrow()
 }
 
@@ -3689,7 +3716,8 @@ async function createFromSwitcher(path) {
   }
   storage.set(recentPlacesKey(), rememberPlace(storage.get(recentPlacesKey(), []), dirOf(path)))
   await refreshNotes()
-  openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), path)
+  // 409 は、同じ名前のノートが既にあったとき。そのときは既にあるノートとして開く（フォーカスを入れない）。
+  openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), path, { focus: created.ok })
 }
 
 function moveSwitcher(delta) {
@@ -3741,10 +3769,11 @@ function bindChrome() {
     $('history').close()
   })
   for (const button of $('modes').querySelectorAll('button')) {
-    // 切り替えたあとは、本文にフォーカスを戻す。ボタンに残ると、そのあとの Cmd+V が、貼り付けでなくノートを開く操作になる。
-    button.addEventListener('click', () => {
+    // 本文をクリックしたあとにマウスで押したときは、切り替えたあと本文にフォーカスを戻す。ボタンに残ると、そのあとの Cmd+V が、貼り付けでなくノートを開く操作になる。
+    // キーボード（Enter・Space）で押したときと、開いてからまだ本文をクリックしていないときは、戻さない（modes.mjs の refocusesBody）。
+    button.addEventListener('click', (event) => {
       applyMode(button.dataset.mode)
-      if (currentPath) view?.focus()
+      if (currentPath && view && refocusesBody(event, { quiet: cursorQuiet(view.state) })) view.focus()
     })
   }
   // 書式の付いたリンクは、マウスを押した時点で開く。離す前にカーソルが入ると表示が変わるため。
@@ -4007,7 +4036,7 @@ async function receiveFromLeft(data) {
         drafts.remove(oldPath)
       }
     }
-    await openNote(data.path, { push: false, anchor: data.anchor, startMode: data.startMode })
+    await openNote(data.path, { push: false, anchor: data.anchor, startMode: data.startMode, focus: data.focus === true })
   } else if (data.type === MSG.ACTIVE) {
     paneActive = Boolean(data.active)
     if (paneActive) {

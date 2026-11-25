@@ -6,7 +6,7 @@ import { EditorSelection, EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 
 import { noteMarkdown } from '../src/markdown-ext.mjs'
-import { editableExtensions, endQuietAfterClick, pasteOpensNote, pastePlace } from '../src/modes.mjs'
+import { editableExtensions, endQuietAfterClick, focusEndsQuiet, pasteOpensNote, pastePlace, refocusesBody } from '../src/modes.mjs'
 import { cursorQuiet, hiddenRanges, keyEndsQuiet, noteContext, previewField, quietAfter, setComposing, setCursorQuiet, setMode, togglePropsPanel, typingStart } from '../src/preview.mjs'
 import { WikiLinkWidget } from '../src/widgets.mjs'
 
@@ -230,4 +230,47 @@ test('クリックのあとで印を外す処理は、その間に別のノー�
   pending.shift()()
   assert.equal(cursorQuiet(reused.state), true)
   assert.deepEqual(hiddenRanges(reused.state), ['# '])
+})
+
+test('本文にフォーカスが入ったときは、マウスで押している最中でなければ、開いた直後の印を外す', () => {
+  // Tab で入ったとき、新しく作ったノートでフォーカスを入れたとき、「編集」「ソース」のボタンのあと：外す。
+  assert.equal(focusEndsQuiet({ quiet: true, pressing: false }), true)
+  // エディターを押した最中のフォーカス：押した位置が決まってから外すので、ここでは外さない。
+  assert.equal(focusEndsQuiet({ quiet: true, pressing: true }), false)
+  // 印がもうないとき：何もしない。
+  assert.equal(focusEndsQuiet({ quiet: false, pressing: false }), false)
+  assert.equal(focusEndsQuiet(), false)
+})
+
+test('「編集」「ソース」のボタンは、本文をクリックしたあとにマウスで押したときだけ本文にフォーカスを戻す', () => {
+  assert.equal(refocusesBody({ detail: 1 }), true)
+  assert.equal(refocusesBody({ detail: 2 }), true)
+  // Enter・Space で押した click は detail が 0。
+  assert.equal(refocusesBody({ detail: 0 }), false)
+  assert.equal(refocusesBody(undefined), false)
+  // 開いてからまだ本文をクリックしていない（印が残っている）ときは、マウスで押しても戻さない。
+  assert.equal(refocusesBody({ detail: 1 }, { quiet: true }), false)
+  assert.equal(refocusesBody({ detail: 1 }, { quiet: false }), true)
+})
+
+// 既にあるノートは、開いても本文にフォーカスを入れない（2026-11-25）。開いた直後のキーが本文に届くと、
+// 隠れた記号の前後で打った文字が見た目と違う所に入る（見出しで Backspace を押すと # のあとの空白が消えてタグになる、など）。
+// 新しく作ったノートだけ、すぐ打てるようにフォーカスを入れる。画面の処理（main.mjs）の書き方で確かめる。
+test('ノートを開いたときに本文にフォーカスを入れるのは、新しく作ったノートだけ', () => {
+  const main = fs.readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8')
+  const body = main.slice(main.indexOf('async function openNote('), main.indexOf('function pushNoteUrl('))
+  // 決まりがないときは入れない。
+  assert.match(body, /startMode = 'live', focus = false \} = \{\}\) \{/)
+  // 入れるのは focus のときだけ。前のノートから残ったフォーカスは外す。
+  assert.match(body, /if \(focus\) view\.focus\(\)\n\s*else if \(\$\('editor'\)\.contains\(document\.activeElement\)\) document\.activeElement\.blur\(\)/)
+  assert.equal((body.match(/view\.focus\(\)/g) ?? []).length, 1)
+  // まだないノートを作ってから開くとき。
+  assert.match(body, /return openNote\(path, \{ push, anchor, startMode: 'live', focus: true \}\)/)
+  // 日付のノート（今作ったときだけ）、「新しいノート」（409 の既にあるノートは除く）、「新しいタスク」。
+  assert.match(main, /path, \{ focus: created === true \}\)/)
+  assert.match(main, /path, \{ focus: created\.ok \}\)/)
+  assert.match(main, /created\.data\.path, \{ focus: true \}\)/)
+  // 右の枠へは、左から届いた focus が true のときだけ。
+  assert.match(main, /focus: data\.focus === true/)
+  assert.match(main, /split\.post\(\{ type: MSG\.OPEN, path, anchor, startMode, focus \}\)/)
 })
