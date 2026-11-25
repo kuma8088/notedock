@@ -1740,6 +1740,35 @@ body.chat-on #editor .cm-content { padding-bottom: 220px; }
   font-size: 12px;
 }
 
+/* 見出しの「直近 □ 日」。右端に寄せ、狭い幅でも言葉と欄を1つにまとめて折り返す。 */
+.task-soon {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  margin-left: auto;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.task-soon-input {
+  width: 3.4em;
+  padding: 0 2px 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: right;
+}
+
+.task-soon-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .task-panel-note {
   flex-basis: 100%;
   color: var(--warn-text);

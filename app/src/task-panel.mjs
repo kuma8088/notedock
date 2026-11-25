@@ -1,5 +1,18 @@
 // デイリーノートの上に出すタスクのパネル（読み取りだけ）。区分けは task-buckets.mjs、ここは描くだけ。
-import { TASK_SECTIONS, TASK_SECTION_LABELS, bucketTasks, dueView, sectionOpenState, statusView, taskLabel } from './task-buckets.mjs'
+import {
+  TASK_SECTIONS,
+  TASK_SECTION_LABELS,
+  TASK_SOON_DAYS,
+  TASK_SOON_DAYS_MAX,
+  TASK_SOON_DAYS_MIN,
+  bucketTasks,
+  dueView,
+  isSoonDays,
+  sectionOpenState,
+  soonDaysOf,
+  statusView,
+  taskLabel,
+} from './task-buckets.mjs'
 
 const el = (tag, className, text) => {
   const node = document.createElement(tag)
@@ -12,10 +25,18 @@ const shortDate = (date) => `${Number(date.slice(5, 7))}/${Number(date.slice(8, 
 
 // box: パネルの要素。store: { get(key, fallback), set(key, value) }。keyOf(name): 覚える名前（Vault ごと）。
 // onOpen(path, event): タスクの名前をクリックしたとき。
-export function createTaskPanel({ box, store, keyOf, onOpen }) {
+// onSoonDays(days): 見出しの「直近 □ 日」を変えたとき。保存できたら true を返す（できなければ元の日数に戻す）。
+export function createTaskPanel({ box, store, keyOf, onOpen, onSoonDays }) {
   let last = null
   // 問い合わせの番号。あとから頼んだものがあれば、前の返事は捨てる。
   let request = 0
+  // 「直近」の日数。一覧の返事に添えて届く（届くまでは3）。隠しても覚えておく。
+  let soonDays = TASK_SOON_DAYS
+  // 日数を変えた回数と、保存を待っている数。保存の前に頼んだ一覧の返事は古い日数を持っているので、その日数は使わない。
+  let soonEdit = 0
+  let soonSaving = 0
+  // 日数の欄の下に出す知らせ（入れた数が使えない・保存できなかった）。次に日数を変えるまで出す。
+  let soonNote = ''
 
   const panelOpen = () => store.get(keyOf('task-panel-open'), true) !== false
   const sections = () => sectionOpenState(store.get(keyOf('task-sections'), null))
@@ -44,11 +65,73 @@ export function createTaskPanel({ box, store, keyOf, onOpen }) {
     return li
   }
 
+  // 見出しの「直近 □ 日」の欄。変えたら（Enter・欄の外へ出る・上下の矢印）すぐ区分けし直して、保存を頼む。
+  function soonField() {
+    const label = el('label', 'task-soon')
+    const input = el('input', 'task-soon-input')
+    input.type = 'number'
+    input.min = String(TASK_SOON_DAYS_MIN)
+    input.max = String(TASK_SOON_DAYS_MAX)
+    input.step = '1'
+    input.inputMode = 'numeric'
+    input.value = String(soonDays)
+    input.dataset.shown = input.value
+    input.title = `期日がこの日から何日先までのタスクを「直近」に出すか（${TASK_SOON_DAYS_MIN}〜${TASK_SOON_DAYS_MAX}日）`
+    input.setAttribute('aria-label', '直近に出す日数')
+    input.dataset.key = 'soon-days'
+    input.addEventListener('change', () => changeSoon(input))
+    label.append(el('span', 'task-soon-word', '直近'), input, el('span', 'task-soon-word', '日'))
+    return label
+  }
+
+  async function changeSoon(input) {
+    const raw = String(input.value ?? '').trim()
+    const value = raw === '' ? NaN : Number(raw)
+    if (!isSoonDays(value)) {
+      soonNote = `直近の日数は、${TASK_SOON_DAYS_MIN}から${TASK_SOON_DAYS_MAX}までの数で入れてください`
+      draw('soon-days')
+      return
+    }
+    if (value === soonDays) {
+      if (soonNote) {
+        soonNote = ''
+        draw('soon-days')
+      }
+      return
+    }
+    const before = soonDays
+    soonDays = value
+    soonNote = ''
+    const mine = ++soonEdit
+    soonSaving++
+    draw('soon-days')
+    let ok = false
+    try {
+      ok = (await onSoonDays?.(value)) === true
+    } catch {
+      ok = false
+    } finally {
+      soonSaving--
+    }
+    // あとから別の日数に変えていれば、そちらの結果に任せる。
+    if (ok || mine !== soonEdit) return
+    soonDays = before
+    soonNote = '日数を保存できませんでした。元の日数に戻しました'
+    draw(isFocused(box.querySelector('[data-key="soon-days"]')) ? 'soon-days' : null)
+  }
+
+  const isFocused = (node) => Boolean(node) && typeof document !== 'undefined' && document.activeElement === node
+
   // focusKey: 押したボタンを描き直したあとも、キーで続けて操作できるようにフォーカスを戻す。
+  // 日数の欄に打っている途中に描き直すとき（60秒ごとの読み直しなど）は、打った数とフォーカスを残す。
   function draw(focusKey = null) {
     if (!last) return
     const { tasks, date, truncated } = last
-    const buckets = bucketTasks(tasks, date)
+    // 打っている途中＝フォーカスがあり、描いたときの数から変えてまだ確定していない。
+    const oldField = box.querySelector('[data-key="soon-days"]')
+    const keepFocus = focusKey === null && isFocused(oldField)
+    const typing = keepFocus && oldField.value !== oldField.dataset.shown ? oldField.value : null
+    const buckets = bucketTasks(tasks, date, { soonDays })
     const open = panelOpen()
     const state = sections()
     const head = el('div', 'task-panel-head')
@@ -67,6 +150,8 @@ export function createTaskPanel({ box, store, keyOf, onOpen }) {
       const counts = ['soon', 'week', 'month', 'none'].map((key) => `${TASK_SECTION_LABELS[key].replace('のタスク', '')} ${buckets[key].length}`).join('・')
       head.append(el('span', 'task-panel-summary', counts))
     }
+    head.append(soonField())
+    if (soonNote) head.append(el('span', 'task-panel-note task-soon-note', soonNote))
     const parts = [head]
     if (open) {
       const body = el('div', 'task-panel-body')
@@ -102,12 +187,17 @@ export function createTaskPanel({ box, store, keyOf, onOpen }) {
     box.replaceChildren(inner)
     box.classList.toggle('task-panel-closed', !open)
     box.hidden = false
-    if (focusKey) box.querySelector(`[data-key="${focusKey}"]`)?.focus()
+    if (keepFocus) {
+      const input = box.querySelector('[data-key="soon-days"]')
+      if (typing !== null) input.value = typing
+      input.focus()
+    } else if (focusKey) box.querySelector(`[data-key="${focusKey}"]`)?.focus()
   }
 
   // tasks: サーバーの一覧。date: 開いているデイリーノートの日付。truncated: 一覧が途中までか。
-  // タスクのノートが1つもなければ出さない。
-  function show({ tasks, date, truncated = false }) {
+  // soonDays: 「直近」の日数（なければ今の日数のまま。使えない値なら3）。タスクのノートが1つもなければ出さない。
+  function show({ tasks, date, truncated = false, soonDays: days }) {
+    if (days !== undefined) soonDays = soonDaysOf(days)
     if (!Array.isArray(tasks) || tasks.length === 0) return hide()
     last = { tasks, date, truncated: truncated === true }
     draw()
@@ -122,6 +212,7 @@ export function createTaskPanel({ box, store, keyOf, onOpen }) {
       return 'hidden'
     }
     const mine = ++request
+    const editAtStart = soonEdit
     // 別のデイリーノートへ移ったときは、まず手元の一覧でその日から数え直して出す。
     if (last && last.date !== date) show({ ...last, date })
     let data
@@ -132,9 +223,11 @@ export function createTaskPanel({ box, store, keyOf, onOpen }) {
     }
     if (mine !== request || !isCurrent()) return 'stale'
     if (!data || !Array.isArray(data.tasks)) return 'failed'
-    show({ tasks: data.tasks, date, truncated: data.truncated })
+    // 日数を変えて保存を待っている間と、変える前に頼んだ返事の日数は使わない（変えたばかりの日数が戻って見えないように）。
+    const fresh = soonSaving === 0 && soonEdit === editAtStart
+    show({ tasks: data.tasks, date, truncated: data.truncated, soonDays: fresh ? data.soonDays : undefined })
     return 'shown'
   }
 
-  return { show, hide, refresh, shown: () => last !== null, last: () => last }
+  return { show, hide, refresh, shown: () => last !== null, last: () => last, soonDays: () => soonDays }
 }

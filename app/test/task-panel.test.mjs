@@ -15,6 +15,7 @@ class FakeElement {
     this.listeners = {}
     this.text = ''
     this.focused = false
+    this.value = ''
   }
   get textContent() {
     return this.text + this.children.map((c) => c.textContent).join('')
@@ -59,6 +60,13 @@ class FakeElement {
   }
   focus() {
     this.focused = true
+    document.activeElement = this
+  }
+  fire(type) {
+    for (const fn of this.listeners[type] ?? []) fn({})
+  }
+  contains(node) {
+    return node === this || [...this.walk()].includes(node)
   }
   *walk() {
     for (const child of this.children) {
@@ -81,7 +89,7 @@ class FakeElement {
   }
 }
 
-globalThis.document = { createElement: (tag) => new FakeElement(tag) }
+globalThis.document = { createElement: (tag) => new FakeElement(tag), activeElement: null }
 
 function memoryStore() {
   const data = new Map()
@@ -100,6 +108,7 @@ let store
 let opened
 let panel
 beforeEach(() => {
+  document.activeElement = null
   box = new FakeElement('section')
   box.hidden = true
   store = memoryStore()
@@ -201,4 +210,128 @@ test('読み込みに失敗したら今の見た目のまま', async () => {
   panel.show({ tasks: TASKS, date: '2026-11-24' })
   assert.equal(await panel.refresh({ date: '2026-11-24', load: async () => { throw new Error('x') } }), 'failed')
   assert.equal(box.hidden, false)
+})
+
+// ---- 「直近」の日数の欄（段階1-F） ----
+
+const SOON = [task('3日後', { due: '2026-11-27' }), task('5日後', { due: '2026-11-29' }), task('6日後', { due: '2026-11-30' })]
+const soonNames = () => box.querySelector('.task-section-soon').querySelectorAll('.task-open').map((n) => n.textContent)
+const field = () => head('soon-days')
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+function panelWith(onSoonDays) {
+  return createTaskPanel({ box, store, keyOf: (name) => `${name}:v`, onOpen: () => {}, onSoonDays })
+}
+
+test('日数は一覧に添えて届いた値で区分ける。ない・使えないときは3', () => {
+  panel.show({ tasks: SOON, date: '2026-11-24' })
+  assert.equal(field().value, '3')
+  assert.deepEqual(soonNames(), ['3日後'])
+  panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 5 })
+  assert.equal(field().value, '5')
+  assert.deepEqual(soonNames(), ['3日後', '5日後'])
+  // 値を持たない返事では、今の日数のまま。
+  panel.show({ tasks: SOON, date: '2026-11-24' })
+  assert.deepEqual(soonNames(), ['3日後', '5日後'])
+  panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 99 })
+  assert.equal(field().value, '3')
+  assert.deepEqual(soonNames(), ['3日後'])
+})
+
+test('欄の数を変えると、すぐ区分けし直し、保存を頼み、欄にフォーカスを戻す', async () => {
+  const saved = []
+  panel = panelWith(async (days) => saved.push(days) > 0)
+  panel.show({ tasks: SOON, date: '2026-11-24' })
+  field().value = '6'
+  field().fire('change')
+  assert.deepEqual(soonNames(), ['3日後', '5日後', '6日後'])
+  assert.equal(field().value, '6')
+  assert.equal(field().focused, true)
+  await tick()
+  assert.deepEqual(saved, [6])
+  assert.equal(panel.soonDays(), 6)
+  assert.equal(box.querySelector('.task-soon-note'), null)
+  // 同じ数のままなら頼まない。
+  field().fire('change')
+  await tick()
+  assert.deepEqual(saved, [6])
+})
+
+test('保存できなければ元の日数に戻し、知らせを出す。パネルは消えない', async () => {
+  for (const fail of [async () => false, async () => { throw new Error('net') }]) {
+    box = new FakeElement('section')
+    panel = panelWith(fail)
+    panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 3 })
+    field().value = '5'
+    field().fire('change')
+    assert.deepEqual(soonNames(), ['3日後', '5日後'])
+    await tick()
+    assert.equal(field().value, '3')
+    assert.deepEqual(soonNames(), ['3日後'])
+    assert.equal(box.querySelector('.task-soon-note').textContent, '日数を保存できませんでした。元の日数に戻しました')
+    assert.equal(box.hidden, false)
+  }
+})
+
+test('使えない数（範囲の外・小数・空）は頼まずに元に戻し、知らせを出す', async () => {
+  const saved = []
+  panel = panelWith(async (days) => saved.push(days) > 0)
+  panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 4 })
+  for (const bad of ['32', '-1', '2.5', '', 'abc']) {
+    field().value = bad
+    field().fire('change')
+    assert.equal(field().value, '4', bad)
+    assert.match(box.querySelector('.task-soon-note').textContent, /0から31までの数で入れてください/)
+  }
+  await tick()
+  assert.deepEqual(saved, [])
+  // 使える数に直すと、知らせは消える。
+  field().value = '0'
+  field().fire('change')
+  assert.equal(box.querySelector('.task-soon-note'), null)
+  assert.deepEqual(soonNames(), [])
+})
+
+test('保存より前に頼んだ一覧の返事が遅れて来ても、変えた日数は戻らない', async () => {
+  let finishSave
+  panel = panelWith(() => new Promise((resolve) => { finishSave = resolve }))
+  panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 3 })
+  let answer
+  const pending = panel.refresh({ date: '2026-11-24', load: () => new Promise((resolve) => { answer = resolve }) })
+  field().value = '6'
+  field().fire('change')
+  answer({ tasks: SOON, soonDays: 3 })
+  assert.equal(await pending, 'shown')
+  assert.equal(field().value, '6')
+  finishSave(true)
+  await tick()
+  // 保存を待つ間に頼んだ返事も、日数は使わない。保存のあとに頼んだ返事は使う。
+  assert.equal(await panel.refresh({ date: '2026-11-24', load: async () => ({ tasks: SOON, soonDays: 6 }) }), 'shown')
+  assert.deepEqual(soonNames(), ['3日後', '5日後', '6日後'])
+  assert.equal(await panel.refresh({ date: '2026-11-24', load: async () => ({ tasks: SOON, soonDays: 2 }) }), 'shown')
+  assert.equal(field().value, '2')
+  // 確定したあとフォーカスが欄に残っていても、届いた日数を見せる（フォーカスはそのまま）。
+  assert.equal(field().focused, true)
+})
+
+test('欄に打っている途中に読み直しが来ても、打った数とフォーカスは残る', async () => {
+  panel = panelWith(async () => true)
+  panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 3 })
+  field().focus()
+  field().value = '1'
+  assert.equal(await panel.refresh({ date: '2026-11-24', load: async () => ({ tasks: SOON, soonDays: 3 }) }), 'shown')
+  assert.equal(field().value, '1')
+  assert.equal(field().focused, true)
+  assert.equal(document.activeElement, field())
+})
+
+test('パネルをたたんでも欄は出て、件数も日数で数える。欄は開閉のボタンの中にない', () => {
+  panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 6 })
+  head('panel').click()
+  assert.ok(field())
+  assert.equal(head('panel').querySelector('[data-key="soon-days"]'), null)
+  assert.match(box.querySelector('.task-panel-summary').textContent, /直近 3・/)
+  // 別の日のデイリーノートへ移っても、日数は残る。
+  panel.show({ ...panel.last(), date: '2026-11-25' })
+  assert.equal(field().value, '6')
 })

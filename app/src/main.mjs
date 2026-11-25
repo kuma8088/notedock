@@ -2829,6 +2829,14 @@ const taskPanel = createTaskPanel({
     if (newTab) return openIn(targetPane({ meta: true, from: 'left', active: activePane() }), path)
     return openNote(path)
   },
+  // 「直近」の日数を Vault の設定（settings.json）に保存する。保存できたら、反対の枠のパネルも読み直してもらう。
+  onSoonDays: async (days) => {
+    const result = await request('/api/settings', { method: 'PUT', body: JSON.stringify({ taskSoonDays: days }) })
+    if (!result.ok) return false
+    if (PANE === 'right') toLeft({ type: MSG.TASKS })
+    else if (split?.isOpen()) split.post({ type: MSG.TASKS })
+    return true
+  },
 })
 let taskPanelRequest = 0
 
