@@ -733,13 +733,13 @@ body[data-mode='source'] .cm-editor {
 
 /* 見出しの大きさ・太さ・行間・色はObsidianの --h1-size〜--h6-size、--h1-weight〜、--h1-line-height〜、--h1-color〜（inherit）と同じ。
    ただし h1・h2 の行間はObsidianの1.2だと、日本語の見出しが折り返したときに上下の字がくっついて見えたので1.3にした。
-   上の余白は、編集の表示ではすべて16px（Obsidianの --p-spacing 1rem）、下は0。ソースの表示は見出しの見た目を変えないので付けない。
-   閲覧の表示では、段落・箇条書き・コードなどのあとの見出しだけ40px（Obsidianの --heading-spacing 2.5rem）、見出しのすぐあとの見出しは16px。
-   ノートの先頭の見出しは0（Obsidianの閲覧表示で先頭の要素に余白がないのと同じ）。 */
+   上の余白は16px（Obsidianの --p-spacing 1rem）、下は0。ただし段落・箇条書き・コードなどのあとの見出しだけ40px（Obsidianの --heading-spacing 2.5rem）。
+   前は閲覧の表示だけで広げていたが、閲覧の表示をなくしたので、編集の表示で広げる。ソースの表示は見出しの見た目を変えない（cm-heading が付かない）。
+   ノートの先頭の見出しは0（Obsidianの閲覧の表示で先頭の要素に余白がないのと同じ）。 */
 .cm-heading { color: inherit; font-weight: 600; }
 /* 上下の余白は、CodeMirrorの基本の .cm-line（padding: 0 2px 0 6px）より強い指定にする（.cm-heading だけだと負けて0pxになっていた）。 */
 .cm-content .cm-line.cm-heading { padding-top: 1rem; padding-bottom: 0; }
-body[data-mode='reading'] .cm-content .cm-line.cm-heading.cm-heading-after-block { padding-top: 2.5rem; }
+.cm-content .cm-line.cm-heading.cm-heading-after-block { padding-top: 2.5rem; }
 .cm-content .cm-line.cm-heading.cm-heading-first { padding-top: 0; }
 /* 字間はObsidianと同じく h1〜h3 だけ -0.015em。 */
 .cm-h1 { font-size: 1.802em; line-height: 1.3; font-weight: 700; letter-spacing: -0.015em; }
@@ -899,7 +899,7 @@ a.cm-link-missing {
   grid-template-rows: auto 22px;
   padding: 4px 0 2px;
 }
-/* 書き換えできない表（閲覧の表示など）には「＋」のボタンがないので、ボタンの分の列と行を空けない。 */
+/* 書き換えできない表（編集できないノートなど）には「＋」のボタンがないので、ボタンの分の列と行を空けない。 */
 .cm-table-wrap.cm-table-readonly { grid-template-columns: minmax(0, max-content); grid-template-rows: auto; }
 /* 行の外に置かれる部品（表・数式のかたまり・Mermaidの図・属性の欄）も、コード・コールアウト・引用と同じく本文の文字の端にそろえる。
    行の中ではないので、.cm-line の左6px・右2pxをここで足す。 */

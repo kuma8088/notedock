@@ -105,7 +105,7 @@ test('項目でない行・選択中・記号の手前では何もしない（�
   state = state.update({ selection: EditorSelection.range(3, 5) }).state
   assert.equal(alphaListEnter({ state, dispatch: () => {} }), false)
   const locked = EditorState.create({ doc: 'a. xyz', selection: EditorSelection.cursor(6), extensions: [noteMarkdown(), EditorState.readOnly.of(true)] })
-  assert.equal(alphaListEnter({ state: locked, dispatch: () => assert.fail('閲覧中は書き換えない') }), false)
+  assert.equal(alphaListEnter({ state: locked, dispatch: () => assert.fail('読み取り専用では書き換えない') }), false)
 })
 
 test('Tab / Shift+Tab の字下げは番号付きと同じに動き、字下げ後も項目のまま', () => {

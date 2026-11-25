@@ -29,7 +29,7 @@ export function listMarkerFold(state, pos) {
   if (mark.name !== 'ListMark' && mark.name !== 'AlphaMark') return null
   const line = state.doc.lineAt(pos)
   // 編集中は、カーソルがある行では開閉せず、カーソルを置かせる。「•」はその行では生の「-」に戻って押せないので、番号・英字もそろえる。
-  // 閲覧（書き換えできない表示）ではカーソルが見えず「•」も戻らないので、どの行でも開閉する。
+  // 編集できないノート（書き換えできない表示）ではカーソルが見えず「•」も戻らないので、どの行でも開閉する。
   if (!state.readOnly && state.selection.ranges.some((range) => state.doc.lineAt(range.head).number === line.number)) return null
   let open = null
   foldedRanges(state).between(line.from, line.to, (from, to) => {

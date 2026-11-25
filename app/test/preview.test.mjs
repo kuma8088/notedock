@@ -7,7 +7,7 @@ import { EditorState, EditorSelection } from '@codemirror/state'
 import { headingsOf, linkCompletion } from '../src/complete.mjs'
 import { relativeHref, resolveHref, slugify } from '../src/links.mjs'
 import { noteMarkdown } from '../src/markdown-ext.mjs'
-import { atNoteStart, findCallouts, headingPlace, hiddenRanges, noteContext, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from '../src/preview.mjs'
+import { atNoteStart, findCallouts, headingPlace, hiddenRanges, noteContext, noteMode, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from '../src/preview.mjs'
 import { addColumn, addRow, deleteRow, parseTable, replaceCell, setAlign, sortRows, splitRow } from '../src/table-model.mjs'
 import { CheckboxWidget, FrontmatterWidget, TableWidget, cleanCss, hasExternalRef, imagePlan, isExternalHref, keepHref } from '../src/widgets.mjs'
 import { deleteProperty, inferType, parseFrontmatter, renameProperty, setProperty } from '../src/yaml-lite.mjs'
@@ -77,12 +77,30 @@ test('ソース表示では何も隠さない', () => {
   assert.equal(state.field(previewField).deco.size, 0)
 })
 
-test('閲覧表示ではカーソルがあっても隠す', () => {
+test('のぞくだけの表示（reading。リンクの小窓とチャット欄の返事）では、カーソルがあっても隠す', () => {
   const text = '**太字** です'
   let state = make(text, 3)
   assert.deepEqual(hiddenRanges(state), [])
   state = state.update({ effects: setMode.of('reading') }).state
   assert.deepEqual(hiddenRanges(state), ['**', '**'])
+})
+
+test('編集できないノート（読み取り専用）は編集の表示でも、カーソルの行の記号を出さない', () => {
+  const text = '# 見出し\n\n**太字** です'
+  const at = text.indexOf('太字')
+  const editableState = make(text, at)
+  assert.deepEqual(hiddenRanges(editableState), ['# '])
+  const locked = EditorState.create({
+    doc: text,
+    selection: EditorSelection.cursor(at),
+    extensions: [noteMarkdown(), noteContext.of({ path: 'a/b.md', known: new Set(), editable: false }), previewField, EditorState.readOnly.of(true)],
+  })
+  assert.deepEqual(hiddenRanges(locked), ['# ', '**', '**'])
+})
+
+test('ノートの表示は live と source の2つ。ほかの値（前の版の reading など）は live にする', () => {
+  assert.equal(noteMode('source'), 'source')
+  for (const value of ['live', 'reading', '', undefined, null, 'Source', 'preview']) assert.equal(noteMode(value), 'live', String(value))
 })
 
 test('先頭のYAMLは見出しや水平線にしない', () => {
@@ -216,27 +234,23 @@ test('編集できないノートでは、表とチェックを変えられな�
   })
   assert.equal(widgetsOf(locked, TableWidget)[0].readOnly, true)
   assert.equal(widgetsOf(locked, CheckboxWidget)[0].readOnly, true)
-  // 閲覧表示は設計どおり、チェックだけ押せる。
-  const reading = make(text).update({ effects: setMode.of('reading') }).state
-  assert.equal(widgetsOf(reading, TableWidget)[0].readOnly, true)
-  assert.equal(widgetsOf(reading, CheckboxWidget)[0].readOnly, false)
+  // 編集できるノート（編集の表示）では、表もチェックも変えられる。
   const free = make(text)
   assert.equal(widgetsOf(free, TableWidget)[0].readOnly, false)
   assert.equal(widgetsOf(free, CheckboxWidget)[0].readOnly, false)
 })
 
-test('プロパティ欄：ノートが編集できるか・表示・動かしている間の組み合わせごとの状態', async () => {
+test('プロパティ欄：ノートが編集できるか・動かしている間の組み合わせごとの状態', async () => {
   const { EditorView } = await import('@codemirror/view')
   const text = '---\ntitle: "x"\ntype: task\nstatus: 未着手\nstart:\ndue: 2026-11-30\n---\n本文'
-  // main.mjs の editableExtensions と同じ決め方（ノートが編集できて、閲覧の表示でないときだけ画面も編集できる）。
-  const stateOf = ({ editable, mode, busy = false }) => {
-    const allow = editable && mode !== 'reading'
+  // main.mjs の editableExtensions と同じ決め方（ノートが編集できれば、画面も編集できる）。
+  const stateOf = ({ editable, busy = false }) => {
     const base = EditorState.create({
       doc: text,
       selection: EditorSelection.cursor(text.length),
-      extensions: [noteMarkdown(), noteContext.of({ path: 'a/b.md', known: new Set(), editable }), previewField, EditorView.editable.of(allow), EditorState.readOnly.of(!allow)],
+      extensions: [noteMarkdown(), noteContext.of({ path: 'a/b.md', known: new Set(), editable }), previewField, EditorView.editable.of(editable), EditorState.readOnly.of(!editable)],
     })
-    return base.update({ effects: [setMode.of(mode), togglePropsPanel.of(true), setNoteBusy.of(busy)] }).state
+    return base.update({ effects: [setMode.of('live'), togglePropsPanel.of(true), setNoteBusy.of(busy)] }).state
   }
   const widgetOf = (opts) => {
     const found = widgetsOf(stateOf(opts), FrontmatterWidget)
@@ -247,50 +261,32 @@ test('プロパティ欄：ノートが編集できるか・表示・動かし�
   const items = parseFrontmatter(text.slice(0, text.indexOf('\n---\n') + 4)).items
   const accessOf = (w, key) => w.access(items.find((item) => item.key === key), true, true)
 
-  const liveEdit = widgetOf({ editable: true, mode: 'live' })
+  const liveEdit = widgetOf({ editable: true })
   assert.deepEqual(fields(liveEdit), { open: true, noteEditable: true, locked: false, viewEditable: true, busy: false })
-  assert.deepEqual(accessOf(liveEdit, 'title'), { full: true, value: true })
+  for (const key of ['title', 'status', 'due']) assert.deepEqual(accessOf(liveEdit, key), { full: true, value: true }, key)
 
-  const reading = widgetOf({ editable: true, mode: 'reading' })
-  assert.deepEqual(fields(reading), { open: true, noteEditable: true, locked: true, viewEditable: false, busy: false })
-  assert.deepEqual(accessOf(reading, 'status'), { full: false, value: true })
-  assert.deepEqual(accessOf(reading, 'due'), { full: false, value: true })
-  assert.deepEqual(accessOf(reading, 'title'), { full: false, value: false })
-
-  const lockedNote = widgetOf({ editable: false, mode: 'live' })
+  // 編集できないノートは、タスクの status・日付も含めて直せない。
+  const lockedNote = widgetOf({ editable: false })
   assert.deepEqual(fields(lockedNote), { open: true, noteEditable: false, locked: true, viewEditable: false, busy: false })
-  assert.deepEqual(accessOf(lockedNote, 'status'), { full: false, value: false })
-  const lockedReading = widgetOf({ editable: false, mode: 'reading' })
-  assert.deepEqual(accessOf(lockedReading, 'status'), { full: false, value: false })
+  for (const key of ['title', 'status', 'due']) assert.deepEqual(accessOf(lockedNote, key), { full: false, value: false }, key)
 
-  // 動かしている間は、閲覧・編集どちらでも止める。
-  for (const mode of ['live', 'reading']) {
-    const busy = widgetOf({ editable: true, mode, busy: true })
-    assert.equal(busy.busy, true)
-    assert.deepEqual(accessOf(busy, 'status'), { full: false, value: false }, mode)
-    assert.deepEqual(accessOf(busy, 'title'), { full: false, value: false }, mode)
-  }
+  // 動かしている間は止める。
+  const busy = widgetOf({ editable: true, busy: true })
+  assert.equal(busy.busy, true)
+  assert.deepEqual(accessOf(busy, 'status'), { full: false, value: false })
+  assert.deepEqual(accessOf(busy, 'title'), { full: false, value: false })
 
   // 状態が違えば eq は false（作り直す）、同じなら true。
-  const all = [
-    liveEdit,
-    reading,
-    lockedNote,
-    widgetOf({ editable: true, mode: 'live', busy: true }),
-    widgetOf({ editable: true, mode: 'reading', busy: true }),
-  ]
+  const all = [liveEdit, lockedNote, busy]
   for (const [i, a] of all.entries()) {
     for (const [j, b] of all.entries()) assert.equal(a.eq(b), i === j, `${i} vs ${j}`)
   }
-  assert.equal(reading.eq(widgetOf({ editable: true, mode: 'reading' })), true)
-  // 編集できないノートは、閲覧でも編集の表示でも欄の中身が同じなので、作り直さない。
-  assert.equal(lockedNote.eq(lockedReading), true)
+  assert.equal(liveEdit.eq(widgetOf({ editable: true })), true)
 
   // busy を false に戻すと、表示を作り直して元の状態に戻る。
-  const back = stateOf({ editable: true, mode: 'reading', busy: true }).update({ effects: setNoteBusy.of(false) }).state
-  assert.equal(widgetsOf(back, FrontmatterWidget)[0].eq(reading), true)
+  const back = stateOf({ editable: true, busy: true }).update({ effects: setNoteBusy.of(false) }).state
+  assert.equal(widgetsOf(back, FrontmatterWidget)[0].eq(liveEdit), true)
 })
-
 test('読み取り専用でも、historyStep で履歴を1つ戻して進められる（@codemirror/commands の内部の pop に頼っている）', async () => {
   const { EditorView } = await import('@codemirror/view')
   const { history, undo } = await import('@codemirror/commands')
@@ -307,57 +303,6 @@ test('読み取り専用でも、historyStep で履歴を1つ戻して進めら�
   assert.equal(historyStep(view, 1), true)
   assert.equal(state.doc.toString(), 'status: 進行中')
   assert.equal(historyStep(view, 1), false)
-})
-
-test('プロパティ欄の取り消しの記録：本文が変わったら断る、2回戻して2回進める、別の state なら断る', async () => {
-  const { history } = await import('@codemirror/commands')
-  const { recordPropsChange, runPropsHistory } = await import('../src/widgets.mjs')
-  const fresh = (doc) => EditorState.create({ doc, extensions: [history(), EditorState.readOnly.of(true)] })
-  const makeView = (doc) => {
-    const view = { state: fresh(doc), dispatch(tr) { view.state = tr.state ?? view.state.update(tr).state } }
-    return view
-  }
-  // 欄から直したときと同じく、履歴を区切って変える。
-  const { isolateHistory } = await import('@codemirror/commands')
-  const change = (view, from, to, insert) => {
-    view.dispatch(view.state.update({ changes: { from, to, insert }, annotations: isolateHistory.of('full') }))
-    recordPropsChange(view)
-  }
-  const text = (view) => view.state.doc.toString()
-
-  // 2回戻して2回進める。
-  const a = makeView('status: 未着手\ndue: 2026-11-30')
-  change(a, 8, 11, '進行中')
-  const at = text(a).indexOf('2026-11-30')
-  change(a, at, at + 10, '2026-12-05')
-  assert.equal(text(a), 'status: 進行中\ndue: 2026-12-05')
-  assert.equal(runPropsHistory(a, 'undo'), true)
-  assert.equal(text(a), 'status: 進行中\ndue: 2026-11-30')
-  assert.equal(runPropsHistory(a, 'undo'), true)
-  assert.equal(text(a), 'status: 未着手\ndue: 2026-11-30')
-  assert.equal(runPropsHistory(a, 'undo'), false)
-  assert.equal(runPropsHistory(a, 'redo'), true)
-  assert.equal(runPropsHistory(a, 'redo'), true)
-  assert.equal(text(a), 'status: 進行中\ndue: 2026-12-05')
-  assert.equal(runPropsHistory(a, 'redo'), false)
-
-  // 欄の変更のあとに本文を変えたら断る（その変更を巻き込まない）。断ったあとは覚えていたものを空にする。
-  const b = makeView('status: 未着手\n本文')
-  change(b, 8, 11, '完了')
-  b.dispatch(b.state.update({ changes: { from: b.state.doc.length, insert: 'を足す' }, annotations: isolateHistory.of('full') }))
-  assert.equal(runPropsHistory(b, 'undo'), false)
-  assert.equal(text(b), 'status: 完了\n本文を足す')
-  // 足した分を消して本文が元と同じ文字になっても、空にしたので戻さない。
-  b.dispatch(b.state.update({ changes: { from: b.state.doc.length - 3, to: b.state.doc.length } }))
-  assert.equal(runPropsHistory(b, 'undo'), false)
-  assert.equal(text(b), 'status: 完了\n本文')
-
-  // 別の state に入れ替えたら（ノートを開き直したなど）断る。
-  const c = makeView('status: 未着手')
-  change(c, 8, 11, '保留')
-  c.state = fresh('status: 保留')
-  assert.equal(runPropsHistory(c, 'undo'), false)
-  assert.equal(text(c), 'status: 保留')
 })
 
 test('プロパティ欄で直した値：タスクのノートの title だけ、いつも二重引用符で書く', async () => {

@@ -8,8 +8,6 @@ export const TASK_TYPE = 'task'
 // タスクのノートを置くフォルダー（Vault の直下）。この下（サブフォルダーを含む）の type: task だけを集める。
 export const TASK_FOLDER = 'Tasks'
 export const TASK_DATE_KEYS = Object.freeze(['start', 'due'])
-// 閲覧の表示のままでも直せる項目。
-export const TASK_QUICK_KEYS = Object.freeze(['status', ...TASK_DATE_KEYS])
 // プロパティの並び順。
 const TASK_KEYS = ['title', 'type', 'status', 'start', 'due', 'goal', 'parent']
 
@@ -57,15 +55,14 @@ function wikiOf(target) {
 
 // プロパティ欄の1行を直せるか。DOM に頼らない形で決める。
 // full: 名前・値・削除をすべて直せる（ふつうの編集）。value: 値だけでも直せる。
-// - busy（ノートを動かしている間）は、閲覧・編集どちらでもすべて止める。
+// - busy（ノートを動かしている間）は、すべて止める。
 // - 入れ子などがある（simple でない）ときは、文字のまま編集するので欄では直さない。
-// - 画面が編集できれば、すべて直せる。
-// - タスクのノートで、ノートそのものが編集できれば、閲覧の表示でも status・start・due の値だけ直せる。
-export function propsRowAccess({ key, task = false, simple = true, noteEditable = false, viewEditable = false, busy = false } = {}) {
+// - 画面が編集できれば、すべて直せる。編集できないノート（画面も編集できない）では、どれも直せない。
+// 前は閲覧の表示でもタスクの status・start・due の値だけ直せたが、閲覧の表示をなくしたので、その決まりもなくした。
+export function propsRowAccess({ simple = true, viewEditable = false, busy = false } = {}) {
   if (busy || !simple) return { full: false, value: false }
   const full = viewEditable === true
-  const quick = task === true && noteEditable === true && TASK_QUICK_KEYS.includes(key)
-  return { full, value: full || quick }
+  return { full, value: full }
 }
 
 // 日付の欄の確定のしかた。

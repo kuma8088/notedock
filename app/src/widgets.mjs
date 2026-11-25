@@ -1,4 +1,4 @@
-import { historyField, isolateHistory, redo, redoDepth, undo, undoDepth } from '@codemirror/commands'
+import { historyField, isolateHistory, redo, undo } from '@codemirror/commands'
 import { runScopeHandlers, WidgetType } from '@codemirror/view'
 
 import { fileUrl } from './access.mjs'
@@ -461,37 +461,6 @@ function replaceBlock(view, node, source, next, annotations = []) {
   return replaceAt(view, view.posAtDOM(node), source, next, annotations)
 }
 
-// プロパティ欄から行った変更の履歴。閲覧の表示（読み取り専用）では CodeMirror の undo/redo が止まるので、
-// この欄から直した分だけを、ここで覚えて戻せるようにする。
-// done・undone には、変更（または戻し）の直後の本文と履歴の深さを積む。今の本文と深さが一致するときだけ戻す。
-// 間に編集の表示での入力や取り消しがあれば深さか本文がずれるので、ほかの変更を巻き込まない。
-const propsSteps = new WeakMap()
-
-function stepsOf(view) {
-  let steps = propsSteps.get(view)
-  if (!steps) propsSteps.set(view, (steps = { done: [], undone: [] }))
-  return steps
-}
-
-// 覚えておく件数の上限。古いものから捨てる。
-const PROPS_STEPS_LIMIT = 50
-
-function clearSteps(steps) {
-  steps.done = []
-  steps.undone = []
-}
-
-// プロパティ欄から本文を変えた直後に呼ぶ。view は state と dispatch を持つもの（テストでは EditorView でなくてよい）。
-export function recordPropsChange(view) {
-  const steps = stepsOf(view)
-  const depth = undoDepth(view.state)
-  // 別のノートに切り替えたあと（同じ view を使い回す）などで残った、今の履歴より深いものは捨てる。
-  steps.done = steps.done.filter((entry) => entry.depth < depth)
-  steps.done.push({ doc: view.state.doc, depth })
-  if (steps.done.length > PROPS_STEPS_LIMIT) steps.done = steps.done.slice(-PROPS_STEPS_LIMIT)
-  steps.undone = []
-}
-
 // readOnly を見ずに、履歴を1つ戻す（進める）。@codemirror/commands の undo/redo は readOnly のとき何もしないため、
 // 同じ中身（historyField の pop を取り出して dispatch する）を、ここだけで行う。
 export function historyStep(view, side) {
@@ -500,34 +469,6 @@ export function historyStep(view, side) {
   const tr = history.pop(side, view.state, false)
   if (!tr) return false
   view.dispatch(tr)
-  return true
-}
-
-// プロパティ欄の中の Cmd+Z / Shift+Cmd+Z（Windows は Ctrl）。読み取り専用のときに使う。戻せたら true。
-// 照合に失敗したら（間にほかの変更があった、別のノートになったなど）、覚えていたものはもう使えないので空にする。
-export function runPropsHistory(view, kind) {
-  const steps = stepsOf(view)
-  const state = view.state
-  if (kind === 'undo') {
-    const last = steps.done.at(-1)
-    if (!last) return false
-    if (undoDepth(state) !== last.depth || !state.doc.eq(last.doc) || !historyStep(view, 0)) {
-      clearSteps(steps)
-      return false
-    }
-    steps.done.pop()
-    steps.undone.push({ doc: view.state.doc, depth: redoDepth(view.state) })
-    if (steps.undone.length > PROPS_STEPS_LIMIT) steps.undone = steps.undone.slice(-PROPS_STEPS_LIMIT)
-    return true
-  }
-  const last = steps.undone.at(-1)
-  if (!last) return false
-  if (redoDepth(state) !== last.depth || !state.doc.eq(last.doc) || !historyStep(view, 1)) {
-    clearSteps(steps)
-    return false
-  }
-  steps.undone.pop()
-  steps.done.push({ doc: view.state.doc, depth: undoDepth(view.state) })
   return true
 }
 
@@ -801,7 +742,7 @@ export class TableWidget extends WidgetType {
     cell.addEventListener('blur', () => commit())
     watchTyping(cell)
     cell.addEventListener('keydown', (event) => {
-      // Cmd+OとCmd+Eは画面全体で受けるので止めない。部品の中のキーをエディター本体は受け取らない。
+      // Cmd+Oは画面全体で受けるので止めない。部品の中のキーをエディター本体は受け取らない。
       const command = isCommandKey(event)
       if (!command || composing || event.isComposing) event.stopPropagation()
       if (composing || event.isComposing) return
@@ -898,7 +839,7 @@ export class TableWidget extends WidgetType {
 }
 
 export class FrontmatterWidget extends WidgetType {
-  // noteEditable: ノートそのものが編集できるか（閲覧の表示かどうかとは別）。locked: 閲覧の表示か、読み取り専用か。
+  // noteEditable: ノートそのものが編集できるか。locked: 読み取り専用か（編集できないノート、ノートを動かしている間）。
   // viewEditable: 画面が編集できるか（EditorView.editable）。busy: ノートを動かしている間など、欄をすべて止めるとき。
   constructor(source, open, pos, { noteEditable = false, locked = false, viewEditable = false, busy = false } = {}) {
     super()
@@ -922,7 +863,7 @@ export class FrontmatterWidget extends WidgetType {
   }
   // その行の名前と値を直せるか。
   access(item, simple, task) {
-    return propsRowAccess({ key: item.key, task, simple, noteEditable: this.noteEditable, viewEditable: this.viewEditable, busy: this.busy })
+    return propsRowAccess({ simple, viewEditable: this.viewEditable, busy: this.busy })
   }
   toDOM(view) {
     const { items, simple } = parseFrontmatter(this.source)
@@ -933,18 +874,14 @@ export class FrontmatterWidget extends WidgetType {
     head.addEventListener('click', () => view.dom.dispatchEvent(new CustomEvent('note-toggle-props', { bubbles: true })))
     wrap.append(head)
     if (!this.open) return wrap
-    // 欄からの変更は、1つずつ取り消せるように履歴を区切り、読み取り専用でも戻せるように覚えておく。
+    // 欄からの変更は、1つずつ取り消せるように履歴を区切る。
     // refocus: 作り直した欄で、同じ項目にフォーカスを戻す（ステータスを選んだあと、続けて Cmd+Z を押せるように）。
     const apply = (next, refocus) => {
       const before = view.state.doc
       const ok = replaceBlock(view, wrap, this.source, next, [isolateHistory.of('full')])
-      if (ok && view.state.doc !== before) {
-        recordPropsChange(view)
-        if (refocus) focusPropsField(view, refocus)
-      }
+      if (ok && view.state.doc !== before && refocus) focusPropsField(view, refocus)
       return ok
     }
-    // タスクのノートは、閲覧の表示のままでもステータス・開始日・期日だけは直せる。
     const task = isTaskItems(items)
     const editable = simple && this.viewEditable && !this.busy
     if (!simple) {
@@ -969,7 +906,7 @@ export class FrontmatterWidget extends WidgetType {
       view.focus()
     })
     wrap.append(source)
-    // タスクのノートは、閲覧の表示のままでも削除できるよう、ここに「このタスクを削除」を置く（ツールバーは閲覧では隠れる）。
+    // タスクのノートは、ここにも「このタスクを削除」を置く（ノートの情報を見ながら消せるように）。
     if (task && this.noteEditable && !this.busy) {
       const trash = element('button', { type: 'button', class: 'cm-props-trash' }, ['このタスクを削除'])
       trash.addEventListener('click', () => view.dom.dispatchEvent(new CustomEvent('note-trash-task', { bubbles: true })))
@@ -995,20 +932,6 @@ export class FrontmatterWidget extends WidgetType {
       input.addEventListener('keydown', (event) => {
         if (!isCommandKey(event) || event.isComposing) {
           event.stopPropagation()
-          return
-        }
-        // 閲覧の表示（読み取り専用）では、この欄から直した分だけを戻す。
-        const kind = view.state.readOnly ? historyKey(event) : null
-        if (kind) {
-          event.preventDefault()
-          // まだ確定していない打ちかけ（日付の欄）があれば、まずそれを元の値に戻すだけにする。
-          if (kind === 'undo' && input.value !== initial) {
-            input.value = initial
-            return
-          }
-          const key = input.getAttribute('aria-label')
-          if (runPropsHistory(view, kind)) focusPropsField(view, key)
-          else showMessage(kind === 'undo' ? '閲覧の表示では、この欄から直した分だけ戻せます。ほかの変更は、編集に切り替えてから戻してください。' : 'やり直せる変更がありません。')
           return
         }
         if (runFieldHistory(event, view, input, input.value !== initial, () => {})) return

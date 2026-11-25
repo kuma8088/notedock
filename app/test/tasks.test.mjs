@@ -4,7 +4,6 @@ import test from 'node:test'
 import {
   DATE_FIELD_IDLE,
   TASK_DEFAULT_STATUS,
-  TASK_QUICK_KEYS,
   TASK_STATUSES,
   buildTaskFrontmatter,
   buildTaskNote,
@@ -22,7 +21,6 @@ import { parseFrontmatter } from '../src/yaml-lite.mjs'
 test('ステータスは4つで、初期値は未着手', () => {
   assert.deepEqual(TASK_STATUSES, ['未着手', '進行中', '完了', '保留'])
   assert.equal(TASK_DEFAULT_STATUS, '未着手')
-  assert.deepEqual(TASK_QUICK_KEYS, ['status', 'start', 'due'])
   assert.ok(Object.isFrozen(TASK_STATUSES))
 })
 
@@ -109,10 +107,8 @@ test('プロパティ欄の1行を直せるか', () => {
   // 編集の表示：すべて直せる。
   assert.deepEqual(propsRowAccess(base), { full: true, value: true })
   assert.deepEqual(propsRowAccess({ ...base, key: 'title' }), { full: true, value: true })
-  // 閲覧の表示（画面は編集できない）：タスクの status・start・due の値だけ。
-  for (const key of ['status', 'start', 'due']) assert.deepEqual(propsRowAccess({ ...base, key, viewEditable: false }), { full: false, value: true }, key)
-  for (const key of ['title', 'type', 'goal', 'parent', 'Status', 'DUE']) assert.deepEqual(propsRowAccess({ ...base, key, viewEditable: false }), { full: false, value: false }, key)
-  // タスクでないノートは、閲覧の表示では直せない。
+  // 画面が編集できないとき（編集できないノート）は、タスクの status・start・due も含めて直せない（閲覧の表示だけの決まりはなくした）。
+  for (const key of ['status', 'start', 'due', 'title', 'type', 'goal', 'parent']) assert.deepEqual(propsRowAccess({ ...base, key, viewEditable: false }), { full: false, value: false }, key)
   assert.deepEqual(propsRowAccess({ ...base, task: false, viewEditable: false }), { full: false, value: false })
   assert.deepEqual(propsRowAccess({ ...base, task: false }), { full: true, value: true })
   // ノートそのものが編集できない（読み取り専用の場所など）。
@@ -120,7 +116,7 @@ test('プロパティ欄の1行を直せるか', () => {
   // 入れ子などがある（simple でない）。
   assert.deepEqual(propsRowAccess({ ...base, simple: false }), { full: false, value: false })
   assert.deepEqual(propsRowAccess({ ...base, simple: false, viewEditable: false }), { full: false, value: false })
-  // ノートを動かしている間は、閲覧・編集どちらでも止める。
+  // ノートを動かしている間は止める。
   assert.deepEqual(propsRowAccess({ ...base, busy: true }), { full: false, value: false })
   assert.deepEqual(propsRowAccess({ ...base, busy: true, viewEditable: false }), { full: false, value: false })
   assert.deepEqual(propsRowAccess({ key: 'status' }), { full: false, value: false })

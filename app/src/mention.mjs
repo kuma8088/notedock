@@ -106,7 +106,7 @@ export function noteForName(notes, name) {
 export function mentionCandidates({ query, editor, notes, headings }) {
   const out = []
   const dirtyNote = '保存していない変更があるので、行がずれることがあります'
-  // 閲覧の表示では見出しや空の行の分だけ、目で数えた行と番号がずれて見えるので、ファイルの行番号だと添える。
+  // 書式を整えた表示では、見出しの余白や隠した記号の分だけ、目で数えた行と番号がずれて見えるので、ファイルの行番号だと添える。
   const fileLines = 'ファイルの行番号です'
   const hash = query.indexOf('#')
   const namePart = hash < 0 ? query : query.slice(0, hash)

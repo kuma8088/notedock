@@ -36,7 +36,7 @@ import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { noteContext, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from './preview.mjs'
+import { noteContext, noteMode, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
 import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
@@ -349,8 +349,8 @@ let events = null
 let notes = []
 let known = null
 let currentPath = null
-// ノートはまず閲覧で開き、「編集」か Cmd+E で編集に切り替える。
-let mode = 'reading'
+// ノートは編集の表示（live）で開く。上の「ソース」で Markdown の文字のままの表示（source）に切り替えられる。
+let mode = 'live'
 let rootPaths = []
 let platform = 'darwin'
 let vaultLabel = ''
@@ -620,7 +620,7 @@ function toolbarBusy() {
 
 function syncToolbar() {
   const bar = $('toolbar')
-  bar.hidden = !currentPath || !editable || mode === 'reading'
+  bar.hidden = !currentPath || !editable
   if (bar.hidden || !view) return
   const busy = toolbarBusy()
   const format = currentFormat(view.state)
@@ -660,11 +660,6 @@ function bindToolbar() {
   $('editor').addEventListener('focusout', () => setTimeout(syncToolbar, 0))
 }
 
-function cycleMode() {
-  applyMode(mode === 'reading' ? 'live' : 'reading')
-  return true
-}
-
 function addProperty(target) {
   askText('追加する項目の名前').then((name) => applyNewProperty(target, name))
   return true
@@ -699,7 +694,6 @@ const editorKeys = keymap.of([
   { key: 'Mod-i', run: runSpec((state) => inlineSpec(state, 'italic')), preventDefault: true },
   { key: 'Mod-k', run: (target) => { insertLink(target); return true }, preventDefault: true },
   { key: 'Mod-s', run: saveNow, preventDefault: true },
-  { key: 'Mod-e', run: cycleMode, preventDefault: true },
   { key: 'Mod-Alt-f', run: openSearchPanel, preventDefault: true },
   { key: 'Mod-;', run: addProperty, preventDefault: true },
   { key: 'Mod-Shift-t', run: insertTable, preventDefault: true },
@@ -910,8 +904,7 @@ function noteContextFor(path, canEdit) {
 }
 
 function editableExtensions(canEdit) {
-  const allow = canEdit && mode !== 'reading'
-  return [EditorView.editable.of(allow), EditorState.readOnly.of(!allow)]
+  return [EditorView.editable.of(canEdit), EditorState.readOnly.of(!canEdit)]
 }
 
 function onUpdate(update) {
@@ -944,7 +937,9 @@ function restoreFolds(path) {
   if (effects.length) view.dispatch({ effects })
 }
 
-function applyMode(next) {
+function applyMode(requested) {
+  // 古い呼び出しや右の枠への連絡で 'reading' などが来ても、編集の表示として扱う。
+  const next = noteMode(requested)
   if (sourceOnly && next !== 'source') return
   mode = next
   showPasteHint(false)
@@ -2010,7 +2005,7 @@ function commitOpenField() {
 
 let openRequest = 0
 
-async function openNote(path, { push = true, anchor = '', startMode = 'reading' } = {}) {
+async function openNote(path, { push = true, anchor = '', startMode = 'live' } = {}) {
   openRequest += 1
   const thisRequest = openRequest
   let note
@@ -2045,7 +2040,7 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   if (PANE !== 'right') renderCalendar()
   sourceOnly = note.sourceOnly
   editable = note.editable
-  const nextMode = sourceOnly ? 'source' : startMode
+  const nextMode = sourceOnly ? 'source' : noteMode(startMode)
   mode = nextMode
   // YAMLの中にカーソルを置くと文字で見えてしまうので、本文の先頭から始める。
   const front = note.text.match(/^---\n[\s\S]*?\n---(?:\n|$)/)
@@ -2157,7 +2152,7 @@ function openHref(href, newTab) {
 }
 
 // 左右どちらかの枠でノートを開く。右に開くときは、分けていなければ先に分ける。
-async function openIn(pane, path, { anchor = '', startMode = 'reading' } = {}) {
+async function openIn(pane, path, { anchor = '', startMode = 'live' } = {}) {
   // 狭い画面では分けないので、左で開く。
   if (pane !== 'right' || !split || isNarrow()) return openNote(path, { anchor, startMode })
   if (!split.isOpen()) {
@@ -2415,7 +2410,7 @@ async function doMove(from, to, rename = false, confirm = false) {
   const holdsCurrent = currentPath && inside(currentPath, from)
   // 右の枠で開いているノート（またはそれを含むフォルダー）を動かすときは、右の書きかけも動かす直前に保存する。
   const rightPath = split?.isOpen() && rightState.path && inside(rightState.path, from) ? rightState.path : null
-  // 動かしている間は、閲覧の表示でもプロパティ欄（タスクのステータス・日付）を止める。戻すときは欄を作り直す。
+  // 動かしている間は、プロパティ欄（タスクのステータス・日付）も止める。戻すときは欄を作り直す。
   const lock = (locked) =>
     view?.dispatch({ effects: [editableSlot.reconfigure(editableExtensions(locked ? false : editable)), setNoteBusy.of(locked)] })
   if (holdsCurrent) lock(true)
@@ -2663,7 +2658,7 @@ async function openPeriodicNote(period, date, { ask = false, from = 'sidebar', m
     if (!result.ok) return refuse(result)
     const { path, created } = result.data
     if (created) await refreshNotes()
-    await openIn(targetPane({ meta, from, active: activePane() }), path, { startMode: created ? 'live' : 'reading' })
+    await openIn(targetPane({ meta, from, active: activePane() }), path)
     drawCalendar()
   } catch {
     showMessage('このノートは作れません。')
@@ -2908,18 +2903,10 @@ async function makeTask(lineNumber) {
   let linked = false
   const path = currentPath
   const target = view
-  const startedReading = mode === 'reading'
-  // 閲覧から始めてリンクを足さなかったときは、閲覧の表示に戻す（同じノートを開いているときだけ）。
-  const backToReading = () => {
-    if (startedReading && path === currentPath && target === view && mode === 'live') applyMode('reading')
-  }
   try {
     commitOpenField()
-    // 閲覧の表示では「元に戻す」が効かないので、編集の表示に切り替えてから書き換える。
-    if (startedReading) applyMode('live')
     const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify(taskRequestBody(found, todayText())) })
     if (!created.ok || typeof created.data?.path !== 'string') {
-      backToReading()
       showMessage(createFailedText(created.status, created.data?.error))
       return
     }
@@ -2928,19 +2915,17 @@ async function makeTask(lineNumber) {
     if (plan.action === 'trash') {
       // リンクを足さないときは、作ったノートをゴミ箱へ移す。
       const trashed = await request('/api/trash', { method: 'POST', body: JSON.stringify({ path: taskPath }) })
-      backToReading()
       showMessage(notLinkedText(plan.reason, { trashed: trashed.ok, taskPath }))
       await refreshNotes()
       tasksSaved()
       return
     }
-    if (mode === 'reading') applyMode('live')
     // 新しいノートを known に足してから、リンクの解決に使う情報を作り直す。同じ1回の変更にして、リンクがすぐ解決済みとして描かれるようにする。
     known = new Set(known ?? [])
     known.add(normalizeKey(taskPath))
     view.dispatch({
       changes: linkChange(plan.at, taskPath),
-      // 編集の表示へ切り替えると行の位置がずれるので、リンクを足した行を見える所へ出す。
+      // リンクを足した行を見える所へ出す（右クリックした行が画面の外へずれていることがあるため）。
       // 狭いペインでは下半分にチャットの欄が重なるので、真ん中ではなく上のほうに出す。
       effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), EditorView.scrollIntoView(plan.at.from, { y: 'start', yMargin: 60 })],
       annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.task')],
@@ -3162,8 +3147,6 @@ async function deleteTaskFromLink(info) {
     }
     const range = unlinkRange(at.lineText, at.lineFrom, at.from, at.to)
     commitOpenField()
-    // 閲覧の表示では「元に戻す」が効かないので、編集の表示に切り替えてから書き換える。
-    if (mode === 'reading') applyMode('live')
     view.dispatch({ changes: { ...range, insert: '' }, annotations: [isolateHistory.of('full'), Transaction.userEvent.of('delete.task')] })
     await saver?.flush()
     if (!savedClean()) {
@@ -3682,7 +3665,7 @@ async function createFromSwitcher(path) {
   }
   storage.set(recentPlacesKey(), rememberPlace(storage.get(recentPlacesKey(), []), dirOf(path)))
   await refreshNotes()
-  openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), path, { startMode: 'live' })
+  openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), path)
 }
 
 function moveSwitcher(delta) {
@@ -3697,7 +3680,7 @@ function moveSwitcher(delta) {
 
 // 文字を貼れる画面では、Cmd+Vは普通の貼り付けにする。
 function pasteOpensNote() {
-  return !currentPath || mode === 'reading' || !editable
+  return !currentPath || !editable
 }
 
 // 本文をクリックしても見た目が変わらないと分からないので、貼り付けを待っていることを見せる。
@@ -3706,7 +3689,7 @@ function showPasteHint(show) {
   document.body.classList.toggle('paste-ready', show)
 }
 
-// 閲覧表示では文字を貼る場所がないので、Cmd+Vをコピーしたパスのノートを開く操作に使う。
+// ノートを開いていないときと、編集できないノートでは文字を貼る場所がないので、Cmd+Vをコピーしたパスのノートを開く操作に使う。
 function openFromPaste(event) {
   if (document.querySelector('dialog[open]')) return
   if (!pasteOpensNote()) return
@@ -3763,12 +3746,6 @@ function bindChrome() {
       } else {
         openSwitcher()
       }
-    }
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e' && !view?.hasFocus) {
-      event.preventDefault()
-      // 表のマスや欄で打っている文字を、表示を切り替える前に本文へ書き戻す。
-      commitOpenField()
-      cycleMode()
     }
   })
   window.addEventListener('keyup', (event) => {
@@ -4054,7 +4031,7 @@ function execCopy(text) {
   }
 }
 
-// 今開いているノートの絶対パスをコピーする。閲覧だけのノートでも使える。
+// 今開いているノートの絶対パスをコピーする。編集できないノートでも使える。
 // 押した直後でないとコピーを断るブラウザがあるので、サーバーを待たずにその場で作る。
 async function copyNotePath() {
   if (!currentPath) return

@@ -18,7 +18,14 @@ import {
   WikiLinkWidget,
 } from './widgets.mjs'
 
+// 表示のしかた。ノートの表示は 'live'（編集の表示）と 'source'（ソースの表示）の2つ。
+// 'reading' はノートの表示には使わず、リンクに乗せたときの小窓とチャット欄の返事（書き換えない、のぞくだけの表示）でだけ使う。
 export const setMode = StateEffect.define()
+
+// ノートの表示として受け付ける値に直す。'source' 以外（前の版の 'reading'、空、知らない値）は、編集の表示にする。
+export function noteMode(value) {
+  return value === 'source' ? 'source' : 'live'
+}
 export const setComposing = StateEffect.define()
 export const togglePropsPanel = StateEffect.define()
 // ノートを動かしている間など、プロパティ欄をすべて止めるとき true。false に戻すと表示を作り直す。
@@ -35,8 +42,9 @@ const HIDE = Decoration.replace({})
 // Obsidianのハイライトの6色。
 const HIGHLIGHT_COLORS = [['🔴', 'red'], ['🟠', 'orange'], ['🟡', 'yellow'], ['🟢', 'green'], ['🔵', 'blue'], ['🟣', 'purple']]
 
+// 書き換えられない表示（のぞくだけの表示と、編集できないノート）では、カーソルが見えないので、カーソルの行でも記号を出さない。
 function selectionToucher(state, mode) {
-  if (mode === 'reading') return { touches: () => false, lineTouched: () => false }
+  if (mode === 'reading' || state.readOnly) return { touches: () => false, lineTouched: () => false }
   const ranges = state.selection.ranges
   return {
     touches: (from, to) => ranges.some((r) => r.from <= to && r.to >= from),
@@ -156,7 +164,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false, busy
           if (node.node.parent?.name !== 'Link') add(from, to, Decoration.mark({ class: 'cm-tag', attributes: { title: doc.sliceString(from, to) } }))
           return false
         case 'ObsidianComment':
-          // Obsidianと同じく、閲覧では見せない。編集中は薄く見せる。
+          // のぞくだけの表示では、Obsidianの閲覧と同じく見せない。ノートの表示では薄く見せる。
           if (reading) hideRange(add, from, to)
           else add(from, to, Decoration.mark({ class: 'cm-comment' }))
           return false
@@ -410,7 +418,7 @@ function decorateInlineHtml(node, doc, touches, add) {
   if (closeFrom > node.to) add(node.to, closeFrom, Decoration.mark({ class: cls }))
 }
 
-// ノートの先頭（前にあるのが空行と frontmatter だけ）かどうか。先頭の見出しには上の余白を付けない（Obsidianの閲覧表示と同じ）。
+// ノートの先頭（前にあるのが空行と frontmatter だけ）かどうか。先頭の見出しには上の余白を付けない（Obsidianの閲覧の表示と同じ）。
 export function atNoteStart(state, pos) {
   let start = 0
   const first = syntaxTree(state).topNode.firstChild
@@ -423,7 +431,7 @@ export function atNoteStart(state, pos) {
 }
 
 // 見出しの上の余白を決めるための印。ノートの先頭なら cm-heading-first（余白なし）。
-// 前のかたまりが段落・コード・表・箇条書きなら cm-heading-after-block（閲覧の表示で広く空ける。Obsidianの --heading-spacing）。
+// 前のかたまりが段落・コード・表・箇条書きなら cm-heading-after-block（広く空ける。Obsidianの --heading-spacing）。
 // Obsidianの :is(p,pre,table,ul,ol) + 見出し と同じで、見出し・引用・コールアウト・区切り線のあとには付けない。
 const AFTER_BLOCK = new Set(['Paragraph', 'FencedCode', 'CodeBlock', 'Table', 'BulletList', 'OrderedList'])
 

@@ -142,7 +142,7 @@ test('カーソルがある行の番号・記号を押したときは開閉せ�
   assert.equal(listMarkerFold(folded.update({ selection: { anchor: 1 } }).state, 0), null)
 })
 
-test('閲覧（書き換えできない表示）では、カーソルの行でも開閉する', () => {
+test('編集できないノート（書き換えできない表示）では、カーソルの行でも開閉する', () => {
   const state = EditorState.create({ doc: '1. 親\n\t1. 子\n', selection: { anchor: 1 }, extensions: [noteMarkdown(), codeFolding(), EditorState.readOnly.of(true)] })
   assert.ok(listMarkerFold(state, 0)?.is(foldEffect))
 })
