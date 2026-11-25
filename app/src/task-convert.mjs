@@ -12,10 +12,10 @@ const REASON_TEXT = {
   'no-line': 'この行はタスクにできません。',
   front: 'プロパティの行はタスクにできません。',
   code: 'コードの中の行はタスクにできません。',
-  heading: '見出しはタスクにできません。見出しの下の箇条書きの行で選んでください。',
+  heading: '見出しはタスクにできません。見出しの下の箇条書きの行を選んでください。',
   'not-list': 'タスクにできるのは箇条書きの行です。',
   empty: '中身のない行はタスクにできません。',
-  'week-link': '週のリンクの行はタスクにできません。その下の行で選んでください。',
+  'week-link': '週のリンクの行はタスクにできません。その下の行を選んでください。',
   struck: '取り消し線を引いた行はタスクにできません。',
   'has-task-link': 'この行は、もうタスクになっています。',
   callout: '囲みの見出しの行はタスクにできません。',
@@ -26,7 +26,7 @@ const REASON_TEXT = {
 export function createFailedText(status, error) {
   if (status === 400 && error === 'tasks-folder') return 'Vault の直下に Tasks というフォルダーを作れませんでした（同じ名前のファイルがあるなど）。タスクのノートは作っていません。'
   if (status === 409) return '同じ名前のタスクのノートが多すぎて、作れませんでした。'
-  if (status === 400 && error === 'body') return '下の行をタスクのノートへ移せなかったので（行が多すぎるなど）、作れませんでした。ノートは変えていません。'
+  if (status === 400 && error === 'body') return '下の行が多すぎるなどの理由でタスクのノートへ移せなかったので、タスクのノートを作れませんでした。元のノートは変えていません。'
   return 'タスクのノートを作れませんでした。'
 }
 
@@ -132,7 +132,7 @@ export function planAfterCreate({ sameNote, canWrite, doc, found }) {
 
 const NOT_LINKED_WHY = {
   switched: '作っている間に別のノートを開いたので',
-  stopped: '作っている間にこのノートの保存が止まったので',
+  stopped: '作っている間にこのノートを保存できなくなったので',
   changed: '作っている間に行が書き換わったので',
 }
 
@@ -142,25 +142,25 @@ const COPIED = '本文には、下の行と同じ行が入っています。'
 // リンクを足さなかったときの知らせ。trashed はゴミ箱へ移せたか。moved は、本文に入れた下の行があるか（元のノートからは消していない）。
 export function notLinkedText(reason, { trashed, taskPath, moved = false }) {
   const why = NOT_LINKED_WHY[reason] ?? '作っている間にノートが変わったので'
-  return why + '、リンクは足していません。' + (trashed
-    ? '作ったタスクのノートはゴミ箱へ移しました。もう一度選んでください。'
-    : `作ったノート（${taskPath}）が Tasks に残っています。` + (moved ? COPIED : ''))
+  return why + '、リンクは追加していません。' + (trashed
+    ? '作ったタスクのノートはゴミ箱へ移しました。もう一度、行を選んでください。'
+    : `作ったタスクのノート（${taskPath}）が Tasks フォルダーに残っています。` + (moved ? COPIED : ''))
 }
 
 // ノートを作ったあと、リンクを足す途中で失敗したときの知らせ。moved は notLinkedText と同じ。
 export function leftoverText(taskPath, { moved = false } = {}) {
-  return `リンクを足せませんでした。作ったノート（${taskPath}）が Tasks に残っています。` + (moved ? COPIED : '')
+  return `リンクを追加できませんでした。作ったタスクのノート（${taskPath}）が Tasks フォルダーに残っています。` + (moved ? COPIED : '')
 }
 
 // ノートを作れたかわからないまま失敗したとき（作る問い合わせの応答が届かなかったなど）の知らせ。元のノートは変えていない。
 // moved は、送った本文に下の行を入れていたか。
 export function createLostText({ moved = false } = {}) {
   if (!moved) return 'タスクのノートを作れませんでした。'
-  return 'タスクのノートを作れたかどうか、確かめられませんでした。作れていた場合は、Tasks のそのノートの本文に下の行と同じ行が入っています。元のノートは変えていません。'
+  return 'タスクのノートを作れたかどうか、確かめられませんでした。作れていた場合は、Tasks フォルダーにできたタスクのノートに、下の行と同じ行が入っています。元のノートは変えていません。'
 }
 
 // 自前のメニューの下に出す案内。
-export const MENU_HINT = 'Shift+右クリックでいつものメニュー'
+export const MENU_HINT = 'Shift+右クリックで、いつものメニューを出せます'
 
 // 送る中身（作成日は画面の今日）。
 // text は本文（movedBody の結果）。空なら送らない。
@@ -178,14 +178,14 @@ export function taskRequestBody(found, created, text = '') {
 // 取り消してもタスクのノートは消えないこと（移した行は、タスクのノートにも残ること）も書く。
 export function createdText(due, { moved = 0 } = {}) {
   const m = /^\d{4}-(\d{2})-(\d{2})$/.exec(due ?? '')
-  const head = m ? `期日 ${Number(m[1])}/${Number(m[2])} で作りました。` : '期日なしで作りました。'
-  if (Number.isInteger(moved) && moved > 0) return head + `下の${moved}行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して行を元に戻します。タスクのノートは、同じ行が入ったまま Tasks に残ります。`
-  return head + '「取り消す」を押すと、行のリンクだけを外します。タスクのノートは Tasks に残ります。'
+  const head = m ? `期日 ${Number(m[1])}/${Number(m[2])} でタスクを作りました。` : '期日なしでタスクを作りました。'
+  if (Number.isInteger(moved) && moved > 0) return head + `下の${moved}行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して行を元に戻します。タスクのノートは、同じ行が入ったまま Tasks フォルダーに残ります。`
+  return head + '「取り消す」を押すと、行のリンクだけを外します。タスクのノートは Tasks フォルダーに残ります。'
 }
 
 // 「取り消す」のあとの知らせ。moved は、移した行を戻したか。
 export function undoneText({ moved = false } = {}) {
-  const left = moved ? 'タスクのノートは、戻した行と同じ行が入ったまま Tasks に残っています。' : 'タスクのノートは Tasks に残っています。'
+  const left = moved ? 'タスクのノートは、戻した行と同じ行が入ったまま Tasks フォルダーに残っています。' : 'タスクのノートは Tasks フォルダーに残っています。'
   return '取り消しました。' + left + 'いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。'
 }
 

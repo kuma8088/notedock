@@ -100,17 +100,17 @@ test('送る中身は空の値を入れない', () => {
 })
 
 test('知らせの文', () => {
-  assert.match(createdText('2026-05-10'), /^期日 5\/10 で作りました。/)
-  assert.match(createdText(''), /^期日なしで作りました。/)
-  assert.match(createdText(undefined), /^期日なしで作りました。/)
-  assert.match(createdText('2026-05-10'), /Tasks に残ります/)
+  assert.match(createdText('2026-05-10'), /^期日 5\/10 でタスクを作りました。/)
+  assert.match(createdText(''), /^期日なしでタスクを作りました。/)
+  assert.match(createdText(undefined), /^期日なしでタスクを作りました。/)
+  assert.match(createdText('2026-05-10'), /Tasks フォルダーに残ります/)
   assert.equal(reasonText('heading').includes('見出し'), true)
   assert.equal(typeof reasonText('unknown'), 'string')
   assert.match(createFailedText(400, 'tasks-folder'), /Tasks というフォルダーを作れませんでした/)
   assert.match(createFailedText(409), /多すぎて/)
   assert.equal(createFailedText(500), 'タスクのノートを作れませんでした。')
   // 移す本文をサーバーが断った（長すぎる・\r や \0 を含む）ときは、一般の知らせと分ける
-  assert.match(createFailedText(400, 'body'), /^下の行をタスクのノートへ移せなかったので/)
+  assert.match(createFailedText(400, 'body'), /^下の行が多すぎるなどの理由でタスクのノートへ移せなかったので/)
   assert.equal(createFailedText(400, 'title'), 'タスクのノートを作れませんでした。')
 })
 
@@ -141,19 +141,19 @@ test('POST のあと：同じ場所ならそこへ、ずれただけなら同じ
 })
 
 test('リンクを足さなかったときの知らせは、理由とゴミ箱へ移せたかで分ける', () => {
-  assert.match(notLinkedText('switched', { trashed: true, taskPath: 'Tasks/a.md' }), /^作っている間に別のノートを開いたので、リンクは足していません。作ったタスクのノートはゴミ箱へ移しました。/)
-  assert.match(notLinkedText('stopped', { trashed: true, taskPath: 'Tasks/a.md' }), /保存が止まった/)
+  assert.match(notLinkedText('switched', { trashed: true, taskPath: 'Tasks/a.md' }), /^作っている間に別のノートを開いたので、リンクは追加していません。作ったタスクのノートはゴミ箱へ移しました。/)
+  assert.match(notLinkedText('stopped', { trashed: true, taskPath: 'Tasks/a.md' }), /保存できなくなった/)
   assert.match(notLinkedText('changed', { trashed: true, taskPath: 'Tasks/a.md' }), /行が書き換わった/)
-  assert.match(notLinkedText('changed', { trashed: false, taskPath: 'Tasks/a.md' }), /作ったノート（Tasks\/a\.md）が Tasks に残っています。$/)
-  assert.equal(leftoverText('Tasks/a.md'), 'リンクを足せませんでした。作ったノート（Tasks/a.md）が Tasks に残っています。')
+  assert.match(notLinkedText('changed', { trashed: false, taskPath: 'Tasks/a.md' }), /作ったタスクのノート（Tasks\/a\.md）が Tasks フォルダーに残っています。$/)
+  assert.equal(leftoverText('Tasks/a.md'), 'リンクを追加できませんでした。作ったタスクのノート（Tasks/a.md）が Tasks フォルダーに残っています。')
   // 下の行を本文に入れて作ったのに元のノートから消さなかったときは、本文に同じ行が入っていることも書く（ゴミ箱へ移せたときは書かない）
-  assert.equal(notLinkedText('changed', { trashed: false, taskPath: 'Tasks/a.md', moved: true }), '作っている間に行が書き換わったので、リンクは足していません。作ったノート（Tasks/a.md）が Tasks に残っています。本文には、下の行と同じ行が入っています。')
+  assert.equal(notLinkedText('changed', { trashed: false, taskPath: 'Tasks/a.md', moved: true }), '作っている間に行が書き換わったので、リンクは追加していません。作ったタスクのノート（Tasks/a.md）が Tasks フォルダーに残っています。本文には、下の行と同じ行が入っています。')
   assert.doesNotMatch(notLinkedText('changed', { trashed: true, taskPath: 'Tasks/a.md', moved: true }), /同じ行/)
-  assert.equal(leftoverText('Tasks/a.md', { moved: true }), 'リンクを足せませんでした。作ったノート（Tasks/a.md）が Tasks に残っています。本文には、下の行と同じ行が入っています。')
+  assert.equal(leftoverText('Tasks/a.md', { moved: true }), 'リンクを追加できませんでした。作ったタスクのノート（Tasks/a.md）が Tasks フォルダーに残っています。本文には、下の行と同じ行が入っています。')
   // 作れたかわからない（応答が届かなかった）とき。下の行を入れていなければ今までと同じ文
   assert.equal(createLostText(), 'タスクのノートを作れませんでした。')
-  assert.equal(createLostText({ moved: true }), 'タスクのノートを作れたかどうか、確かめられませんでした。作れていた場合は、Tasks のそのノートの本文に下の行と同じ行が入っています。元のノートは変えていません。')
-  assert.equal(MENU_HINT, 'Shift+右クリックでいつものメニュー')
+  assert.equal(createLostText({ moved: true }), 'タスクのノートを作れたかどうか、確かめられませんでした。作れていた場合は、Tasks フォルダーにできたタスクのノートに、下の行と同じ行が入っています。元のノートは変えていません。')
+  assert.equal(MENU_HINT, 'Shift+右クリックで、いつものメニューを出せます')
 })
 
 
@@ -256,18 +256,18 @@ test('移す変更：リンクを足すのと子の行を消すのは重なら�
 })
 
 test('作ったあとの知らせ：移した行があれば行数と、取り消すと戻ること', () => {
-  assert.equal(createdText('2026-05-10', { moved: 3 }), '期日 5/10 で作りました。下の3行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して行を元に戻します。タスクのノートは、同じ行が入ったまま Tasks に残ります。')
-  assert.match(createdText('', { moved: 1 }), /^期日なしで作りました。下の1行を/)
+  assert.equal(createdText('2026-05-10', { moved: 3 }), '期日 5/10 でタスクを作りました。下の3行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して行を元に戻します。タスクのノートは、同じ行が入ったまま Tasks フォルダーに残ります。')
+  assert.match(createdText('', { moved: 1 }), /^期日なしでタスクを作りました。下の1行を/)
   // 移した行がなければ今までと同じ文
   assert.equal(createdText('2026-05-10', { moved: 0 }), createdText('2026-05-10'))
   // 行数でないもの（planAfterCreate の moved は「ずれたか」の true・false）を渡しても、行数の文にしない
   assert.equal(createdText('2026-05-10', { moved: true }), createdText('2026-05-10'))
-  assert.equal(createdText('2026-05-10'), '期日 5/10 で作りました。「取り消す」を押すと、行のリンクだけを外します。タスクのノートは Tasks に残ります。')
+  assert.equal(createdText('2026-05-10'), '期日 5/10 でタスクを作りました。「取り消す」を押すと、行のリンクだけを外します。タスクのノートは Tasks フォルダーに残ります。')
 })
 
 test('取り消したあとの知らせ：タスクのノートが残ることと、消し方', () => {
-  assert.equal(undoneText({ moved: true }), '取り消しました。タスクのノートは、戻した行と同じ行が入ったまま Tasks に残っています。いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。')
-  assert.equal(undoneText(), '取り消しました。タスクのノートは Tasks に残っています。いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。')
+  assert.equal(undoneText({ moved: true }), '取り消しました。タスクのノートは、戻した行と同じ行が入ったまま Tasks フォルダーに残っています。いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。')
+  assert.equal(undoneText(), '取り消しました。タスクのノートは Tasks フォルダーに残っています。いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。')
 })
 
 test('Cmd+Z・Cmd+Shift+Z で足したリンクが消えたか・戻ったか：文書で決める', () => {
