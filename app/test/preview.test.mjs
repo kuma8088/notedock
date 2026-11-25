@@ -7,6 +7,7 @@ import { EditorState, EditorSelection } from '@codemirror/state'
 import { headingsOf, linkCompletion } from '../src/complete.mjs'
 import { relativeHref, resolveHref, slugify } from '../src/links.mjs'
 import { noteMarkdown } from '../src/markdown-ext.mjs'
+import { editableExtensions } from '../src/modes.mjs'
 import { atNoteStart, findCallouts, headingPlace, hiddenRanges, noteContext, noteMode, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from '../src/preview.mjs'
 import { addColumn, addRow, deleteRow, parseTable, replaceCell, setAlign, sortRows, splitRow } from '../src/table-model.mjs'
 import { CheckboxWidget, FrontmatterWidget, TableWidget, cleanCss, hasExternalRef, imagePlan, isExternalHref, keepHref } from '../src/widgets.mjs'
@@ -240,15 +241,14 @@ test('編集できないノートでは、表とチェックを変えられな�
   assert.equal(widgetsOf(free, CheckboxWidget)[0].readOnly, false)
 })
 
-test('プロパティ欄：ノートが編集できるか・動かしている間の組み合わせごとの状態', async () => {
-  const { EditorView } = await import('@codemirror/view')
+test('プロパティ欄：ノートが編集できるか・動かしている間の組み合わせごとの状態', () => {
   const text = '---\ntitle: "x"\ntype: task\nstatus: 未着手\nstart:\ndue: 2026-11-30\n---\n本文'
-  // main.mjs の editableExtensions と同じ決め方（ノートが編集できれば、画面も編集できる）。
+  // ノートが編集できれば、画面も編集できる（main.mjs が使う modes.mjs の editableExtensions）。
   const stateOf = ({ editable, busy = false }) => {
     const base = EditorState.create({
       doc: text,
       selection: EditorSelection.cursor(text.length),
-      extensions: [noteMarkdown(), noteContext.of({ path: 'a/b.md', known: new Set(), editable }), previewField, EditorView.editable.of(editable), EditorState.readOnly.of(!editable)],
+      extensions: [noteMarkdown(), noteContext.of({ path: 'a/b.md', known: new Set(), editable }), previewField, editableExtensions(editable)],
     })
     return base.update({ effects: [setMode.of('live'), togglePropsPanel.of(true), setNoteBusy.of(busy)] }).state
   }
@@ -257,24 +257,24 @@ test('プロパティ欄：ノートが編集できるか・動かしている�
     assert.equal(found.length, 1)
     return found[0]
   }
-  const fields = (w) => ({ open: w.open, noteEditable: w.noteEditable, locked: w.locked, viewEditable: w.viewEditable, busy: w.busy })
-  const items = parseFrontmatter(text.slice(0, text.indexOf('\n---\n') + 4)).items
-  const accessOf = (w, key) => w.access(items.find((item) => item.key === key), true, true)
+  const fields = (w) => ({ open: w.open, noteEditable: w.noteEditable, viewEditable: w.viewEditable, busy: w.busy })
+  // 行ごとの決まりはなく（タスクの status・日付も、ほかの項目と同じ）、入れ子があるか（simple）と画面の状態だけで決まる。
+  const accessOf = (w, simple = true) => w.access(simple)
 
   const liveEdit = widgetOf({ editable: true })
-  assert.deepEqual(fields(liveEdit), { open: true, noteEditable: true, locked: false, viewEditable: true, busy: false })
-  for (const key of ['title', 'status', 'due']) assert.deepEqual(accessOf(liveEdit, key), { full: true, value: true }, key)
+  assert.deepEqual(fields(liveEdit), { open: true, noteEditable: true, viewEditable: true, busy: false })
+  assert.deepEqual(accessOf(liveEdit), { full: true, value: true })
+  assert.deepEqual(accessOf(liveEdit, false), { full: false, value: false })
 
   // 編集できないノートは、タスクの status・日付も含めて直せない。
   const lockedNote = widgetOf({ editable: false })
-  assert.deepEqual(fields(lockedNote), { open: true, noteEditable: false, locked: true, viewEditable: false, busy: false })
-  for (const key of ['title', 'status', 'due']) assert.deepEqual(accessOf(lockedNote, key), { full: false, value: false }, key)
+  assert.deepEqual(fields(lockedNote), { open: true, noteEditable: false, viewEditable: false, busy: false })
+  assert.deepEqual(accessOf(lockedNote), { full: false, value: false })
 
   // 動かしている間は止める。
   const busy = widgetOf({ editable: true, busy: true })
   assert.equal(busy.busy, true)
-  assert.deepEqual(accessOf(busy, 'status'), { full: false, value: false })
-  assert.deepEqual(accessOf(busy, 'title'), { full: false, value: false })
+  assert.deepEqual(accessOf(busy), { full: false, value: false })
 
   // 状態が違えば eq は false（作り直す）、同じなら true。
   const all = [liveEdit, lockedNote, busy]

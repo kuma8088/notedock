@@ -839,15 +839,14 @@ export class TableWidget extends WidgetType {
 }
 
 export class FrontmatterWidget extends WidgetType {
-  // noteEditable: ノートそのものが編集できるか。locked: 読み取り専用か（編集できないノート、ノートを動かしている間）。
+  // noteEditable: ノートそのものが編集できるか（「このタスクを削除」を出すか）。
   // viewEditable: 画面が編集できるか（EditorView.editable）。busy: ノートを動かしている間など、欄をすべて止めるとき。
-  constructor(source, open, pos, { noteEditable = false, locked = false, viewEditable = false, busy = false } = {}) {
+  constructor(source, open, pos, { noteEditable = false, viewEditable = false, busy = false } = {}) {
     super()
     this.source = source
     this.open = open
     this.pos = pos
     this.noteEditable = noteEditable
-    this.locked = locked
     this.viewEditable = viewEditable
     this.busy = busy
   }
@@ -856,13 +855,12 @@ export class FrontmatterWidget extends WidgetType {
       other.source === this.source &&
       other.open === this.open &&
       other.noteEditable === this.noteEditable &&
-      other.locked === this.locked &&
       other.viewEditable === this.viewEditable &&
       other.busy === this.busy
     )
   }
   // その行の名前と値を直せるか。
-  access(item, simple, task) {
+  access(simple) {
     return propsRowAccess({ simple, viewEditable: this.viewEditable, busy: this.busy })
   }
   toDOM(view) {
@@ -888,7 +886,7 @@ export class FrontmatterWidget extends WidgetType {
       wrap.append(element('p', { class: 'cm-props-note' }, ['入れ子などがあるので、文字のまま編集します。']))
     }
     for (const item of items) {
-      const { full, value } = this.access(item, simple, task)
+      const { full, value } = this.access(simple)
       wrap.append(this.row(view, item, full, apply, { task, valueEditable: value }))
     }
     if (editable) {

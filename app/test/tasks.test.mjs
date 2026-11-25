@@ -102,24 +102,20 @@ test('項目の名前は小文字だけを対象にする（Type・Status など
   assert.equal(readTaskProps('---\ntype: task\nStatus: 完了\n---\n').status, '')
 })
 
-test('プロパティ欄の1行を直せるか', () => {
-  const base = { key: 'status', task: true, simple: true, noteEditable: true, viewEditable: true, busy: false }
-  // 編集の表示：すべて直せる。
-  assert.deepEqual(propsRowAccess(base), { full: true, value: true })
-  assert.deepEqual(propsRowAccess({ ...base, key: 'title' }), { full: true, value: true })
-  // 画面が編集できないとき（編集できないノート）は、タスクの status・start・due も含めて直せない（閲覧の表示だけの決まりはなくした）。
-  for (const key of ['status', 'start', 'due', 'title', 'type', 'goal', 'parent']) assert.deepEqual(propsRowAccess({ ...base, key, viewEditable: false }), { full: false, value: false }, key)
-  assert.deepEqual(propsRowAccess({ ...base, task: false, viewEditable: false }), { full: false, value: false })
-  assert.deepEqual(propsRowAccess({ ...base, task: false }), { full: true, value: true })
-  // ノートそのものが編集できない（読み取り専用の場所など）。
-  assert.deepEqual(propsRowAccess({ ...base, noteEditable: false, viewEditable: false }), { full: false, value: false })
-  // 入れ子などがある（simple でない）。
-  assert.deepEqual(propsRowAccess({ ...base, simple: false }), { full: false, value: false })
-  assert.deepEqual(propsRowAccess({ ...base, simple: false, viewEditable: false }), { full: false, value: false })
-  // ノートを動かしている間は止める。
-  assert.deepEqual(propsRowAccess({ ...base, busy: true }), { full: false, value: false })
-  assert.deepEqual(propsRowAccess({ ...base, busy: true, viewEditable: false }), { full: false, value: false })
-  assert.deepEqual(propsRowAccess({ key: 'status' }), { full: false, value: false })
+test('プロパティ欄の1行を直せるか（画面が編集できるか・入れ子があるか・動かしている間か で決まる）', () => {
+  // 画面が編集できて、入れ子がなく、動かしていなければ、すべて直せる。
+  assert.deepEqual(propsRowAccess({ viewEditable: true, simple: true, busy: false }), { full: true, value: true })
+  // どれか1つでも外れたら、どれも直せない（タスクの status・start・due も同じ。閲覧の表示だけの決まりはなくした）。
+  for (const viewEditable of [true, false]) {
+    for (const simple of [true, false]) {
+      for (const busy of [true, false]) {
+        const ok = viewEditable && simple && !busy
+        assert.deepEqual(propsRowAccess({ viewEditable, simple, busy }), { full: ok, value: ok }, JSON.stringify({ viewEditable, simple, busy }))
+      }
+    }
+  }
+  // 何も渡さないときは、画面が編集できないものとして扱う。
+  assert.deepEqual(propsRowAccess(), { full: false, value: false })
 })
 
 test('日付の欄で「打った」とみなすキー', () => {

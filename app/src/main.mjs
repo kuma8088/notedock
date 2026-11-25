@@ -36,7 +36,8 @@ import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { noteContext, noteMode, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from './preview.mjs'
+import { editableExtensions, pasteOpensNote, pastePlace } from './modes.mjs'
+import { cursorQuiet, keyEndsQuiet, noteContext, noteMode, previewField, setComposing, setCursorQuiet, setMode, setNoteBusy, togglePropsPanel } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
 import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
@@ -785,6 +786,24 @@ const editorEvents = EditorView.domEventHandlers({
   },
 })
 
+// 開いた直後の印（記号を出さない）を、本人がエディターをクリックするかキーを押したら外す。
+// 選択が変わる操作では、その変更で印が外れる（preview.mjs の quietAfter）。ここで外すのは、選択が変わらない場合の分。
+// フォーカスがあるときに、今のカーソルと同じ位置（開いた直後の本文の先頭）をクリックしても選択は変わらない。
+const quietEnders = EditorView.domEventObservers({
+  mousedown(event, target) {
+    if (event.button !== 0 || !cursorQuiet(target.state)) return
+    // チェックボックスや箇条書きの記号、ノートの情報の欄などの部品を押したときは、その操作のためなので外さない。
+    if (event.target?.closest?.('[contenteditable="false"]')) return
+    // エディターがクリックの位置を決めてから外す。先に外すと、先頭の行の見た目が変わって、押した位置がずれる。
+    setTimeout(() => {
+      if (cursorQuiet(target.state)) target.dispatch({ effects: setCursorQuiet.of(false) })
+    }, 0)
+  },
+  keydown(event, target) {
+    if (cursorQuiet(target.state) && keyEndsQuiet(event)) target.dispatch({ effects: setCursorQuiet.of(false) })
+  },
+})
+
 async function uploadImage(file, target) {
   const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg').replace('svg+xml', 'svg') ?? 'png'
   const name = file.name && file.name.includes('.') ? file.name : `image.${ext}`
@@ -892,6 +911,7 @@ function extensionsFor(path, canEdit) {
     editableSlot.of(editableExtensions(canEdit)),
     editorKeys,
     editorEvents,
+    quietEnders,
     hoverPreview,
     EditorView.updateListener.of(onUpdate),
     EditorView.contentAttributes.of({ spellcheck: 'false', autocapitalize: 'off', autocorrect: 'off' }),
@@ -901,10 +921,6 @@ function extensionsFor(path, canEdit) {
 // リンクの解決などに使う、開いているノートの情報。作り直すとき（タスクを作ったあと）も同じ中身にする。
 function noteContextFor(path, canEdit) {
   return noteContext.of({ path, known, newNoteDir: defaultNoteDir(path, noteFolders(notes)), api, editable: canEdit })
-}
-
-function editableExtensions(canEdit) {
-  return [EditorView.editable.of(canEdit), EditorState.readOnly.of(!canEdit)]
 }
 
 function onUpdate(update) {
@@ -1938,6 +1954,7 @@ function jumpTo(pos) {
   view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
 }
 
+// 見出しの位置まで見せるだけで、カーソルは動かさない（開いた直後の印も外さないので、先頭の見出しの # も出ない）。
 function jumpToAnchor(anchor) {
   if (!anchor) return
   const heading = findHeading(headingsOf(view.state), anchor)
@@ -2051,6 +2068,8 @@ async function openNote(path, { push = true, anchor = '', startMode = 'live' } =
   })
   if (view) view.setState(state)
   else view = new EditorView({ state, parent: $('editor') })
+  // 開いた直後は、カーソルが先頭にあっても記号を出さない（本人がクリックするかキーを押すまで）。
+  view.dispatch({ effects: setCursorQuiet.of(true) })
   applyMode(nextMode)
   // タスクのノートは、開いたらすぐステータスや期日を直せるように、プロパティ欄を開いておく。
   if (isTaskNote(note.text)) view.dispatch({ effects: togglePropsPanel.of(true) })
@@ -3678,9 +3697,9 @@ function moveSwitcher(delta) {
   items[next].scrollIntoView({ block: 'nearest' })
 }
 
-// 文字を貼れる画面では、Cmd+Vは普通の貼り付けにする。
-function pasteOpensNote() {
-  return !currentPath || !editable
+// Cmd+V でノートを開くか。決まりは modes.mjs の pasteOpensNote。target は貼り付けた先（フォーカスのある場所）。
+function pasteOpensNoteAt(target) {
+  return pasteOpensNote({ hasNote: Boolean(currentPath), editable, ...pastePlace(target) })
 }
 
 // 本文をクリックしても見た目が変わらないと分からないので、貼り付けを待っていることを見せる。
@@ -3689,11 +3708,11 @@ function showPasteHint(show) {
   document.body.classList.toggle('paste-ready', show)
 }
 
-// ノートを開いていないときと、編集できないノートでは文字を貼る場所がないので、Cmd+Vをコピーしたパスのノートを開く操作に使う。
+// フォーカスが本文や入力欄の外にあるとき（と、ノートを開いていないとき、編集できないノート）は文字を貼る場所がないので、
+// Cmd+Vをコピーしたパスのノートを開く操作に使う。本文や入力欄の中では、ふつうの貼り付け。
 function openFromPaste(event) {
   if (document.querySelector('dialog[open]')) return
-  if (!pasteOpensNote()) return
-  if (event.target?.closest?.('input, textarea, .cm-cell-editing, .cm-props')) return
+  if (!pasteOpensNoteAt(event.target)) return
   const text = event.clipboardData?.getData('text/plain') ?? ''
   const pasted = resolvePasted(text, rootPaths, allNotes, platform)
   if (pasted) {
@@ -3777,7 +3796,7 @@ function bindLeftChrome() {
   document.addEventListener('click', (event) => {
     // チェックやリンクを押したときは、その操作のためなので案内を出さない。
     const onBody = event.target.closest?.('#editor') && !event.target.closest('.cm-task-box, [data-href], a, #task-panel')
-    showPasteHint(Boolean(onBody) && pasteOpensNote())
+    showPasteHint(Boolean(onBody) && pasteOpensNoteAt(document.activeElement))
   })
   // 案内が最後の行に重なるので、読み進めるときは消す。
   $('editor').addEventListener('scroll', () => showPasteHint(false), { capture: true, passive: true })

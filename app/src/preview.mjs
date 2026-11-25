@@ -27,6 +27,34 @@ export function noteMode(value) {
   return value === 'source' ? 'source' : 'live'
 }
 export const setComposing = StateEffect.define()
+// 開いた直後の印（quiet）。本人がエディターをクリックするかキーを押すまでは、カーソルが触れていても記号を出さない。
+// 開いた直後はカーソルが本文の先頭にあるので、印がないと先頭の # や **、[[ ]] が文字のまま見えてしまう。
+// true で付け、false で外す。選択を変える変更（クリック、文字の入力、タスク機能などからの選択の変更）でも外れる。
+export const setCursorQuiet = StateEffect.define()
+
+// 1つの変更のあとの印。印を付け外しする効果があればそれに従い、なければ選択を変える変更で外す。
+// 外からの書き換えや一時保存の戻し（選択を変えない文字の変更）、チェックボックスの切り替えでは外さない。
+export function quietAfter(quiet, tr) {
+  const asked = tr.effects.filter((effect) => effect.is(setCursorQuiet)).at(-1)
+  if (asked) return asked.value === true
+  return quiet && tr.selection === undefined
+}
+
+// 印を外すキーか。Cmd・Ctrl・Shift・Alt だけを押したとき（リンクに乗せた小窓、Cmd+クリック）と、
+// Cmd・Ctrl と組み合わせたショートカット（ノートを探す Cmd+O など）では外さない。文字を変えるショートカットは、選択も変えるのでそこで外れる。
+// 日本語の変換を始めるキーでも外さない（変換の始まりで表示を変えないため。変換した文字が入ると選択が変わって外れる）。
+const MODIFIER_KEYS = new Set(['Meta', 'Control', 'Shift', 'Alt', 'AltGraph', 'CapsLock', 'Fn', 'OS'])
+export function keyEndsQuiet(event) {
+  if (!event || MODIFIER_KEYS.has(event.key)) return false
+  if (event.metaKey || event.ctrlKey) return false
+  if (event.isComposing || event.key === 'Process' || event.keyCode === 229) return false
+  return true
+}
+
+// 印が付いているか（previewField のない状態では false）。
+export function cursorQuiet(state) {
+  return state.field(previewField, false)?.quiet === true
+}
 export const togglePropsPanel = StateEffect.define()
 // ノートを動かしている間など、プロパティ欄をすべて止めるとき true。false に戻すと表示を作り直す。
 export const setNoteBusy = StateEffect.define()
@@ -43,8 +71,9 @@ const HIDE = Decoration.replace({})
 const HIGHLIGHT_COLORS = [['🔴', 'red'], ['🟠', 'orange'], ['🟡', 'yellow'], ['🟢', 'green'], ['🔵', 'blue'], ['🟣', 'purple']]
 
 // 書き換えられない表示（のぞくだけの表示と、編集できないノート）では、カーソルが見えないので、カーソルの行でも記号を出さない。
-function selectionToucher(state, mode) {
-  if (mode === 'reading' || state.readOnly) return { touches: () => false, lineTouched: () => false }
+// 開いた直後の印（quiet）があるときも、まだ本人が触っていないので出さない。
+function selectionToucher(state, mode, quiet = false) {
+  if (mode === 'reading' || state.readOnly || quiet) return { touches: () => false, lineTouched: () => false }
   const ranges = state.selection.ranges
   return {
     touches: (from, to) => ranges.some((r) => r.from <= to && r.to >= from),
@@ -86,10 +115,10 @@ function eachLine(state, from, to, fn) {
   }
 }
 
-export function buildDecorations(state, { mode = 'live', propsOpen = false, busy = false } = {}) {
+export function buildDecorations(state, { mode = 'live', propsOpen = false, busy = false, quiet = false } = {}) {
   if (mode === 'source') return Decoration.none
   const ctx = state.facet(noteContext)
-  const { touches, lineTouched } = selectionToucher(state, mode)
+  const { touches, lineTouched } = selectionToucher(state, mode, quiet)
   const reading = mode === 'reading'
   const locked = reading || state.readOnly
   const checksLocked = ctx.editable === false
@@ -121,7 +150,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false, busy
             return false
           }
           const text = doc.sliceString(from, to)
-          add(from, to, Decoration.replace({ widget: new FrontmatterWidget(text, propsOpen, from, { noteEditable: ctx.editable === true, locked, viewEditable: state.facet(EditorView.editable), busy }), block: true }))
+          add(from, to, Decoration.replace({ widget: new FrontmatterWidget(text, propsOpen, from, { noteEditable: ctx.editable === true, viewEditable: state.facet(EditorView.editable), busy }), block: true }))
           return false
         }
         case 'ATXHeading1':
@@ -470,11 +499,13 @@ function addIndentGuides(state, add) {
 
 export const previewField = StateField.define({
   create(state) {
-    return { deco: buildDecorations(state, { mode: 'live' }), mode: 'live', composing: false, propsOpen: false, busy: false }
+    // 印（quiet）は、ノートを開いたあとに setCursorQuiet で付ける。ここで付けると、カーソルの行を見せたい場面（小窓など）でも隠れるため。
+    return { deco: buildDecorations(state, { mode: 'live' }), mode: 'live', composing: false, propsOpen: false, busy: false, quiet: false }
   },
   update(value, tr) {
     let { mode, composing, propsOpen, busy } = value
-    let changed = false
+    const quiet = quietAfter(value.quiet, tr)
+    let changed = quiet !== value.quiet
     for (const effect of tr.effects) {
       if (effect.is(setMode)) {
         mode = effect.value
@@ -491,9 +522,10 @@ export const previewField = StateField.define({
       }
     }
     // 日本語の変換中は表示を切り替えない。変換が終わってからまとめて直す。
-    if (composing) return { ...value, composing, mode, propsOpen, busy, deco: value.deco.map(tr.changes) }
+    // 印は変換中も覚えておく（開いてすぐ日本語を打ったときに、印が残ったままにならないように）。
+    if (composing) return { ...value, composing, mode, propsOpen, busy, quiet, deco: value.deco.map(tr.changes) }
     if (changed || tr.docChanged || tr.selection) {
-      return { deco: buildDecorations(tr.state, { mode, propsOpen, busy }), mode, composing, propsOpen, busy }
+      return { deco: buildDecorations(tr.state, { mode, propsOpen, busy, quiet }), mode, composing, propsOpen, busy, quiet }
     }
     return value
   },
