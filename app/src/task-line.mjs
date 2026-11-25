@@ -201,14 +201,14 @@ export function weekDue(name, range) {
 
 // 行の親にあたる箇条書きを、近いものから順に返す（何段上でも）。見出し・区切り線・先頭のプロパティ・引用の深さが違う行で止まる。
 // 箇条書きでない行（注記の ※ … など）は飛ばして続ける。
-// 項目の下に字下げして書いた引用の中の行（「- [[2026-W10]]」の次の「  > - 目標」）は、引用の外の、引用の &gt; より浅い
+// 項目の下に字下げして書いた引用の中の行（「- [[2026-W10]]」の次の「  > - 目標」）は、引用の外の、引用の > より浅い
 // 字下げの箇条書きも親にする（lezer も、字下げした引用をその項目の中身として読む）。字下げのない引用（「> - 目標」）は今までどおり止まる。
 export function ancestorsOf(rows, index) {
   const self = rows[index]
   const out = []
   let limit = self.indent
   let quote = self.quote
-  // 引用の最初の &gt; の前の字下げの幅。引用の外へ出たら、これを limit にする。
+  // 引用の最初の > の前の字下げの幅。引用の外へ出たら、これを limit にする。
   const outer = quote > 0 ? widthOf(/^[\t ]*/.exec(self.text)[0]) : 0
   for (let i = index - 1; i >= 0 && (limit > 0 || (quote > 0 && outer > 0)); i--) {
     const row = rows[i]
@@ -267,13 +267,13 @@ function fencesOf(rows) {
 //   先頭のプロパティの行・選んだ行より引用が浅い行で止まる、
 //   選んだ行と同じ数の > を外したあとの字下げが rows[index] 以下の行で止まる、
 //   それ以外（字下げが深い行）は種類を問わず子。字下げしたあとに > がある行（項目の下に字下げして書いた引用）も子。
-//   子の行がコードの囲みを開くなら、閉じの行まで囲みごと子にする（中の行の字下げや > は見ない）。
+//   コードの囲みの中の行も、同じ決まりで見る（囲みの開きから閉じまで飛ばさない。閉じ忘れた囲みが、ずっと下の別の囲みと
+//   組になって、兄弟の行や見出しまで子になってしまうため。lezer も、項目の字下げより浅い行で囲みごと項目を終える）。
 // 返り値: { first, last }（rows の番号。末尾の空白だけの行は含めない）。子がなければ null。
 export function childRange(rows, index) {
   const self = rows?.[index]
   if (!self) return null
   const marks = quoteMarks(self.quote, true)
-  const fences = fencesOf(rows)
   let last = -1
   for (let i = index + 1; i < rows.length; i++) {
     const row = rows[i]
@@ -282,11 +282,6 @@ export function childRange(rows, index) {
     const mark = marks.exec(row.text)
     if (!mark || widthOf(/^[\t ]*/.exec(row.text.slice(mark[0].length))[0]) <= self.indent) break
     last = i
-    const close = fences.get(i)
-    if (close !== undefined && close > i) {
-      last = close
-      i = close
-    }
   }
   return last < 0 ? null : { first: index + 1, last }
 }
@@ -331,11 +326,14 @@ export function childrenOf(text, index, rows = analyzeLines(text)) {
   if (!range) return null
   const quote = rows[index].quote
   const kids = rows.slice(range.first, range.last + 1)
-  // コードの囲みの中の行と閉じの行（いちばん浅い字下げの幅を決めるのに使わない）。
+  // コードの囲みの中の行と閉じの行（いちばん浅い字下げの幅を決めるのに使わない）。範囲の中の行だけを入れる。
+  // 閉じが範囲の外にある囲み（閉じ忘れて、ずっと下の囲みと組になったものも）は、範囲の終わりまで。
+  // 閉じのない囲みは、ノートの終わりまで囲みの中（analyzeLines と同じ）なので、これも範囲の終わりまで。
   const loose = new Set()
   for (const [open, close] of fencesOf(rows)) {
-    if (open < range.first || open > range.last || close < 0) continue
-    for (let i = open + 1; i <= close; i++) loose.add(i - range.first)
+    if (open < range.first || open > range.last) continue
+    const end = close < 0 ? range.last : Math.min(close, range.last)
+    for (let i = open + 1; i <= end; i++) loose.add(i - range.first)
   }
   const from = rows[index].to
   const to = rows[range.last].to

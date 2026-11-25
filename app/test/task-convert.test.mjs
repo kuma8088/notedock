@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EditorState, Text } from '@codemirror/state'
 
-import { MENU_HINT, leftoverText, notLinkedText, planAfterCreate } from '../src/task-convert.mjs'
+import { MENU_HINT, createLostText, leftoverText, notLinkedText, planAfterCreate, undidTask, undoneText } from '../src/task-convert.mjs'
 import { canUndoDirectly, createFailedText, createdText, linkChange, linkRemoval, lineStillThere, menuForLine, reasonText, taskForDocLine, taskLinkText, taskRequestBody } from '../src/task-convert.mjs'
 import { expectedTaskPath, moveChanges, moveUndoChange, movedBody } from '../src/task-convert.mjs'
 import { Transaction } from '@codemirror/state'
@@ -146,6 +146,13 @@ test('リンクを足さなかったときの知らせは、理由とゴミ箱�
   assert.match(notLinkedText('changed', { trashed: true, taskPath: 'Tasks/a.md' }), /行が書き換わった/)
   assert.match(notLinkedText('changed', { trashed: false, taskPath: 'Tasks/a.md' }), /作ったノート（Tasks\/a\.md）が Tasks に残っています。$/)
   assert.equal(leftoverText('Tasks/a.md'), 'リンクを足せませんでした。作ったノート（Tasks/a.md）が Tasks に残っています。')
+  // 下の行を本文に入れて作ったのに元のノートから消さなかったときは、本文に同じ行が入っていることも書く（ゴミ箱へ移せたときは書かない）
+  assert.equal(notLinkedText('changed', { trashed: false, taskPath: 'Tasks/a.md', moved: true }), '作っている間に行が書き換わったので、リンクは足していません。作ったノート（Tasks/a.md）が Tasks に残っています。本文には、下の行と同じ行が入っています。')
+  assert.doesNotMatch(notLinkedText('changed', { trashed: true, taskPath: 'Tasks/a.md', moved: true }), /同じ行/)
+  assert.equal(leftoverText('Tasks/a.md', { moved: true }), 'リンクを足せませんでした。作ったノート（Tasks/a.md）が Tasks に残っています。本文には、下の行と同じ行が入っています。')
+  // 作れたかわからない（応答が届かなかった）とき。下の行を入れていなければ今までと同じ文
+  assert.equal(createLostText(), 'タスクのノートを作れませんでした。')
+  assert.equal(createLostText({ moved: true }), 'タスクのノートを作れたかどうか、確かめられませんでした。作れていた場合は、Tasks のそのノートの本文に下の行と同じ行が入っています。元のノートは変えていません。')
   assert.equal(MENU_HINT, 'Shift+右クリックでいつものメニュー')
 })
 
@@ -249,13 +256,28 @@ test('移す変更：リンクを足すのと子の行を消すのは重なら�
 })
 
 test('作ったあとの知らせ：移した行があれば行数と、取り消すと戻ること', () => {
-  assert.equal(createdText('2026-05-10', { moved: 3 }), '期日 5/10 で作りました。下の行3行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して移した行を戻します（タスクのノートは Tasks に残ります）。')
-  assert.match(createdText('', { moved: 1 }), /^期日なしで作りました。下の行1行を/)
+  assert.equal(createdText('2026-05-10', { moved: 3 }), '期日 5/10 で作りました。下の3行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して行を元に戻します。タスクのノートは、同じ行が入ったまま Tasks に残ります。')
+  assert.match(createdText('', { moved: 1 }), /^期日なしで作りました。下の1行を/)
   // 移した行がなければ今までと同じ文
   assert.equal(createdText('2026-05-10', { moved: 0 }), createdText('2026-05-10'))
   // 行数でないもの（planAfterCreate の moved は「ずれたか」の true・false）を渡しても、行数の文にしない
   assert.equal(createdText('2026-05-10', { moved: true }), createdText('2026-05-10'))
-  assert.equal(createdText('2026-05-10'), '期日 5/10 で作りました。「取り消す」を押すと、行のリンクだけを外します（タスクのノートは Tasks に残ります）。')
+  assert.equal(createdText('2026-05-10'), '期日 5/10 で作りました。「取り消す」を押すと、行のリンクだけを外します。タスクのノートは Tasks に残ります。')
+})
+
+test('取り消したあとの知らせ：タスクのノートが残ることと、消し方', () => {
+  assert.equal(undoneText({ moved: true }), '取り消しました。タスクのノートは、戻した行と同じ行が入ったまま Tasks に残っています。いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。')
+  assert.equal(undoneText(), '取り消しました。タスクのノートは Tasks に残っています。いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。')
+})
+
+test('Cmd+Z で「タスクにする」の変更まで戻ったか（作ったときの知らせを閉じる）', () => {
+  const last = { depth: 3 }
+  assert.equal(undidTask(last, { undo: true, depth: 2 }), true)
+  // あとで打った文字を戻しただけ（深さは作った直後と同じ）
+  assert.equal(undidTask(last, { undo: true, depth: 3 }), false)
+  // undo でない変更（打った・redo）では閉じない
+  assert.equal(undidTask(last, { undo: false, depth: 2 }), false)
+  assert.equal(undidTask(null, { undo: true, depth: 0 }), false)
 })
 
 // エディターと同じ拡張（Markdown・ノートの情報・プレビュー・プロパティの欄を守る決まり・履歴）で、1回の変更にまとめて入れる。

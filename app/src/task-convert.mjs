@@ -136,17 +136,27 @@ const NOT_LINKED_WHY = {
   changed: '作っている間に行が書き換わったので',
 }
 
-// リンクを足さなかったときの知らせ。trashed はゴミ箱へ移せたか。
-export function notLinkedText(reason, { trashed, taskPath }) {
+// 下の行をタスクのノートの本文に入れて作ったのに、元のノートから消さなかったときに足す文。
+const COPIED = '本文には、下の行と同じ行が入っています。'
+
+// リンクを足さなかったときの知らせ。trashed はゴミ箱へ移せたか。moved は、本文に入れた下の行があるか（元のノートからは消していない）。
+export function notLinkedText(reason, { trashed, taskPath, moved = false }) {
   const why = NOT_LINKED_WHY[reason] ?? '作っている間にノートが変わったので'
   return why + '、リンクは足していません。' + (trashed
     ? '作ったタスクのノートはゴミ箱へ移しました。もう一度選んでください。'
-    : `作ったノート（${taskPath}）が Tasks に残っています。`)
+    : `作ったノート（${taskPath}）が Tasks に残っています。` + (moved ? COPIED : ''))
 }
 
-// ノートを作ったあと、リンクを足す途中で失敗したときの知らせ。
-export function leftoverText(taskPath) {
-  return `リンクを足せませんでした。作ったノート（${taskPath}）が Tasks に残っています。`
+// ノートを作ったあと、リンクを足す途中で失敗したときの知らせ。moved は notLinkedText と同じ。
+export function leftoverText(taskPath, { moved = false } = {}) {
+  return `リンクを足せませんでした。作ったノート（${taskPath}）が Tasks に残っています。` + (moved ? COPIED : '')
+}
+
+// ノートを作れたかわからないまま失敗したとき（作る問い合わせの応答が届かなかったなど）の知らせ。元のノートは変えていない。
+// moved は、送った本文に下の行を入れていたか。
+export function createLostText({ moved = false } = {}) {
+  if (!moved) return 'タスクのノートを作れませんでした。'
+  return 'タスクのノートを作れたかどうか、確かめられませんでした。作れていた場合は、Tasks のそのノートの本文に下の行と同じ行が入っています。元のノートは変えていません。'
 }
 
 // 自前のメニューの下に出す案内。
@@ -165,11 +175,24 @@ export function taskRequestBody(found, created, text = '') {
 
 // 作ったあとの知らせ。期日は M/D で出す（年は出さない）。
 // moved は、タスクのノートへ移した子の行の数（空の行は数えない）。1以上なら、移したことと、取り消すと戻ることを書く。
+// 取り消してもタスクのノートは消えないこと（移した行は、タスクのノートにも残ること）も書く。
 export function createdText(due, { moved = 0 } = {}) {
   const m = /^\d{4}-(\d{2})-(\d{2})$/.exec(due ?? '')
   const head = m ? `期日 ${Number(m[1])}/${Number(m[2])} で作りました。` : '期日なしで作りました。'
-  if (Number.isInteger(moved) && moved > 0) return head + `下の行${moved}行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して移した行を戻します（タスクのノートは Tasks に残ります）。`
-  return head + '「取り消す」を押すと、行のリンクだけを外します（タスクのノートは Tasks に残ります）。'
+  if (Number.isInteger(moved) && moved > 0) return head + `下の${moved}行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して行を元に戻します。タスクのノートは、同じ行が入ったまま Tasks に残ります。`
+  return head + '「取り消す」を押すと、行のリンクだけを外します。タスクのノートは Tasks に残ります。'
+}
+
+// 「取り消す」のあとの知らせ。moved は、移した行を戻したか。
+export function undoneText({ moved = false } = {}) {
+  const left = moved ? 'タスクのノートは、戻した行と同じ行が入ったまま Tasks に残っています。' : 'タスクのノートは Tasks に残っています。'
+  return '取り消しました。' + left + 'いらなければ、サイドバーの「リンクが外れたタスク」からゴミ箱へ移せます。'
+}
+
+// 履歴の undo（Cmd+Z）で、「タスクにする」の変更まで戻ったか。last は作った直後の履歴の深さ（depth）。
+// 「タスクにする」の変更は1つの履歴になっている（isolateHistory）ので、深さがそれより浅くなれば、その変更は戻っている。
+export function undidTask(last, { undo, depth }) {
+  return Boolean(last && undo && Number.isInteger(last.depth) && depth < last.depth)
 }
 
 // 「取り消す」で、履歴の undo をそのまま使ってよいか。作った直後の文書と同じで、履歴の深さも同じときだけ。

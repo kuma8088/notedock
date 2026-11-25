@@ -50,7 +50,7 @@ import { checkNewTask, dailyDateOf } from './task-buckets.mjs'
 import { createTaskSide } from './task-side.mjs'
 import { createTaskPanel } from './task-panel.mjs'
 import { collectDescendants, confirmedChildren, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkedTrashCheck, unlinkRange, unsavedBlockText } from './task-delete.mjs'
-import { MENU_HINT, canUndoDirectly, createFailedText, createdText, expectedTaskPath, leftoverText, linkRemoval, menuForLine, moveChanges, moveUndoChange, movedBody, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
+import { MENU_HINT, canUndoDirectly, createFailedText, createLostText, createdText, expectedTaskPath, leftoverText, linkRemoval, menuForLine, moveChanges, moveUndoChange, movedBody, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody, undidTask, undoneText } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -1009,6 +1009,11 @@ function onUpdate(update) {
     syncToolbar()
   }
   if (foldsChanged(update)) rememberFolds()
+  // 履歴の undo（Cmd+Z）で「タスクにする」の変更まで戻ったら、作ったときの知らせ（「取り消す」）を閉じる。
+  if (lastTask && update.view === lastTask.view && undidTask(lastTask, { undo: update.transactions.some((tr) => tr.isUserEvent('undo')), depth: undoDepth(update.state) })) {
+    lastTask = null
+    hideTaskNotice()
+  }
 }
 
 function rememberFolds() {
@@ -3003,6 +3008,8 @@ async function makeTask(lineNumber) {
   let taskPath = null
   // リンクを足し終えたか。足したあとの失敗（一覧の読み直しがつながらないなど）を、リンクを足せなかったと知らせないため。
   let linked = false
+  // 下の行をタスクのノートの本文に入れて送ったか（失敗の知らせで、本文に同じ行が入っていることを書くため）。
+  let moving = false
   const path = currentPath
   const target = view
   try {
@@ -3011,6 +3018,7 @@ async function makeTask(lineNumber) {
     // 本文のリンクを直すのに使うのは予想のパス。行に足すリンクには、サーバーが返した実際のパスを使う。
     const day = todayText()
     const text = found.children ? movedBody(found, { notePath: path, taskPath: normalizeKey(expectedTaskPath(found, day)), known }) : ''
+    moving = Boolean(text)
     const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify(taskRequestBody(found, day, text)) })
     if (!created.ok || typeof created.data?.path !== 'string') {
       showMessage(createFailedText(created.status, created.data?.error))
@@ -3021,7 +3029,7 @@ async function makeTask(lineNumber) {
     if (plan.action === 'trash') {
       // リンクを足さないときは、作ったノートをゴミ箱へ移す。
       const trashed = await request('/api/trash', { method: 'POST', body: JSON.stringify({ path: taskPath }) })
-      showMessage(notLinkedText(plan.reason, { trashed: trashed.ok, taskPath }))
+      showMessage(notLinkedText(plan.reason, { trashed: trashed.ok, taskPath, moved: moving }))
       await refreshNotes()
       tasksSaved()
       return
@@ -3046,7 +3054,8 @@ async function makeTask(lineNumber) {
   } catch {
     // リンクを足したあとの失敗（一覧の読み直しなど）は、次の読み直しで追いつくので知らせない。
     // ノートを作ったあと、リンクを足す前の失敗なら、ノートが残っていることを知らせる。
-    if (!linked) showMessage(taskPath ? leftoverText(taskPath) : 'タスクのノートを作れませんでした。')
+    // 作る問い合わせの応答が届かなかったとき（taskPath がない）は、ノートができているかもしれない。
+    if (!linked) showMessage(taskPath ? leftoverText(taskPath, { moved: moving }) : createLostText({ moved: moving }))
   } finally {
     taskBusy = false
   }
@@ -3075,13 +3084,16 @@ function undoLastTask() {
   lastTask = null
   saver?.save()
   tasksSaved()
+  // 取り消してもタスクのノートは残る（移した行も入ったまま）ので、消し方といっしょに知らせる。
+  showTaskNotice(undoneText({ moved: Boolean(last.removedText) }), { undo: false })
 }
 
-function showTaskNotice(text) {
+// undo: false なら「取り消す」のボタンを出さない（取り消したあとの知らせ）。
+function showTaskNotice(text, { undo = true } = {}) {
   const notice = $('task-notice')
   notice.replaceChildren(
     document.createTextNode(text),
-    bannerButton('取り消す', undoLastTask),
+    ...(undo ? [bannerButton('取り消す', undoLastTask)] : []),
     bannerButton('閉じる', hideTaskNotice),
   )
   notice.hidden = false

@@ -667,16 +667,27 @@ test('子の行の範囲：項目の下に字下げして書いた引用と、�
   // 字下げのない引用・選んだ行と同じ字下げの引用は子ではない
   assert.equal(kidsOf('- a\n> 引用', '- a'), null)
   assert.equal(kidsOf('\t- a\n\t> 引用', '- a'), null)
-  // 囲みの中の行が浅くても、囲みごと子にする。いちばん浅い幅は囲みの中の行と閉じの行では決めない
-  const shallow = '\t- a\n\t\t- b\n\t\t' + fence + '\ncode\n\t' + fence + '\n- c'
-  assert.deepEqual(kidsOf(shallow, '- a'), ['\t\t- b', '\t\t' + fence, 'code', '\t' + fence])
-  assert.deepEqual(childrenOf(shallow, 0).lines, ['- b', fence, 'code', fence])
+  // 囲みの中の行も、ふつうの決まりで見る。字下げが浅い行（囲みの中でも）で止まる（lezer も、そこで囲みごと項目を終える）
+  const shallow = '- x\n\t- a\n\t\t- b\n\t\t' + fence + '\ncode\n\t' + fence + '\n- c'
+  assert.deepEqual(kidsOf(shallow, '\t- a'), ['\t\t- b', '\t\t' + fence])
+  assert.deepEqual(childrenOf(shallow, 1).lines, ['- b', fence])
+  // 閉じ忘れた囲みが、ずっと下の別の囲みと組になっても、兄弟の行や見出しまでは子にしない
+  const unclosed = ['## Target', '- [ ] 目標', '  ' + fence, '  メモ', '- [ ] 兄弟1', '- [ ] 兄弟2', '## 見出し', fence, '別のコード', fence, '- [ ] 最後'].join('\n')
+  assert.deepEqual(kidsOf(unclosed, '目標'), ['  ' + fence, '  メモ'])
+  const found = taskFromLine({ path: '90_Periodic/2026/Monthly/2026-03.md', text: unclosed, line: 2, periodicRoot: ROOT })
+  assert.equal(found.ok, true)
+  assert.deepEqual(found.children.lines, [fence, 'メモ'])
+  assert.equal(found.children.count, 2)
+  assert.equal(found.children.text, '\n  ' + fence + '\n  メモ')
+  // 閉じが範囲の外にある囲み・閉じのない囲みの中の行は、いちばん浅い幅を決めるのに使わない（どちらも同じ形になる）
+  assert.deepEqual(childrenOf('- a\n    ' + fence + '\n   x\n- b\n' + fence, 0).lines, [fence, 'x'])
+  assert.deepEqual(childrenOf('- a\n    ' + fence + '\n   x\n  y', 0).lines, [fence, 'x', 'y'])
   // 閉じのない囲みは、囲みとして扱わず、ほかの行と同じく字下げで止める
   assert.deepEqual(kidsOf('- a\n  ' + fence + '\n  x\n- b\n  y', '- a'), ['  ' + fence, '  x'])
   // 隣り合う2つの囲み：2つ目が字下げなしなら、そこで止まる
   assert.deepEqual(kidsOf('- a\n  ' + fence + '\n  x\n  ' + fence + '\n' + fence + '\n- z\n' + fence, '- a'), ['  ' + fence, '  x', '  ' + fence])
   // lezer の ListItem と同じ範囲になる
-  for (const text of [quoted, coded, inQuote, fenceInQuote]) assert.deepEqual(compareNesting(text).diffs, [], text)
+  for (const text of [quoted, coded, inQuote, fenceInQuote, shallow, unclosed]) assert.deepEqual(compareNesting(text).diffs, [], text)
 })
 
 test('字下げの外し方：いちばん浅い行の幅をそろえて外す・引用の > を外す・空の行', () => {
