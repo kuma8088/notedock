@@ -45,6 +45,11 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
   let knownFrom = null
   let knownSet = null
   let actualOf = new Map()
+  // known に Tasks/ の下のファイルを足したもの。known は少し前の一覧（app.mjs で10秒覚える）なので、外から作ったばかりの
+  // タスクのノートが入っていないことがある。足すものと元の known が同じ間は、同じ Set を使う。
+  let mergedFrom = null
+  let mergedExtra = ''
+  let mergedSet = null
 
   // Vault 直下の、folder と大文字小文字だけ違う名前のフォルダーも使う。返すパスは実際の名前にする。
   // 同じ名前（大文字小文字だけ違う）が2つあるとき（大文字小文字を区別するディスク）は、決めた名前どおりのものを選ぶ。
@@ -139,6 +144,30 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
     return { set: knownSet, truncated: listed?.truncated === true }
   }
 
+  // known に、たどった Tasks/ の下のファイル（rels）のうち、まだないものを足す。
+  function withTaskFiles(set, rels) {
+    const extra = rels.filter((rel) => !set.has(normalizeKey(rel))).sort()
+    if (!extra.length) return set
+    const key = extra.join('\n')
+    if (mergedFrom !== set || mergedExtra !== key) {
+      mergedFrom = set
+      mergedExtra = key
+      mergedSet = new Set([...set, ...extra.map(normalizeKey)])
+      for (const rel of extra) actualOf.set(normalizeKey(rel), rel)
+    }
+    return mergedSet
+  }
+
+  // known にない元のノートが、ディスクにはあるか（隠しファイルは、ないものとする）。
+  function existsOnDisk(rel) {
+    try {
+      const full = resolveNotePath(root, rel)
+      return !isHidden(full) && fingerprint(full) !== 'missing'
+    } catch {
+      return false
+    }
+  }
+
   // goal・parent のノートのリンク。読めない・隠しファイルなら null。変わっていなければ読み直さない。
   function sourceRefs(rel, used) {
     const actual = actualOf.get(normalizeKey(rel)) ?? rel
@@ -158,11 +187,13 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
     const hit = sources.get(actual)
     if (hit && hit.fp === fp) return hit.refs
     sourceReads++
-    let refs = null
+    let refs
     try {
       refs = linkRefsIn(readNote(root, actual).text)
     } catch {
-      refs = null
+      // 読めなかったことは覚えない（一時的な失敗のあと、ファイルが変わるまで判定しないままにならないように）。
+      sources.delete(actual)
+      return null
     }
     sources.set(actual, { fp, refs })
     return refs
@@ -207,11 +238,13 @@ export function createTaskIndex(root, { isHidden = () => false, maxEntries = 500
   // 「リンクが外れたか」を毎回決め直す（答えはほかのファイルと known で変わるので覚えない）。
   // 一覧が途中まで（多すぎる）ときは、Tasks/ からのリンクを全部は見られないので、どれも外れたとしない。
   function judge(tasks, truncated) {
+    // Vault のノートの一覧が途中まで（多すぎる）ときも、名前だけのリンクを正しく解決できないので、どれも外れたとしない。
     const known = knownNow()
-    if (!known || truncated) return null
+    if (!known || truncated || known.truncated) return null
     const used = new Set()
+    const set = withTaskFiles(known.set, [...cache.keys()])
     const taskNotes = [...cache.entries()].map(([rel, entry]) => ({ path: rel, refs: entry.refs ?? [] }))
-    const map = unlinkedMap(tasks, { known: known.set, refsOf: (rel) => sourceRefs(rel, used), taskNotes, complete: !known.truncated })
+    const map = unlinkedMap(tasks, { known: set, refsOf: (rel) => sourceRefs(rel, used), taskNotes, complete: true, existsOnDisk })
     // 使わなくなった goal・parent のノートは覚えておかない。
     for (const rel of [...sources.keys()]) if (!used.has(rel)) sources.delete(rel)
     return map

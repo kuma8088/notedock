@@ -420,3 +420,69 @@ test('GET /api/tasks の unlinked：サーバー全体で、リンクを消す�
     })
   }
 })
+
+// ---- E2 のレビューの指摘（中1・小2・小10） ----
+
+test('GET /api/tasks の unlinked：外から作ったノート（Vault の一覧の控えにまだない）でも、すぐ正しく決める', async () => {
+  const r = makeRoot()
+  const st = fs.mkdtempSync(path.join(os.tmpdir(), 'tasks-state-'))
+  const M = '90_Periodic/2026/Monthly/2026-11.md'
+  const G = '"[[90_Periodic/2026/Monthly/2026-11]]"'
+  put(r, M, '- 目標 [[Tasks/a|→タスク]]\n')
+  put(r, 'Tasks/a.md', task({ title: 'A', type: 'task', goal: G }))
+  const app = createApp({ root: r, port: 0, backupDir: st, stateDir: st, vaultDir: path.join(st, 'vault'), noToken: true })
+  const srv = await app.listen(0)
+  const url = `http://127.0.0.1:${srv.address().port}`
+  const flags = async () => Object.fromEntries((await (await fetch(`${url}/api/tasks`)).json()).tasks.map((t) => [t.title, t.unlinked]))
+  try {
+    // 1回読んで、Vault の一覧を控えさせる（10秒覚える）
+    assert.deepEqual(await flags(), { A: false })
+    // 新しい月のノートと、それを goal にしたタスク
+    put(r, '90_Periodic/2026/Monthly/2026-12.md', '- 12月 [[Tasks/b|→タスク]]\n')
+    put(r, 'Tasks/b.md', task({ title: 'B', type: 'task', goal: '"[[90_Periodic/2026/Monthly/2026-12]]"' }))
+    // 今の月のノートに、名前だけのリンクで足したタスク
+    put(r, M, '- 目標 [[Tasks/a|→タスク]]\n- 追加 [[c]]\n')
+    put(r, 'Tasks/c.md', task({ title: 'C', type: 'task', goal: G }))
+    // 新しい親のタスクと子（親の本文のリンクは名前だけ）
+    put(r, 'Tasks/p2.md', task({ title: 'P2', type: 'task' }, '- [ ] 子 [[d|→タスク]]\n'))
+    put(r, 'Tasks/d.md', task({ title: 'D', type: 'task', parent: '"[[Tasks/p2]]"' }))
+    // 新しい親で、親にリンクがない子は外れた
+    put(r, 'Tasks/p3.md', task({ title: 'P3', type: 'task' }, '本文にリンクなし\n'))
+    put(r, 'Tasks/e.md', task({ title: 'E', type: 'task', parent: '"[[Tasks/p3]]"' }))
+    // goal のノートがどこにもないタスクも外れた
+    put(r, 'Tasks/f.md', task({ title: 'F', type: 'task', goal: '"[[90_Periodic/2026/Monthly/2027-01]]"' }))
+    assert.deepEqual(await flags(), { A: false, B: false, C: false, D: false, E: true, F: true, P2: false, P3: false })
+  } finally {
+    await new Promise((done) => {
+      srv.closeAllConnections()
+      srv.close(done)
+    })
+  }
+})
+
+test('unlinked：Vault の一覧が途中まで（truncated）なら、名前だけのリンクのタスクも外れたとしない', () => {
+  const r = makeRoot()
+  const M = '90_Periodic/2026/Monthly/2026-11.md'
+  put(r, M, '- 目標 [[y]]\n')
+  put(r, 'Tasks/y.md', task({ title: 'Y', type: 'task', goal: '"[[90_Periodic/2026/Monthly/2026-11]]"' }))
+  put(r, 'Tasks/z.md', task({ title: 'Z', type: 'task', goal: '"[[90_Periodic/2026/Monthly/2026-11]]"' }))
+  const index = createTaskIndex(r, { notes: () => ({ known: [M], truncated: true }) })
+  assert.deepEqual(Object.fromEntries(index.list().tasks.map((t) => [t.title, t.unlinked])), { Y: false, Z: false })
+})
+
+test('unlinked：goal のノートを一時的に読めなかったことは覚えない（直ったら、ファイルが変わらなくても決め直す）', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+  const r = makeRoot()
+  const M = '90_Periodic/2026/Monthly/2026-11.md'
+  const full = put(r, M, '- 目標\n')
+  put(r, 'Tasks/a.md', task({ title: 'A', type: 'task', goal: '"[[90_Periodic/2026/Monthly/2026-11]]"' }))
+  const index = createTaskIndex(r, { notes: () => ({ known: [M, 'Tasks/a.md'], truncated: false }) })
+  fs.chmodSync(full, 0o000)
+  try {
+    // 読めない間は、外れたとしない
+    assert.equal(index.list().tasks[0].unlinked, false)
+  } finally {
+    fs.chmodSync(full, 0o644)
+  }
+  // 権限を戻しただけ（中身・大きさ・更新日時は同じ）でも、読み直して外れたと決める
+  assert.equal(index.list().tasks[0].unlinked, true)
+})

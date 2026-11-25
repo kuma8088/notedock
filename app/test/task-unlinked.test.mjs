@@ -108,3 +108,51 @@ test('CRLF のノートでも読める。linkedKeys は解決したキーを返�
   assert.deepEqual(refs, [{ wiki: 'Tasks/A' }])
   assert.deepEqual([...linkedKeys(refs, MONTH, new Set(['Tasks/A.md']))], ['tasks/a'])
 })
+
+// ---- E2 のレビューの指摘（小1・小2・小9・中1） ----
+
+test('BOM つきのタスクノート：先頭のプロパティ（parent: など）のリンクは数えない', () => {
+  const BOM = String.fromCharCode(0xfeff)
+  assert.deepEqual(linkRefsIn(BOM + '---\ntype: task\nparent: "[[Tasks/p]]"\n---\n'), [])
+  assert.deepEqual(linkRefsIn(BOM + '---\ntype: task\n---\n[[Tasks/p]]\n'), [{ wiki: 'Tasks/p' }])
+  // 子の parent: が親へのリンクに数えられて、親が「外れていない」にならない
+  const tasks = [{ path: T('p'), goal }, { path: T('c'), goal, parent: '[[Tasks/p]]' }]
+  const notes = { [MONTH]: '- 目標\n', [T('p')]: '', [T('c')]: BOM + '---\ntype: task\nparent: "[[Tasks/p]]"\n---\n' }
+  assert.deepEqual(judge(tasks, notes), { [T('p')]: true, [T('c')]: true })
+})
+
+test('数えないもの：行内コードと HTML のコメント（行をまたぐものも）の中', () => {
+  const tasks = [{ path: T('a'), goal }]
+  for (const text of ['文中の `[[Tasks/a]]` はコード\n', '文中の ``a ` [[Tasks/a]]`` はコード\n', '<!-- [[Tasks/a]] -->\n', '<!--\n- [[Tasks/a]]\n-->\n本文\n']) {
+    assert.equal(judge(tasks, { [MONTH]: text })[T('a')], true, text)
+  }
+  // 閉じたあとのリンク・閉じていない ` のあとのリンクは数える
+  for (const text of ['`code` [[Tasks/a]]\n', '<!-- x --> [[Tasks/a]]\n', '<!--\nx\n--> [[Tasks/a]]\n', '閉じない ` [[Tasks/a]]\n']) {
+    assert.equal(judge(tasks, { [MONTH]: text })[T('a')], false, text)
+  }
+})
+
+test('known が途中まで（complete: false）なら、名前だけのリンクでも外れたとしない', () => {
+  const tasks = [{ path: T('y'), goal }]
+  // known に月のノートしかない（Tasks/y がない）と、名前だけの [[y]] は届かないが、途中までなので外れたとしない
+  const known = new Set([MONTH])
+  const refsOf = () => linkRefsIn('- [[y]]\n')
+  assert.equal(unlinkedMap(tasks, { known, refsOf, complete: false }).get(pathKey(T('y'))), false)
+  assert.equal(unlinkedMap(tasks, { known, refsOf, complete: true }).get(pathKey(T('y'))), true)
+})
+
+test('Tasks/ の中の type: task でないノートからのリンクでも、外れていない', () => {
+  const tasks = [{ path: T('a'), goal }]
+  assert.equal(judge(tasks, { [MONTH]: '', [T('memo')]: '- [[Tasks/a]]\n' })[T('a')], false)
+})
+
+test('known にない元のノートでも、ディスクにあれば（existsOnDisk）中のリンクを見る', () => {
+  const tasks = [{ path: T('b'), goal: '[[90_Periodic/2026/Monthly/2026-12]]' }]
+  const M2 = '90_Periodic/2026/Monthly/2026-12.md'
+  const known = new Set([T('b')])
+  const refsOf = (p) => (p === M2 ? linkRefsIn('- [[Tasks/b|→タスク]]\n') : null)
+  assert.equal(unlinkedMap(tasks, { known, refsOf }).get(pathKey(T('b'))), true)
+  assert.equal(unlinkedMap(tasks, { known, refsOf, existsOnDisk: (p) => p === M2 }).get(pathKey(T('b'))), false)
+  // ディスクにあってリンクがなければ外れた
+  assert.equal(unlinkedMap(tasks, { known, refsOf: () => [], existsOnDisk: () => true }).get(pathKey(T('b'))), true)
+})

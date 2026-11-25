@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, planUnlinkInNote, relocateLink, sourceNoteOf, taskLinksIn, trashFailedNotice, trashFailedText, unlinkRange } from '../src/task-delete.mjs'
+import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, linkRows, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskLinksIn, trashFailedNotice, trashFailedText, unlinkedTrashCheck, unlinkRange } from '../src/task-delete.mjs'
 
 const T = (path, parentPath = null, title = '') => ({ path, parentPath, title })
 
@@ -187,4 +187,41 @@ test('ゴミ箱へ移せなかったとき：行のリンクを外していれ�
   assert.doesNotMatch(trashFailedNotice({ failed: ['Tasks/a.md'], rootMoved: false, unlinked: true, undo: false }), /元に戻す/)
   // 子だけ失敗したとき（タスク自身は移せた）は、失敗したものだけ
   assert.equal(trashFailedNotice({ failed: ['Tasks/b.md'], rootMoved: true, unlinked: true, undo: true }), trashFailedText(['Tasks/b.md']))
+})
+
+// ---- E2 のレビューの指摘（中2・小5・小6・小9） ----
+
+test('リンクを探す：行内コードと HTML のコメントの中は数えない。位置は元の文書のまま', () => {
+  const text = '- `[[Tasks/a]]` と <!-- [[Tasks/a]] --> と [[Tasks/a|→タスク]]\n<!--\n[[Tasks/a]]\n-->'
+  const links = taskLinksIn(text, MONTH, 'Tasks/a.md', known)
+  assert.equal(links.length, 1)
+  assert.equal(text.slice(links[0].from, links[0].to), '[[Tasks/a|→タスク]]')
+  assert.equal(links[0].lineText, text.split('\n')[0])
+  assert.equal(linkRows('a `b` <!-- c --> d')[0].scan.length, 'a `b` <!-- c --> d'.length)
+})
+
+test('ゴミ箱へ移せなかったとき：リンク元のリンクも外していれば、タスク自身を移せなかったときだけ書き添える', () => {
+  const failed = trashFailedNotice({ failed: ['Tasks/a.md'], rootMoved: false, unlinked: true, undo: true, sourceName: '2026-11' })
+  assert.match(failed, /「元に戻す」（Cmd\+Z）で、外したリンクを戻せます。\n「2026-11」の中のリンクは外しました（「元に戻す」では戻りません）。$/)
+  assert.doesNotMatch(trashFailedNotice({ failed: ['Tasks/b.md'], rootMoved: true, unlinked: true, undo: true, sourceName: '2026-11' }), /2026-11/)
+  assert.equal(sourceLinkNote(''), '')
+  assert.match(sourceLinkNote('P'), /^\n「P」の中のリンクは外しました/)
+})
+
+test('一覧の「ゴミ箱へ」：読み直した一覧で、まだ外れているときだけ移す', () => {
+  const list = [{ path: 'Tasks/a.md', unlinked: true }, { path: 'Tasks/b.md', unlinked: false }]
+  assert.equal(unlinkedTrashCheck(list, 'tasks/A.md').ok, true)
+  assert.equal(unlinkedTrashCheck(list, 'Tasks/a.md').task.path, 'Tasks/a.md')
+  assert.match(unlinkedTrashCheck(list, 'Tasks/b.md').message, /もうリンクが外れたタスクではない/)
+  assert.match(unlinkedTrashCheck(list, 'Tasks/x.md').message, /もうリンクが外れたタスクではない/)
+  assert.match(unlinkedTrashCheck(null, 'Tasks/a.md').message, /一覧を読めなかった/)
+})
+
+test('閉じていない <!-- のあとのリンクは数える。表示名に行内コードがあっても、見つけたリンクの文字は元のまま', () => {
+  assert.equal(taskLinksIn('<!-- 閉じない\n- [[Tasks/a]]\n', MONTH, 'Tasks/a.md', known).length, 1)
+  const text = '- [[Tasks/a|`x` の作業]]'
+  const [link] = taskLinksIn(text, MONTH, 'Tasks/a.md', known)
+  assert.equal(link.text, '[[Tasks/a|`x` の作業]]')
+  // 位置がずれた文書でも、同じ文字で見つけ直せる
+  assert.ok(relocateLink('先頭\n' + text, { from: link.from, to: link.to, linkText: link.text }, { notePath: MONTH, taskPath: 'Tasks/a.md', known }))
 })

@@ -72,21 +72,82 @@ export function unlinkRange(lineText, lineFrom, from, to) {
 const WIKI = /!?\[\[([^\[\]\n]+)\]\]/g
 const MD_LINK = /!?\[[^\]\n]*\]\(([^()\s]+)(?:\s+"[^"]*")?\)/g
 
-// ノートの本文から、taskPath を指すリンクを全部探す（先頭のプロパティとコードの中は見ない。画像などの埋め込み ![[…]] も数えない）。
+// リンクを探す行。先頭のプロパティとフェンスのコードの行は除き、行内コード（`…`）と HTML のコメント（<!-- … -->。
+// 行をまたいでもよい）の中は空白に置き換えた scan を付ける（長さは変えないので、見つけた位置はそのまま文書の位置に使える）。
+// リンクが外れたかの判定（task-unlinked.mjs）と、外すリンクを探すとき（taskLinksIn）で同じものを使う。
+export function linkRows(text) {
+  const out = []
+  let inComment = false
+  for (const row of analyzeLines(text)) {
+    if (row.kind === 'front' || row.kind === 'code') continue
+    const line = row.text
+    let scan = ''
+    let i = 0
+    while (i < line.length) {
+      if (inComment) {
+        const end = line.indexOf('-->', i)
+        const stop = end < 0 ? line.length : end + 3
+        scan += ' '.repeat(stop - i)
+        i = stop
+        if (end >= 0) inComment = false
+        continue
+      }
+      // 閉じる --> がこのあとのどこにもないコメントは、HTML のコメントとして扱わない（残りのリンクを全部見落とさないように）。
+      if (line.startsWith('<!--', i) && text.indexOf('-->', row.from + i + 4) >= 0) {
+        inComment = true
+        scan += '    '
+        i += 4
+        continue
+      }
+      if (line[i] === '`') {
+        let n = 1
+        while (line[i + n] === '`') n++
+        // 同じ数の ` が続くところで閉じる。閉じなければ、ただの文字。
+        let close = -1
+        for (let j = i + n; j < line.length; ) {
+          if (line[j] !== '`') {
+            j++
+            continue
+          }
+          let m = 1
+          while (line[j + m] === '`') m++
+          if (m === n) {
+            close = j
+            break
+          }
+          j += m
+        }
+        if (close < 0) {
+          scan += line.slice(i, i + n)
+          i += n
+          continue
+        }
+        scan += ' '.repeat(close + n - i)
+        i = close + n
+        continue
+      }
+      scan += line[i]
+      i++
+    }
+    out.push({ ...row, scan })
+  }
+  return out
+}
+
+// ノートの本文から、taskPath を指すリンクを全部探す（先頭のプロパティとコード・行内コード・HTML のコメントの中は見ない。画像などの埋め込み ![[…]] も数えない）。
 // 返り値：[{ from, to, text, lineFrom, lineText }]（from・to は text の中の位置）。
 export function taskLinksIn(text, notePath, taskPath, known) {
   const want = pathKey(taskPath)
   const found = []
-  for (const row of analyzeLines(text)) {
-    if (row.kind === 'front' || row.kind === 'code') continue
-    for (const match of row.text.matchAll(WIKI)) {
+  for (const row of linkRows(text)) {
+    for (const match of row.scan.matchAll(WIKI)) {
       if (match[0].startsWith('!')) continue
       const parsed = parseWikiLink(match[1])
       if (!parsed?.file) continue
       const target = resolveWikiTarget(notePath, parsed.file, known)
       if (target && pathKey(target.path) === want) found.push(hit(row, match))
     }
-    for (const match of row.text.matchAll(MD_LINK)) {
+    for (const match of row.scan.matchAll(MD_LINK)) {
       if (match[0].startsWith('!') || isExternal(match[1])) continue
       const target = resolveHref(notePath, match[1])
       if (target && pathKey(target.path) === want) found.push(hit(row, match))
@@ -95,8 +156,11 @@ export function taskLinksIn(text, notePath, taskPath, known) {
   return found.sort((x, y) => x.from - y.from)
 }
 
+// text は元の文書の文字（scan では、表示名の中の行内コードが空白になっているため）。
 function hit(row, match) {
-  return { from: row.from + match.index, to: row.from + match.index + match[0].length, text: match[0], lineFrom: row.from, lineText: row.text }
+  const from = row.from + match.index
+  const to = from + match[0].length
+  return { from, to, text: row.text.slice(match.index, match.index + match[0].length), lineFrom: row.from, lineText: row.text }
 }
 
 // goal・parent のノートの中のリンクを外す計画。ちょうど1つなら { count: 1, change }、0 か 2つ以上なら { count, change: null }。
@@ -194,10 +258,25 @@ export function deletedText({ title, movedChildren = 0, undo = true, unlinked = 
 
 // ゴミ箱へ移せなかったものがあるときの知らせ。rootMoved：消すタスク自身は移せたか。
 // unlinked・undo：行のリンクを外したか、それを「元に戻す」で戻せるか（タスク自身を移せなかったときは、戻し方を添える）。
-export function trashFailedNotice({ failed, rootMoved, unlinked = false, undo = false, keyLabel = (text) => text }) {
+// sourceName：リンク元のノートの中のリンクも外したとき、その名前（「元に戻す」では戻らないので、タスク自身を移せなかったときは書き添える）。
+export function trashFailedNotice({ failed, rootMoved, unlinked = false, undo = false, sourceName = '', keyLabel = (text) => text }) {
   const head = rootMoved ? '' : unlinked ? 'リンクは外しましたが、' : ''
   const tail = !rootMoved && unlinked && undo ? keyLabel('\n「元に戻す」（Cmd+Z）で、外したリンクを戻せます。') : ''
-  return head + trashFailedText(failed) + tail
+  return head + trashFailedText(failed) + tail + (rootMoved ? '' : sourceLinkNote(sourceName))
+}
+
+// リンク元のノートの中のリンクも外したことを知らせる1文（行の頭に改行をつける）。なければ空。
+export function sourceLinkNote(sourceName) {
+  return sourceName ? '\n「' + sourceName + '」の中のリンクは外しました（「元に戻す」では戻りません）。' : ''
+}
+
+// サイドバーの「リンクが外れたタスク」の「ゴミ箱へ」で、読み直した一覧（list。読めなければ null）から、まだ移してよいかを決める。
+// 返り値：{ ok: true, task } か { ok: false, message }（一覧を読めない・タスクがない・もう外れていない）。
+export function unlinkedTrashCheck(list, path) {
+  if (!list) return { ok: false, message: 'タスクの一覧を読めなかったので、移せません。' }
+  const task = findTask(list, path)
+  if (!task || task.unlinked !== true) return { ok: false, message: 'このタスクは、もうリンクが外れたタスクではない（またはなくなった）ので、移しませんでした。' }
+  return { ok: true, task }
 }
 
 // 子を続けて移す途中で失敗したときの知らせ。

@@ -48,7 +48,7 @@ import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
 import { checkNewTask, dailyDateOf } from './task-buckets.mjs'
 import { createTaskSide } from './task-side.mjs'
 import { createTaskPanel } from './task-panel.mjs'
-import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkRange } from './task-delete.mjs'
+import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkedTrashCheck, unlinkRange } from './task-delete.mjs'
 import { MENU_HINT, canUndoDirectly, createFailedText, createdText, leftoverText, linkChange, linkRemoval, menuForLine, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
@@ -2037,6 +2037,8 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   saver?.close()
   saver = null
   currentPath = path
+  // 右の枠でゴミ箱へ移したノートの代わりに別のノートを開いたので、右の枠を閉じても読み込み直さない。
+  reloadAfterSplit = false
   lastTask = null
   hideTaskNotice()
   // 右の枠では、カレンダーとファイルの一覧を使わない（左の一覧の開閉の記録も書き換えない）。
@@ -2449,6 +2451,8 @@ async function doMove(from, to, rename = false, confirm = false) {
     saveFilesOpen()
   }
   await refreshNotes()
+  // タスクのノートや、goal・parent のノートを動かすと、タスクの一覧（リンクが外れたか）も変わる。
+  tasksSaved()
   if (holdsCurrent) {
     // 古い場所へ保存しに行かないよう、開き直す前に保存の仕組みを閉じる。
     saver?.close()
@@ -2487,6 +2491,8 @@ async function trashItem(path, kind) {
     return
   }
   await refreshNotes()
+  // 消したノートがタスク（または goal・parent のノート）なら、タスクの一覧から消す（外れたかも変わる）。
+  tasksSaved()
 }
 
 function bindFilesPanel() {
@@ -3010,6 +3016,9 @@ function savedClean() {
 // open：右の枠から移したとき、左でそのどれかを開いていれば左で開き直すノート（リンク元。なければ null で何も開いていない画面）。
 async function trashTaskNotes(paths, { open = null } = {}) {
   if (PANE !== 'right' && split?.isOpen() && rightState.path && paths.some((path) => pathKey(path) === pathKey(rightState.path))) await closeSplit()
+  // 右の枠から移すときは、左で同じノートを開いていれば、先に左の書きかけを保存してもらう（ゴミ箱のノートに入れるため）。
+  // 保存しきれなかったときは、左の一時保存に残る（打った文字をなくさない）。
+  if (PANE === 'right') await askLeftToSave(paths)
   const moved = []
   const failed = []
   for (const [index, path] of paths.entries()) {
@@ -3041,15 +3050,53 @@ async function trashedElsewhere({ paths, open }) {
   saver?.close()
   saver = null
   if (typeof open === 'string' && open && pathKey(open) !== pathKey(currentPath)) await openNote(open)
-  else if (split?.isOpen()) reloadAfterSplit = true
-  else location.href = '/'
+  else if (split?.isOpen()) {
+    reloadAfterSplit = true
+    // 枠が閉じるまでの間に打った文字は、保存も一時保存もされないので、打てないようにしておく。
+    // 別のノートを開けば（openNote）、読み込み直しはやめる。
+    editable = false
+    view?.dispatch({ effects: [editableSlot.reconfigure(editableExtensions(false)), setNoteBusy.of(true)] })
+    const banner = $('banner')
+    banner.hidden = false
+    banner.textContent = 'このノートは右の枠でゴミ箱へ移しました。右の枠を閉じると、何も開いていない画面に戻ります。'
+  } else location.href = '/'
+}
+
+// 右の枠から：左で paths のどれかを開いていれば、左に書きかけを保存してもらう。返事は { dirty }（5秒たっても返事がなければ dirty）。
+const leftSaveWaiters = []
+function askLeftToSave(paths) {
+  return new Promise((resolve) => {
+    const done = (result) => {
+      clearTimeout(timer)
+      const index = leftSaveWaiters.indexOf(done)
+      if (index >= 0) leftSaveWaiters.splice(index, 1)
+      resolve(result)
+    }
+    const timer = setTimeout(() => done({ dirty: true }), 5_000)
+    leftSaveWaiters.push(done)
+    toLeft({ type: MSG.SAVE_LEFT, paths })
+  })
+}
+
+// 左の枠で：右の枠から頼まれたら、開いているノートが paths のどれかのときだけ保存して返事をする。
+async function saveForRight({ paths }) {
+  let dirty = false
+  try {
+    if (currentPath && Array.isArray(paths) && paths.some((path) => typeof path === 'string' && pathKey(path) === pathKey(currentPath))) {
+      commitOpenField()
+      await saver?.flush()
+      dirty = Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state)
+    }
+  } finally {
+    split?.post({ type: MSG.LEFT_SAVED, dirty })
+  }
 }
 
 // 移したあと：知らせ、両方の枠のファイル一覧・パネル・リンクの見た目を読み直す。読み直しの失敗は、次の読み直しで追いつくので知らせない。
 async function afterTaskTrash({ title, rootPath, result, undo, unlinked, sourceName = '' }) {
   const rootMoved = result.moved.some((path) => pathKey(path) === pathKey(rootPath))
   if (rootMoved) showDeleteNotice(deletedText({ title, movedChildren: result.moved.length - 1, undo, unlinked, sourceName, keyLabel }))
-  if (result.failed.length) showMessage(trashFailedNotice({ failed: result.failed, rootMoved, unlinked, undo, keyLabel }))
+  if (result.failed.length) showMessage(trashFailedNotice({ failed: result.failed, rootMoved, unlinked, undo, sourceName, keyLabel }))
   try {
     await refreshNotes()
     redrawLinks()
@@ -3127,7 +3174,7 @@ async function deleteTaskFromLink(info) {
     view.dispatch({ changes: { ...range, insert: '' }, annotations: [isolateHistory.of('full'), Transaction.userEvent.of('delete.task')] })
     await saver?.flush()
     if (!savedClean()) {
-      showMessage('リンクは外しましたが、保存できなかったので、タスクのノートはゴミ箱へ移していません。')
+      showMessage('リンクは外しましたが、保存できなかったので、タスクのノートはゴミ箱へ移していません。' + sourceLinkNote(sourceUnlinked))
       return
     }
     const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
@@ -3221,7 +3268,9 @@ async function deleteThisTask() {
       // 今の「ファイルが消えた」ときの扱い（保存を止める）に任せる。
       if (source?.exists) await openNote(source.path)
       else {
-        await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked, keyLabel }))
+        // 移せなかったサブタスクがあれば、同じ知らせに書き添える（このあと画面を移るので、afterTaskTrash は通らない）。
+        const failed = result.failed.length ? '\n' + trashFailedNotice({ failed: result.failed, rootMoved: true, keyLabel }) : ''
+        await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked, keyLabel }) + failed)
         saver?.close()
         saver = null
         // 右の枠は、開いていたノートがなくなったので枠を閉じてもらう。左は何も開いていない画面に戻す。
@@ -3290,23 +3339,41 @@ async function createTaskFromSide() {
   closeSideIfNarrow()
 }
 
+// 開いているノート（左と、右の枠）の書きかけを保存する。保存しきれなければ false（何も開いていなければ true）。
+async function saveOpenNotes() {
+  commitOpenField()
+  await saver?.flush()
+  if (saver && !CLEAN_STATES.has($('status').dataset.state)) return false
+  if (split?.isOpen() && rightState.path && (await split.save()).dirty) return false
+  return true
+}
+
 // 「リンクが外れたタスク」の「ゴミ箱へ」。外れたリンクはないので、リンクは外さずにノートをゴミ箱へ移す。
-// 子がいれば一緒に移すか聞く。開いているノートなら「このタスクを削除」と同じ流れにする。
+// 子がいれば一緒に移すか聞く。開いていて書き換えられるノートなら「このタスクを削除」と同じ流れにする。
 async function trashUnlinkedTask(path) {
   if (taskBusy) return
-  if (currentPath && pathKey(currentPath) === pathKey(path)) {
-    deleteThisTask()
-    return
-  }
   taskBusy = true
+  let handOff = false
   try {
+    // 判定はサーバーのファイルで決まるので、開いているノート（左と右）の書きかけを先に保存する。保存しきれなければやめる。
+    if (!(await saveOpenNotes())) {
+      showMessage('開いているノートに、まだ保存できていない変更があります。保存できてから、もう一度選んでください。')
+      return
+    }
     const list = await loadTaskList()
-    const task = list ? findTask(list, path) : null
-    if (!task || task.unlinked !== true) {
-      showMessage(list ? 'このタスクは、もうリンクが外れたタスクではない（またはなくなった）ので、移しませんでした。' : 'タスクの一覧を読めなかったので、移せません。')
+    const checked = unlinkedTrashCheck(list, path)
+    if (!checked.ok) {
+      showMessage(checked.message)
       refreshTaskSide()
       return
     }
+    // 左で開いているノートで、書き換えられるなら「このタスクを削除」と同じ流れにする。編集できない（BOM つきなど）ときは、
+    // 開いていないノートと同じ流れで移す（移したあとは何も開いていない画面に戻す）。
+    if (currentPath && pathKey(currentPath) === pathKey(path) && editable && saver && !saver.isStopped()) {
+      handOff = true
+      return
+    }
+    const { task } = checked
     const children = collectDescendants(list, task.path)
     const title = taskTitleOf(task)
     const source = sourceNoteOf(task, known)
@@ -3314,16 +3381,27 @@ async function trashUnlinkedTask(path) {
     const unlink = source?.exists ? 'none-count' : 'none-missing'
     const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink, sourceName, linkCount: 0 }), deleteChoices(children.length))
     if (!choice) return
-    const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
-    // 左で開いているノートを一緒に移すときは、先に保存する。移したあとは何も開いていない画面に戻す。
-    const openGoes = Boolean(currentPath) && paths.some((item) => pathKey(item) === pathKey(currentPath))
-    if (openGoes) {
-      commitOpenField()
-      await saver?.flush()
+    // 確かめている間に書いた分も保存してから、まだ外れているかを確かめ直す（リンクを戻したのに移さないように）。
+    if (!(await saveOpenNotes())) {
+      showMessage('開いているノートに、まだ保存できていない変更があります。保存できてから、もう一度選んでください。')
+      return
     }
+    const fresh = await loadTaskList()
+    const again = unlinkedTrashCheck(fresh, path)
+    if (!again.ok) {
+      showMessage(again.message)
+      refreshTaskSide()
+      return
+    }
+    const nowChildren = collectDescendants(fresh, again.task.path)
+    const paths = [again.task.path, ...(choice === 'all' ? nowChildren.map((child) => child.path) : [])]
+    // 左で開いているノートを一緒に移すときは、移したあとは何も開いていない画面に戻す（保存は上で済ませた）。
+    const openGoes = Boolean(currentPath) && paths.some((item) => pathKey(item) === pathKey(currentPath))
     const result = await trashTaskNotes(paths)
     if (openGoes && result.moved.some((item) => pathKey(item) === pathKey(currentPath))) {
-      await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked: false }))
+      // 移せなかったサブタスクがあれば、同じ知らせに書き添える（このあと画面を移るので、afterTaskTrash は通らない）。
+      const failed = result.failed.length ? '\n' + trashFailedNotice({ failed: result.failed, rootMoved: true, keyLabel }) : ''
+      await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked: false }) + failed)
       saver?.close()
       saver = null
       location.href = '/'
@@ -3334,6 +3412,8 @@ async function trashUnlinkedTask(path) {
     showMessage('タスクをゴミ箱へ移す途中で失敗しました。ファイル一覧で、残っているものを確かめてください。')
   } finally {
     taskBusy = false
+    // 「このタスクを削除」は taskBusy が立っていると何もしないので、下ろしてからすぐ渡す（間に await を挟まない）。
+    if (handOff) deleteThisTask()
   }
 }
 
@@ -3844,6 +3924,8 @@ function receiveFromRight(data) {
     refreshTaskSide()
   } else if (data.type === MSG.TRASHED) {
     trashedElsewhere(data)
+  } else if (data.type === MSG.SAVE_LEFT) {
+    saveForRight(data)
   } else if (data.type === MSG.CLICKED) {
     split.setActive('right')
   } else if (data.type === MSG.OPENED) {
@@ -3938,6 +4020,8 @@ async function receiveFromLeft(data) {
     // 左が選んだ配色に合わせる。記録は左が持つので、ここでは保存しない。
     themeChoice = data.theme === 'light' || data.theme === 'dark' ? data.theme : null
     applyTheme()
+  } else if (data.type === MSG.LEFT_SAVED) {
+    for (const done of [...leftSaveWaiters]) done({ dirty: data.dirty !== false })
   } else if (data.type === MSG.SAVE) {
     try {
       commitOpenField()

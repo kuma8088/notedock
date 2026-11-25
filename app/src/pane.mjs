@@ -22,6 +22,10 @@ export const MSG = {
   NOTE_SAVED: 'pane:note-saved',
   // 右の枠でタスクのノートをゴミ箱へ移した（右から左へ）。{ paths, open }。左でそのどれかを開いていれば、open（リンク元のノート。なければ null）を開き直す。
   TRASHED: 'pane:trashed',
+  // 右の枠でタスクのノートをゴミ箱へ移す前に、左で同じノートを開いていれば保存してもらう（右から左へ）。{ paths }。
+  SAVE_LEFT: 'pane:save-left',
+  // SAVE_LEFT の返事（左から右へ）。{ dirty }。保存しきれなかった書きかけがあれば true。
+  LEFT_SAVED: 'pane:left-saved',
 }
 
 // 同じアドレスから、pane: の連絡として来たものだけを受け付ける。source を渡したときは、その枠からのものだけ。
