@@ -37,6 +37,31 @@ export function createTaskPanel({ box, store, keyOf, onOpen, onSoonDays }) {
   let soonSaving = 0
   // 日数の欄の下に出す知らせ（入れた数が使えない・保存できなかった）。次に日数を変えるまで出す。
   let soonNote = ''
+  // パネルの中でボタンを押している間（押してから離すまで）は描き直さない。描き直すと押したボタンが入れ替わり、クリックが消えるため。
+  // 欄に数を打ってから中見出しを押したときに、そうなる。描き直しは離したあとにする（押したボタンが自分で描き直していれば何もしない）。
+  let pressing = false
+  let pendingDraw = false
+  box.addEventListener('pointerdown', () => {
+    pressing = true
+  })
+  document.addEventListener?.(
+    'pointerup',
+    () => {
+      if (!pressing) return
+      pressing = false
+      setTimeout(flushDraw, 0)
+    },
+    true,
+  )
+  function flushDraw() {
+    if (!pendingDraw || pressing) return
+    draw()
+  }
+  // 欄の外へ出て確定したとき（ほかの所を押した・Tab）は、フォーカスが移り終えてから描き直す。
+  function drawLater() {
+    pendingDraw = true
+    setTimeout(flushDraw, 0)
+  }
 
   const panelOpen = () => store.get(keyOf('task-panel-open'), true) !== false
   const sections = () => sectionOpenState(store.get(keyOf('task-sections'), null))
@@ -85,17 +110,21 @@ export function createTaskPanel({ box, store, keyOf, onOpen, onSoonDays }) {
   }
 
   async function changeSoon(input) {
+    // Enter・上下の矢印で確定したときは欄にフォーカスがあるので、描き直したあとも欄に戻す。欄の外へ出たときは戻さない。
+    const redraw = isFocused(input) ? () => draw('soon-days') : drawLater
     const raw = String(input.value ?? '').trim()
     const value = raw === '' ? NaN : Number(raw)
     if (!isSoonDays(value)) {
       soonNote = `直近の日数は、${TASK_SOON_DAYS_MIN}から${TASK_SOON_DAYS_MAX}までの数で入れてください`
-      draw('soon-days')
+      input.value = String(soonDays)
+      input.dataset.shown = input.value
+      redraw()
       return
     }
     if (value === soonDays) {
       if (soonNote) {
         soonNote = ''
-        draw('soon-days')
+        redraw()
       }
       return
     }
@@ -104,7 +133,7 @@ export function createTaskPanel({ box, store, keyOf, onOpen, onSoonDays }) {
     soonNote = ''
     const mine = ++soonEdit
     soonSaving++
-    draw('soon-days')
+    redraw()
     let ok = false
     try {
       ok = (await onSoonDays?.(value)) === true
@@ -117,20 +146,23 @@ export function createTaskPanel({ box, store, keyOf, onOpen, onSoonDays }) {
     if (ok || mine !== soonEdit) return
     soonDays = before
     soonNote = '日数を保存できませんでした。元の日数に戻しました'
-    draw(isFocused(box.querySelector('[data-key="soon-days"]')) ? 'soon-days' : null)
+    if (pressing) drawLater()
+    else draw()
   }
 
   const isFocused = (node) => Boolean(node) && typeof document !== 'undefined' && document.activeElement === node
 
   // focusKey: 押したボタンを描き直したあとも、キーで続けて操作できるようにフォーカスを戻す。
-  // 日数の欄に打っている途中に描き直すとき（60秒ごとの読み直しなど）は、打った数とフォーカスを残す。
+  // focusKey がなくても、パネルの中の見出しや日数の欄にフォーカスがあれば、描き直したあとに戻す。
+  // 日数の欄に打っている途中に描き直すとき（60秒ごとの読み直しなど）は、打った数も残す。
   function draw(focusKey = null) {
+    pendingDraw = false
     if (!last) return
     const { tasks, date, truncated } = last
+    const active = typeof document !== 'undefined' ? document.activeElement : null
+    const activeKey = active && active !== box && box.contains?.(active) ? (active.dataset?.key ?? null) : null
     // 打っている途中＝フォーカスがあり、描いたときの数から変えてまだ確定していない。
-    const oldField = box.querySelector('[data-key="soon-days"]')
-    const keepFocus = focusKey === null && isFocused(oldField)
-    const typing = keepFocus && oldField.value !== oldField.dataset.shown ? oldField.value : null
+    const typing = focusKey === null && activeKey === 'soon-days' && active.value !== active.dataset.shown ? active.value : null
     const buckets = bucketTasks(tasks, date, { soonDays })
     const open = panelOpen()
     const state = sections()
@@ -187,11 +219,12 @@ export function createTaskPanel({ box, store, keyOf, onOpen, onSoonDays }) {
     box.replaceChildren(inner)
     box.classList.toggle('task-panel-closed', !open)
     box.hidden = false
-    if (keepFocus) {
-      const input = box.querySelector('[data-key="soon-days"]')
-      if (typing !== null) input.value = typing
-      input.focus()
-    } else if (focusKey) box.querySelector(`[data-key="${focusKey}"]`)?.focus()
+    const key = focusKey ?? activeKey
+    const node = key ? box.querySelector(`[data-key="${key}"]`) : null
+    if (node) {
+      if (typing !== null) node.value = typing
+      node.focus()
+    }
   }
 
   // tasks: サーバーの一覧。date: 開いているデイリーノートの日付。truncated: 一覧が途中までか。

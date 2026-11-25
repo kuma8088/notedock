@@ -218,6 +218,12 @@ const SOON = [task('3日後', { due: '2026-11-27' }), task('5日後', { due: '20
 const soonNames = () => box.querySelector('.task-section-soon').querySelectorAll('.task-open').map((n) => n.textContent)
 const field = () => head('soon-days')
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+// Enter で確定したときと同じ（欄にフォーカスがあるまま change が来る）。
+const commit = (value) => {
+  field().focus()
+  field().value = value
+  field().fire('change')
+}
 
 function panelWith(onSoonDays) {
   return createTaskPanel({ box, store, keyOf: (name) => `${name}:v`, onOpen: () => {}, onSoonDays })
@@ -242,8 +248,7 @@ test('欄の数を変えると、すぐ区分けし直し、保存を頼み、�
   const saved = []
   panel = panelWith(async (days) => saved.push(days) > 0)
   panel.show({ tasks: SOON, date: '2026-11-24' })
-  field().value = '6'
-  field().fire('change')
+  commit('6')
   assert.deepEqual(soonNames(), ['3日後', '5日後', '6日後'])
   assert.equal(field().value, '6')
   assert.equal(field().focused, true)
@@ -252,7 +257,7 @@ test('欄の数を変えると、すぐ区分けし直し、保存を頼み、�
   assert.equal(panel.soonDays(), 6)
   assert.equal(box.querySelector('.task-soon-note'), null)
   // 同じ数のままなら頼まない。
-  field().fire('change')
+  commit('6')
   await tick()
   assert.deepEqual(saved, [6])
 })
@@ -262,8 +267,7 @@ test('保存できなければ元の日数に戻し、知らせを出す。パ�
     box = new FakeElement('section')
     panel = panelWith(fail)
     panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 3 })
-    field().value = '5'
-    field().fire('change')
+    commit('5')
     assert.deepEqual(soonNames(), ['3日後', '5日後'])
     await tick()
     assert.equal(field().value, '3')
@@ -278,16 +282,14 @@ test('使えない数（範囲の外・小数・空）は頼まずに元に戻�
   panel = panelWith(async (days) => saved.push(days) > 0)
   panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 4 })
   for (const bad of ['32', '-1', '2.5', '', 'abc']) {
-    field().value = bad
-    field().fire('change')
+    commit(bad)
     assert.equal(field().value, '4', bad)
     assert.match(box.querySelector('.task-soon-note').textContent, /0から31までの数で入れてください/)
   }
   await tick()
   assert.deepEqual(saved, [])
   // 使える数に直すと、知らせは消える。
-  field().value = '0'
-  field().fire('change')
+  commit('0')
   assert.equal(box.querySelector('.task-soon-note'), null)
   assert.deepEqual(soonNames(), [])
 })
@@ -298,8 +300,7 @@ test('保存より前に頼んだ一覧の返事が遅れて来ても、変え�
   panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 3 })
   let answer
   const pending = panel.refresh({ date: '2026-11-24', load: () => new Promise((resolve) => { answer = resolve }) })
-  field().value = '6'
-  field().fire('change')
+  commit('6')
   answer({ tasks: SOON, soonDays: 3 })
   assert.equal(await pending, 'shown')
   assert.equal(field().value, '6')
@@ -334,4 +335,44 @@ test('パネルをたたんでも欄は出て、件数も日数で数える。�
   // 別の日のデイリーノートへ移っても、日数は残る。
   panel.show({ ...panel.last(), date: '2026-11-25' })
   assert.equal(field().value, '6')
+})
+
+test('欄の外へ出て確定したとき（ほかを押した・Tab）は、フォーカスを欄に戻さず、移り終えてから描き直す', async () => {
+  const saved = []
+  panel = panelWith(async (days) => saved.push(days) > 0)
+  panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 3 })
+  // 本文を押した：フォーカスはパネルの外へ。
+  const outside = new FakeElement('div')
+  field().value = '5'
+  outside.focus()
+  field().fire('change')
+  await tick()
+  assert.deepEqual(soonNames(), ['3日後', '5日後'])
+  assert.equal(document.activeElement, outside)
+  assert.equal(field().focused, false)
+  assert.deepEqual(saved, [5])
+  // Tab で中見出しへ移った：描き直したあとも、その中見出しにフォーカスを戻す。
+  field().value = '6'
+  head('week').focus()
+  field().fire('change')
+  await tick()
+  assert.deepEqual(soonNames(), ['3日後', '5日後', '6日後'])
+  assert.equal(document.activeElement, head('week'))
+})
+
+test('パネルの中でボタンを押している間は描き直さず、離したあとに描き直す（クリックが消えないように）', async () => {
+  panel = panelWith(async () => true)
+  panel.show({ tasks: SOON, date: '2026-11-24', soonDays: 3 })
+  const weekHead = head('week')
+  field().value = '6'
+  box.fire('pointerdown')
+  weekHead.focus()
+  field().fire('change')
+  await tick()
+  // まだ押している：中見出しは入れ替わっていない。
+  assert.equal(head('week'), weekHead)
+  // 押したボタンのクリックで描き直す（新しい日数で区分ける）。
+  weekHead.click()
+  assert.equal(head('week').getAttribute('aria-expanded'), 'true')
+  assert.deepEqual(soonNames(), ['3日後', '5日後', '6日後'])
 })

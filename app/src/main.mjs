@@ -2832,7 +2832,8 @@ const taskPanel = createTaskPanel({
   // 「直近」の日数を Vault の設定（settings.json）に保存する。保存できたら、反対の枠のパネルも読み直してもらう。
   onSoonDays: async (days) => {
     const result = await request('/api/settings', { method: 'PUT', body: JSON.stringify({ taskSoonDays: days }) })
-    if (!result.ok) return false
+    // 日数を知らない古いサーバーは、項目を捨てて 200 を返す。書いた中身に日数が入っていなければ、保存できなかったとする。
+    if (!result.ok || result.data?.settings?.tasks?.soonDays !== days) return false
     if (PANE === 'right') toLeft({ type: MSG.TASKS })
     else if (split?.isOpen()) split.post({ type: MSG.TASKS })
     return true
