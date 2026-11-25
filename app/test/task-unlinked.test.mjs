@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { linkRefsIn, linkedKeys, unlinkedMap } from '../src/task-unlinked.mjs'
-import { pathKey } from '../src/task-delete.mjs'
+import { collectDescendants, pathKey } from '../src/task-delete.mjs'
+import { moveChanges, movedBody } from '../src/task-convert.mjs'
+import { taskFromLine } from '../src/task-line.mjs'
 
 const MONTH = '90_Periodic/2026/Monthly/2026-11.md'
 const T = (name) => `Tasks/${name}.md`
@@ -156,4 +158,36 @@ test('known にない元のノートでも、ディスクにあれば（existsOn
   assert.equal(unlinkedMap(tasks, { known, refsOf, existsOnDisk: (p) => p === M2 }).get(pathKey(T('b'))), false)
   // ディスクにあってリンクがなければ外れた
   assert.equal(unlinkedMap(tasks, { known, refsOf: () => [], existsOnDisk: () => true }).get(pathKey(T('b'))), true)
+})
+
+
+// ---- 段階1-D：もうタスクになっている行を、入れ子ごと別のタスクへ移したとき（T12） ----
+// 移した行の中のタスク（S）の parent・goal は書き換えない（段階1の決まり）。そのときの見え方をここで固定する。
+
+const applyChanges = (text, changes) => [...changes].sort((a, b) => b.from - a.from || b.to - a.to).reduce((t, c) => t.slice(0, c.from) + c.insert + t.slice(c.to), text)
+
+test('T12：もうタスクの行を入れ子ごと移しても、S の parent は変えない。S は外れていない。T をゴミ箱へ移すと S は外れる', () => {
+  const S = T('2026-11-20-下書き')
+  const NEW = T('2026-11-25-動画を出す')
+  const month = '- 動画を出す\n\t- [ ] 下書き [[Tasks/2026-11-20-下書き|→タスク]]\n\t- 構成を決める\n- 別の目標\n'
+  const known = new Set([MONTH, S])
+  const found = taskFromLine({ path: MONTH, text: month, line: 1, periodicRoot: '90_Periodic', known })
+  assert.equal(found.ok, true)
+  assert.equal(found.children.count, 2)
+  const body = movedBody(found, { notePath: MONTH, taskPath: NEW, known })
+  // S へのリンクは T の本文へそのまま移る
+  assert.equal(body, '- [ ] 下書き [[Tasks/2026-11-20-下書き|→タスク]]\n- 構成を決める\n')
+  const monthAfter = applyChanges(month, moveChanges(found, NEW, found.children))
+  assert.equal(monthAfter, '- 動画を出す [[Tasks/2026-11-25-動画を出す|→タスク]]\n- 別の目標\n')
+  // S は月のノートを goal に持ち、parent はないまま（書き換えない）
+  const tasks = [{ path: NEW, goal }, { path: S, goal }]
+  const notes = { [MONTH]: monthAfter, [NEW]: '---\ntitle: "動画を出す"\ntype: task\ngoal: "' + goal + '"\n---\n' + body, [S]: '' }
+  // 月のノートには S へのリンクがもうないが、Tasks/ のノート（T）からリンクされているので外れていない
+  assert.deepEqual(judge(tasks, notes), { [NEW]: false, [S]: false })
+  // T を消すときに、S は子として数えない（parent が T ではない）
+  const list = [{ path: NEW, parentPath: null }, { path: S, parentPath: null }]
+  assert.deepEqual(collectDescendants(list, NEW), [])
+  // T をゴミ箱へ移すと、S へのリンクはどこにもなくなり、S は「リンクが外れたタスク」に出る
+  const { [NEW]: _gone, ...rest } = notes
+  assert.deepEqual(judge([{ path: S, goal }], rest), { [S]: true })
 })

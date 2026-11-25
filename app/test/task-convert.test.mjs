@@ -109,6 +109,9 @@ test('知らせの文', () => {
   assert.match(createFailedText(400, 'tasks-folder'), /Tasks というフォルダーを作れませんでした/)
   assert.match(createFailedText(409), /多すぎて/)
   assert.equal(createFailedText(500), 'タスクのノートを作れませんでした。')
+  // 移す本文をサーバーが断った（長すぎる・\r や \0 を含む）ときは、一般の知らせと分ける
+  assert.match(createFailedText(400, 'body'), /^下の行をタスクのノートへ移せなかったので/)
+  assert.equal(createFailedText(400, 'title'), 'タスクのノートを作れませんでした。')
 })
 
 test('取り消し：作った直後と同じなら履歴で戻す。違えばリンクの文字だけを外す', () => {

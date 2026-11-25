@@ -7,6 +7,9 @@ import { after, before, test } from 'node:test'
 import { createApp } from '../server/app.mjs'
 import { createTaskIndex, linkTarget } from '../server/tasks.mjs'
 import { readTaskProps } from '../src/tasks.mjs'
+import { collectDescendants } from '../src/task-delete.mjs'
+import { expectedTaskPath, movedBody, taskRequestBody } from '../src/task-convert.mjs'
+import { taskFromLine } from '../src/task-line.mjs'
 
 const task = (props, body = '') => `---\n${Object.entries(props).map(([k, v]) => `${k}: ${v}`).join('\n')}\n---\n${body}`
 
@@ -532,4 +535,45 @@ test('unlinked：goal のノートを一時的に読めなかったことは覚�
   }
   // 権限を戻しただけ（中身・大きさ・更新日時は同じ）でも、読み直して外れたと決める
   assert.equal(index.list().tasks[0].unlinked, true)
+})
+
+
+// ---- 段階1-D：入れ子ごと作ったサブタスクの子孫の数え方（T13） ----
+
+test('T13：親 P の行から入れ子ごと作った子 C と、C の行から作った孫 G。P を消すときの子孫は C と G。parent の輪でも止まる', async () => {
+  const P = 'Tasks/2026-11-01-段取りを組む.md'
+  const pText = task({ title: '"段取りを組む"', type: 'task', status: '未着手', due: '2026-11-30', goal: '"[[90_Periodic/2026/Monthly/2026-11]]"' }, '- 準備する\n\t- 下書き\n\t\t- 構図\n')
+  await withApp((dir) => put(dir, P, pText), async ({ dir, url, post }) => {
+    const known = () => new Set((fs.readdirSync(path.join(dir, 'Tasks'))).map((name) => 'Tasks/' + name))
+    const make = async (notePath, text, line) => {
+      const found = taskFromLine({ path: notePath, text, line, periodicRoot: '90_Periodic', known: known() })
+      assert.equal(found.ok, true)
+      const body = movedBody(found, { notePath, taskPath: expectedTaskPath(found, '2026-11-25'), known: known() })
+      const { status, data } = await post(taskRequestBody(found, '2026-11-25', body))
+      assert.equal(status, 201)
+      return { found, path: data.path, text: fs.readFileSync(path.join(dir, data.path), 'utf8') }
+    }
+    const c = await make(P, pText, pText.split('\n').indexOf('- 準備する') + 1)
+    assert.equal(c.found.parent, '[[Tasks/2026-11-01-段取りを組む]]')
+    assert.equal(c.found.children.count, 2)
+    assert.match(c.text, /\n---\n- 下書き\n\t- 構図\n$/)
+    const g = await make(c.path, c.text, c.text.split('\n').indexOf('- 下書き') + 1)
+    assert.equal(g.found.parent, '[[' + c.path.replace(/\.md$/, '') + ']]')
+    assert.equal(g.found.children.count, 1)
+    const list = async () => (await (await fetch(url + '/api/tasks')).json()).tasks
+    const paths = (tasks) => tasks.map((t) => t.path)
+    const before = await list()
+    assert.deepEqual(paths(collectDescendants(before, P)), [c.path, g.path])
+    assert.deepEqual(paths(collectDescendants(before, c.path)), [g.path])
+    // P.parent = G（手で書き換えた輪）。たどったノートを覚えて止まり、自分は入れない
+    fs.writeFileSync(path.join(dir, P), pText.replace('status: 未着手', 'status: 未着手\nparent: "[[' + g.path.replace(/\.md$/, '') + ']]"'))
+    let after = await list()
+    for (let i = 0; i < 20 && !after.find((t) => t.path === P)?.parentPath; i++) {
+      await new Promise((r) => setTimeout(r, 100))
+      after = await list()
+    }
+    assert.equal(after.find((t) => t.path === P).parentPath, g.path)
+    assert.deepEqual(paths(collectDescendants(after, P)), [c.path, g.path])
+    assert.deepEqual(paths(collectDescendants(after, g.path)), [P, c.path])
+  })
 })

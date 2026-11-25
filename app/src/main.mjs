@@ -50,7 +50,7 @@ import { checkNewTask, dailyDateOf } from './task-buckets.mjs'
 import { createTaskSide } from './task-side.mjs'
 import { createTaskPanel } from './task-panel.mjs'
 import { collectDescendants, confirmedChildren, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkedTrashCheck, unlinkRange, unsavedBlockText } from './task-delete.mjs'
-import { MENU_HINT, canUndoDirectly, createFailedText, createdText, leftoverText, linkChange, linkRemoval, menuForLine, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
+import { MENU_HINT, canUndoDirectly, createFailedText, createdText, expectedTaskPath, leftoverText, linkRemoval, menuForLine, moveChanges, moveUndoChange, movedBody, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -2984,7 +2984,8 @@ function makeTaskAtCursor() {
 }
 
 let taskBusy = false
-// 最後に作ったタスクの「取り消す」に使う。{ view, path, taskPath, doc, depth }
+// 最後に作ったタスクの「取り消す」に使う。{ view, path, taskPath, doc, depth, removedText }
+// removedText：タスクのノートへ移した子の行（元のノートから消した文字。先頭の改行を含む）。移していなければ null。
 let lastTask = null
 
 async function makeTask(lineNumber) {
@@ -3006,7 +3007,11 @@ async function makeTask(lineNumber) {
   const target = view
   try {
     commitOpenField()
-    const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify(taskRequestBody(found, todayText())) })
+    // 入れ子の子の行があれば、タスクのノートの本文にする（字下げを外し、リンクを新しい場所から直したもの）。
+    // 本文のリンクを直すのに使うのは予想のパス。行に足すリンクには、サーバーが返した実際のパスを使う。
+    const day = todayText()
+    const text = found.children ? movedBody(found, { notePath: path, taskPath: normalizeKey(expectedTaskPath(found, day)), known }) : ''
+    const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify(taskRequestBody(found, day, text)) })
     if (!created.ok || typeof created.data?.path !== 'string') {
       showMessage(createFailedText(created.status, created.data?.error))
       return
@@ -3024,17 +3029,18 @@ async function makeTask(lineNumber) {
     // 新しいノートを known に足してから、リンクの解決に使う情報を作り直す。同じ1回の変更にして、リンクがすぐ解決済みとして描かれるようにする。
     known = new Set(known ?? [])
     known.add(normalizeKey(taskPath))
+    // リンクを足すことと子の行を消すことを1回の変更にする（Cmd+Z 1回で両方が戻る）。plan.children は今の文書での子の行の位置。
     view.dispatch({
-      changes: linkChange(plan.at, taskPath),
+      changes: moveChanges(plan.at, taskPath, plan.children),
       // リンクを足した行を見える所へ出す（右クリックした行が画面の外へずれていることがあるため）。
       // 狭いペインでは下半分にチャットの欄が重なるので、真ん中ではなく上のほうに出す。
       effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), EditorView.scrollIntoView(plan.at.from, { y: 'start', yMargin: 60 })],
       annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.task')],
     })
     linked = true
-    lastTask = { view, path, taskPath, doc: view.state.doc, depth: undoDepth(view.state) }
+    lastTask = { view, path, taskPath, doc: view.state.doc, depth: undoDepth(view.state), removedText: plan.children?.text ?? null }
     saver?.save()
-    showTaskNotice(createdText(created.data.due ?? found.due))
+    showTaskNotice(createdText(created.data.due ?? found.due, { moved: plan.children ? found.children.count : 0 }))
     await refreshNotes()
     tasksSaved()
   } catch {
@@ -3046,7 +3052,7 @@ async function makeTask(lineNumber) {
   }
 }
 
-// 「取り消す」：足したリンクを外す。ノートは Tasks に残る。
+// 「取り消す」：足したリンクを外し、移した子の行を戻す。ノートは Tasks に残る。
 function undoLastTask() {
   const last = lastTask
   hideTaskNotice()
@@ -3057,8 +3063,9 @@ function undoLastTask() {
   if (canUndoDirectly(last, { doc: view.state.doc, depth: undoDepth(view.state) })) {
     historyStep(view, 0)
   } else {
-    // あとで打った文字があるときは、それを消さないよう、足したリンクの文字だけを外す。
-    const change = linkRemoval(view.state.doc.toString(), last.taskPath)
+    // あとで打った文字があるときは、それを消さないよう、足したリンクの文字だけを外し、移した子の行をその行の下へ戻す。
+    const text = view.state.doc.toString()
+    const change = last.removedText ? moveUndoChange(text, last.taskPath, last.removedText) : linkRemoval(text, last.taskPath)
     if (!change) {
       showMessage('リンクが見つからないので、取り消せません。')
       return

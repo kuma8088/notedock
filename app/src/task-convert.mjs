@@ -26,6 +26,7 @@ const REASON_TEXT = {
 export function createFailedText(status, error) {
   if (status === 400 && error === 'tasks-folder') return 'Vault の直下に Tasks というフォルダーを作れませんでした（同じ名前のファイルがあるなど）。タスクのノートは作っていません。'
   if (status === 409) return '同じ名前のタスクのノートが多すぎて、作れませんでした。'
+  if (status === 400 && error === 'body') return '下の行をタスクのノートへ移せなかったので（行が多すぎるなど）、作れませんでした。ノートは変えていません。'
   return 'タスクのノートを作れませんでした。'
 }
 
