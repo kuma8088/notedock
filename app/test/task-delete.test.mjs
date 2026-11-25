@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, linkRows, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskLinksIn, trashFailedNotice, trashFailedText, unlinkedTrashCheck, unlinkRange } from '../src/task-delete.mjs'
+import { collectDescendants, confirmedChildren, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, linkRows, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskLinksIn, trashFailedNotice, trashFailedText, unlinkedTrashCheck, unlinkRange, unsavedBlockText } from '../src/task-delete.mjs'
+import { linkRefsIn } from '../src/task-unlinked.mjs'
 
 const T = (path, parentPath = null, title = '') => ({ path, parentPath, title })
 
@@ -217,11 +218,89 @@ test('一覧の「ゴミ箱へ」：読み直した一覧で、まだ外れて�
   assert.match(unlinkedTrashCheck(null, 'Tasks/a.md').message, /一覧を読めなかった/)
 })
 
-test('閉じていない <!-- のあとのリンクは数える。表示名に行内コードがあっても、見つけたリンクの文字は元のまま', () => {
-  assert.equal(taskLinksIn('<!-- 閉じない\n- [[Tasks/a]]\n', MONTH, 'Tasks/a.md', known).length, 1)
+test('閉じていない <!-- のあとのリンク：行の途中なら数え、行頭なら（CommonMark の HTML のかたまり）数えない。表示名に行内コードがあっても、見つけたリンクの文字は元のまま', () => {
+  assert.equal(taskLinksIn('文中に <!-- 閉じない\n- [[Tasks/a]]\n', MONTH, 'Tasks/a.md', known).length, 1)
+  assert.equal(taskLinksIn('<!-- 閉じない\n- [[Tasks/a]]\n', MONTH, 'Tasks/a.md', known).length, 0)
   const text = '- [[Tasks/a|`x` の作業]]'
   const [link] = taskLinksIn(text, MONTH, 'Tasks/a.md', known)
   assert.equal(link.text, '[[Tasks/a|`x` の作業]]')
   // 位置がずれた文書でも、同じ文字で見つけ直せる
   assert.ok(relocateLink('先頭\n' + text, { from: link.from, to: link.to, linkText: link.text }, { notePath: MONTH, taskPath: 'Tasks/a.md', known }))
+})
+
+// ---- E2 の再レビューの指摘（小1）：HTML のコメントを CommonMark（プレビュー）と同じに見分ける ----
+
+test('HTML のコメント：行の途中の <!-- は、同じ段落の中で閉じるときだけ。行頭の <!-- は --> のある行まで', () => {
+  const count = (text) => taskLinksIn(text, MONTH, 'Tasks/a.md', known).length
+  const cases = [
+    // 行の途中の <!-- が、空行のあと（別の段落）の --> で閉じたことにならない
+    ['文中に <!-- と書いた\n\n- [[Tasks/a]]\n\nA --> B\n', 1],
+    // 同じ段落の中なら、行をまたいで閉じる
+    ['a <!-- b\n[[Tasks/a]] -->\n', 0],
+    ['a <!--\nx\n--> [[Tasks/a]]\n', 1],
+    // 段落は、見出し・箇条書きの次の項目で終わる。見出しの中のコメントはその行だけ
+    ['a <!-- b\n- [[Tasks/a]] -->\n', 1],
+    ['# 見出し <!-- x\n[[Tasks/a]] -->\n', 1],
+    ['- [ ] <!-- x\n- [[Tasks/a]]\n-->\n', 1],
+    // > を省いて続けた行も、引用の中の同じ段落
+    ['> a <!-- x\n[[Tasks/a]] -->\n', 0],
+    // 行頭の <!-- は、空行をまたいで --> のある行（その行は全部）まで。閉じなければ文書の終わりまで
+    ['<!--\n\n- [[Tasks/a]]\n\n-->\n', 0],
+    ['<!-- x --> [[Tasks/a]]\n', 0],
+    ['<!--\nx\n--> [[Tasks/a]]\n', 0],
+    ['a\n<!-- c -->\n- [[Tasks/a]]\n', 1],
+    // 入っている引用・箇条書きの項目が終われば、そこで終わる
+    ['> <!-- x\n[[Tasks/a]]\n-->\n', 1],
+    ['- <!-- x\n- [[Tasks/a]]\n-->\n', 1],
+    ['- a\n  <!-- x\n- [[Tasks/a]]\n-->\n', 1],
+    ['  <!-- x\n[[Tasks/a]]\n-->\n', 0],
+    // > や字下げを省いて続けた行なら、箇条書きの項目は続いている（項目の中の <!-- は、項目が終わるまで）
+    ['- a\n-->\n  <!-- w\n  [[Tasks/a]]\n[[Tasks/a]]\n', 1],
+    // HTML のかたまりの中の ``` はコードの囲みにならない。かたまりのあとの ``` は囲み
+    ['<!--\n```\n-->\n- [[Tasks/a]]\n', 1],
+    ['<!-- x\n```\n-->\n```\n- [[Tasks/a]]\n', 0],
+    // 行内コードが先なら、その中の <!-- はコメントにならない。<!--> と <!---> は、それだけで閉じたコメント
+    ['`<!--` [[Tasks/a]] -->\n', 1],
+    ['a <!--> [[Tasks/a]]\n', 1],
+    ['a <!---> [[Tasks/a]]\n', 1],
+    // 行末が CRLF でも同じ
+    ['a\r\n<!-- c -->\r\n- [[Tasks/a]]\r\n', 1],
+  ]
+  for (const [text, want] of cases) {
+    assert.equal(count(text), want, JSON.stringify(text))
+    // 判定（linkRefsIn）も同じ数え方
+    assert.equal(linkRefsIn(text).filter((ref) => ref.wiki === 'Tasks/a').length, want, JSON.stringify(text))
+  }
+  // scan の長さは行のまま（見つけた位置をそのまま文書の位置に使う）
+  for (const row of linkRows('a <!-- b\nc --> d\n<!--\ne\n-->')) assert.equal(row.scan.length, row.text.length)
+})
+
+// ---- E2 の再レビューの指摘（小3・小4） ----
+
+test('一覧の「ゴミ箱へ」の「すべて」：確認の文で数えた子だけを移す（確認の間に増えた子・ほかへ移った子は移さない）', () => {
+  const before = [T('Tasks/root.md'), T('Tasks/a.md', 'Tasks/root.md'), T('Tasks/b.md', 'Tasks/root.md')]
+  const confirmed = collectDescendants(before, 'Tasks/root.md')
+  assert.equal(confirmed.length, 2)
+  // 確認の間に c が増え、b はほかの親へ移った
+  const after = [T('Tasks/root.md'), T('Tasks/A.md', 'Tasks/root.md'), T('Tasks/b.md', 'Tasks/other.md'), T('Tasks/c.md', 'Tasks/root.md'), T('Tasks/other.md')]
+  assert.deepEqual(confirmedChildren(confirmed, collectDescendants(after, 'Tasks/root.md')).map((task) => task.path), ['Tasks/A.md'])
+  assert.deepEqual(confirmedChildren([], collectDescendants(after, 'Tasks/root.md')), [])
+})
+
+test('一覧の「ゴミ箱へ」：止めるのは、判定に関わるノートの保存が止まっているときだけ。どの枠のどのノートかを書く', () => {
+  const task = { path: 'Tasks/a.md', goal: '[[90_Periodic/2026/Monthly/2026-11]]', parent: '[[Tasks/p]]' }
+  const knownHere = new Set([MONTH, 'Tasks/a.md', 'Tasks/p.md', 'Notes/x.md'])
+  const check = (stuck, opts = {}) => unsavedBlockText(stuck, { paths: ['Tasks/a.md'], task, known: knownHere, split: true, ...opts })
+  // 関係のないノートなら止めない
+  assert.equal(check([{ pane: 'right', path: 'Notes/x.md' }]), '')
+  assert.equal(check([]), '')
+  // 移すタスク・goal・parent のノートなら止める
+  assert.match(check([{ pane: 'right', path: 'tasks/A.md' }]), /^右の枠の「A」に、まだ保存できていない変更があります。/)
+  assert.match(check([{ pane: 'left', path: MONTH }]), /^左の枠の「2026-11」に、/)
+  assert.match(check([{ pane: 'left', path: 'Tasks/p.md' }, { pane: 'right', path: 'Notes/x.md' }]), /^左の枠の「p」に、/)
+  // 移すサブタスク（paths に入れたもの）も
+  assert.match(check([{ pane: 'right', path: 'Tasks/c.md' }], { paths: ['Tasks/a.md', 'Tasks/c.md'] }), /^右の枠の「c」に、/)
+  // 両方なら両方。右の枠が開いていなければ、枠は書かない
+  assert.match(check([{ pane: 'left', path: MONTH }, { pane: 'right', path: 'Tasks/a.md' }]), /^左の枠の「2026-11」と、右の枠の「a」に、/)
+  assert.match(check([{ pane: 'left', path: MONTH }], { split: false }), /^開いている「2026-11」に、/)
 })

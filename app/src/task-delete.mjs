@@ -1,6 +1,6 @@
 // 「タスクを削除」（段階1-E1）のうち、DOM に頼らない部分。
 // 子孫の集め方、リンクを外す位置、goal・parent のノートの中のリンクの数え方、知らせの文を決める。
-import { analyzeLines } from './task-line.mjs'
+import { analyzeLines, closesFence, lineShape } from './task-line.mjs'
 import { isExternal, parseWikiLink, resolveHref, resolveWikiTarget } from './links.mjs'
 import { TASK_FOLDER } from './tasks.mjs'
 
@@ -72,31 +72,131 @@ export function unlinkRange(lineText, lineFrom, from, to) {
 const WIKI = /!?\[\[([^\[\]\n]+)\]\]/g
 const MD_LINK = /!?\[[^\]\n]*\]\(([^()\s]+)(?:\s+"[^"]*")?\)/g
 
-// リンクを探す行。先頭のプロパティとフェンスのコードの行は除き、行内コード（`…`）と HTML のコメント（<!-- … -->。
-// 行をまたいでもよい）の中は空白に置き換えた scan を付ける（長さは変えないので、見つけた位置はそのまま文書の位置に使える）。
+// HTML のコメントを、CommonMark（プレビューの読み方）に合わせて見分ける。
+// - 行頭（引用の > と3つまでの字下げのあと。箇条書きの記号のすぐ後ろも）の <!-- は、HTML のかたまり。--> がある行まで
+//   （その行は全部）がコメント。空行をまたいでもよく、閉じなければ文書の終わりまで。ただし、入っている引用や箇条書きの項目が
+//   終わったところで終わる（> の数が減った行、項目の中身より浅く字下げした行）。
+// - 行の途中の <!-- は、閉じる --> が同じ段落の中（空行・見出し・区切り線・箇条書きの次の項目・コードの囲み・行頭の <!-- の前まで）に
+//   あるときだけコメント。なければ、ただの文字。
+// 字下げ4つ以上のコードのかたまりは、ここでは見分けない（前からそのまま）。
+const OPEN = '<!--'
+const CLOSE = '-->'
+
+// 行頭の <!-- で始まる HTML のかたまりか。始まるなら { quote, col }（終わる目安。col は入っている箇条書きの項目の中身の位置）。
+function blockStart(shape, listCol) {
+  if (shape.kind === 'list') {
+    return !shape.checkbox && shape.body.startsWith(OPEN) ? { quote: shape.quote, col: shape.indent + shape.mark.length } : null
+  }
+  if (shape.kind !== 'text' || !shape.rest.startsWith(OPEN)) return null
+  const col = listCol !== null && shape.indent >= listCol ? listCol : 0
+  return shape.indent - col < 4 ? { quote: shape.quote, col } : null
+}
+
+// 前の行の段落の続きか（> や字下げを省いて続けた行）。段落の外なら paraQuote は null。
+function lazyLine(shape, paraQuote) {
+  return shape.kind === 'text' && paraQuote !== null && shape.quote <= paraQuote && !shape.fence && !shape.rest.startsWith(OPEN)
+}
+
+// 行の途中の <!--（k 行目の at から）を閉じる --> が、同じ段落の中にあるか。
+// quote は段落の始まりの行の > の数（> を省いて続けた行でも、段落は引用の中のまま）。
+// memo：次の行から先を調べた答え（閉じない <!-- の多い長い段落でも、同じ行を何度も調べないように）。
+function closesInParagraph({ rows, shapes, memo }, k, at, quote, listCol) {
+  if (rows[k].text.indexOf(CLOSE, at + 2) >= 0) return true
+  if (shapes[k].kind === 'heading') return false
+  const seen = []
+  let found = false
+  for (let j = k + 1; j < rows.length; j++) {
+    const key = j + ':' + quote + ':' + listCol
+    if (memo.has(key)) {
+      found = memo.get(key)
+      break
+    }
+    seen.push(key)
+    const next = shapes[j]
+    if (rows[j].kind === 'front' || next.kind !== 'text' || next.fence || next.quote > quote || blockStart(next, listCol)) break
+    if (rows[j].text.includes(CLOSE)) {
+      found = true
+      break
+    }
+  }
+  for (const key of seen) memo.set(key, found)
+  return found
+}
+
+// リンクを探す行。先頭のプロパティとコードの囲みの中の行は除き、行内コード（`…`）と HTML のコメントの中は空白に置き換えた
+// scan を付ける（長さは変えないので、見つけた位置はそのまま文書の位置に使える）。
 // リンクが外れたかの判定（task-unlinked.mjs）と、外すリンクを探すとき（taskLinksIn）で同じものを使う。
 export function linkRows(text) {
+  const rows = analyzeLines(text)
+  const shapes = rows.map((row) => lineShape(row.text))
+  const memo = new Map()
   const out = []
+  let fence = null
+  // 行頭から始まった HTML のかたまりの中か（{ quote, col }）。
+  let block = null
+  // 行の途中で始まったコメントが、次の行へ続いているか（閉じるのは確かめてある）。
   let inComment = false
-  for (const row of analyzeLines(text)) {
-    if (row.kind === 'front' || row.kind === 'code') continue
+  // 今の箇条書きの項目の中身の位置（なければ null）。
+  let listCol = null
+  // 今の段落の始まりの行の > の数（段落の外なら null）。
+  let paraQuote = null
+  for (let k = 0; k < rows.length; k++) {
+    const row = rows[k]
+    if (row.kind === 'front') continue
     const line = row.text
+    const shape = shapes[k]
+    // コードの囲みは、HTML のかたまりの中では始まらないので、ここで数え直す（analyzeLines の 'code' は使わない）。
+    if (fence) {
+      if (closesFence(shape.restRaw, fence)) fence = null
+      paraQuote = null
+      continue
+    }
+    if (block && shape.kind !== 'blank' && (shape.quote < block.quote || shape.indent < block.col)) block = null
+    if (block) {
+      if (line.includes(CLOSE)) block = null
+      paraQuote = null
+      out.push({ ...row, kind: shape.kind, scan: ' '.repeat(line.length) })
+      continue
+    }
+    if (shape.kind !== 'blank') {
+      if (shape.kind === 'list') listCol = shape.indent + shape.mark.length
+      // 浅い行でも、段落の続き（> や字下げを省いて続けた行）なら、項目は終わっていない。
+      else if (listCol !== null && shape.indent < listCol && !lazyLine(shape, paraQuote)) listCol = null
+    }
+    if (!inComment) {
+      if (shape.fence) {
+        fence = shape.fence
+        paraQuote = null
+        continue
+      }
+      const start = blockStart(shape, listCol)
+      if (start) {
+        if (line.indexOf(CLOSE, line.indexOf(OPEN) + 2) < 0) block = start
+        paraQuote = null
+        out.push({ ...row, kind: shape.kind, scan: ' '.repeat(line.length) })
+        continue
+      }
+    }
+    if (shape.kind === 'list' || (shape.kind === 'text' && (paraQuote === null || shape.quote > paraQuote))) paraQuote = shape.quote
+    else if (shape.kind !== 'text') paraQuote = null
     let scan = ''
     let i = 0
     while (i < line.length) {
       if (inComment) {
-        const end = line.indexOf('-->', i)
-        const stop = end < 0 ? line.length : end + 3
+        const end = line.indexOf(CLOSE, i)
+        const stop = end < 0 ? line.length : end + CLOSE.length
         scan += ' '.repeat(stop - i)
         i = stop
         if (end >= 0) inComment = false
         continue
       }
-      // 閉じる --> がこのあとのどこにもないコメントは、HTML のコメントとして扱わない（残りのリンクを全部見落とさないように）。
-      if (line.startsWith('<!--', i) && text.indexOf('-->', row.from + i + 4) >= 0) {
-        inComment = true
-        scan += '    '
-        i += 4
+      // <!--> と <!---> も、閉じたコメント（CommonMark）。
+      if (line.startsWith(OPEN, i) && closesInParagraph({ rows, shapes, memo }, k, i, paraQuote ?? shape.quote, listCol)) {
+        const end = line.indexOf(CLOSE, i + 2)
+        const stop = end < 0 ? line.length : end + CLOSE.length
+        scan += ' '.repeat(stop - i)
+        i = stop
+        if (end < 0) inComment = true
         continue
       }
       if (line[i] === '`') {
@@ -129,7 +229,7 @@ export function linkRows(text) {
       scan += line[i]
       i++
     }
-    out.push({ ...row, scan })
+    out.push({ ...row, kind: shape.kind, scan })
   }
   return out
 }
@@ -188,14 +288,44 @@ export function relocateLink(text, { from, to, linkText }, { notePath, taskPath,
 // 返り値：{ kind: 'parent' | 'goal', path, exists } か null。
 export function sourceNoteOf({ path, goal, parent }, known) {
   for (const [kind, value] of [['parent', parent], ['goal', goal]]) {
-    const inner = /^\[\[([^\[\]]+)\]\]$/.exec(String(value ?? '').trim())?.[1] ?? String(value ?? '').trim()
-    if (!inner) continue
-    const parsed = parseWikiLink(inner)
-    if (!parsed?.file) continue
-    const target = resolveWikiTarget(path, parsed.file, known)
+    const target = propTarget(path, value, known)
     if (target) return { kind, path: target.path, exists: target.exists !== false }
   }
   return null
+}
+
+// プロパティ（goal・parent）の "[[…]]" が指すノート。書いていない・読めないときは null。
+function propTarget(path, value, known) {
+  const inner = /^\[\[([^\[\]]+)\]\]$/.exec(String(value ?? '').trim())?.[1] ?? String(value ?? '').trim()
+  if (!inner) return null
+  const parsed = parseWikiLink(inner)
+  if (!parsed?.file) return null
+  return resolveWikiTarget(path, parsed.file, known)
+}
+
+// 確認の文で数えた子（confirmed）のうち、読み直した一覧でもまだ子孫のもの（now の中のもの）だけを返す。
+// 確認の間に増えたサブタスクは移さない（件数を超えて移さないように）。ほかの親へ移した・消えたものも移さない。
+export function confirmedChildren(confirmed, now) {
+  const keys = new Set((confirmed ?? []).map((task) => pathKey(task?.path)))
+  return (now ?? []).filter((task) => task?.path && keys.has(pathKey(task.path)))
+}
+
+// 一覧の「ゴミ箱へ」を、開いているノートの保存が止まっているために止めるか。
+// stuck：保存しきれなかった開いているノート [{ pane: 'left' | 'right', path }]。
+// 止めるのは、判定に関わるノート（paths：移すタスクとサブタスク、と task の goal・parent のノート）のときだけ。
+// split：右の枠が開いているか（開いていなければ、どちらの枠かは書かない）。
+// 返り値：止めるときは知らせの文、止めないときは ''。
+export function unsavedBlockText(stuck, { paths = [], task = null, known, split = false }) {
+  const related = new Set(paths.map(pathKey))
+  for (const value of [task?.parent, task?.goal]) {
+    const target = task?.path ? propTarget(task.path, value, known) : null
+    if (target?.path) related.add(pathKey(target.path))
+  }
+  const hits = (stuck ?? []).filter((note) => note?.path && related.has(pathKey(note.path)))
+  if (!hits.length) return ''
+  const nameOf = (path) => '「' + path.split('/').at(-1).replace(/\.md$/i, '') + '」'
+  const where = hits.map((note) => (split ? (note.pane === 'right' ? '右の枠の' : '左の枠の') : '開いている') + nameOf(note.path)).join('と、')
+  return where + 'に、まだ保存できていない変更があります。このタスクをゴミ箱へ移すのに関わるノートなので、保存できてから、もう一度選んでください。'
 }
 
 // ---- 知らせの文 ----

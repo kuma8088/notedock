@@ -123,11 +123,12 @@ test('BOM つきのタスクノート：先頭のプロパティ（parent: な�
 
 test('数えないもの：行内コードと HTML のコメント（行をまたぐものも）の中', () => {
   const tasks = [{ path: T('a'), goal }]
-  for (const text of ['文中の `[[Tasks/a]]` はコード\n', '文中の ``a ` [[Tasks/a]]`` はコード\n', '<!-- [[Tasks/a]] -->\n', '<!--\n- [[Tasks/a]]\n-->\n本文\n']) {
+  // 行頭の <!-- で始まるもの（CommonMark の HTML のかたまり）は、--> のある行の残りもコメント
+  for (const text of ['文中の `[[Tasks/a]]` はコード\n', '文中の ``a ` [[Tasks/a]]`` はコード\n', '<!-- [[Tasks/a]] -->\n', '<!--\n- [[Tasks/a]]\n-->\n本文\n', '<!-- x --> [[Tasks/a]]\n', '<!--\nx\n--> [[Tasks/a]]\n']) {
     assert.equal(judge(tasks, { [MONTH]: text })[T('a')], true, text)
   }
-  // 閉じたあとのリンク・閉じていない ` のあとのリンクは数える
-  for (const text of ['`code` [[Tasks/a]]\n', '<!-- x --> [[Tasks/a]]\n', '<!--\nx\n--> [[Tasks/a]]\n', '閉じない ` [[Tasks/a]]\n']) {
+  // 閉じたあとのリンク・閉じていない ` のあとのリンク・別の段落の --> までは届かない行の途中の <!-- のあとのリンクは数える
+  for (const text of ['`code` [[Tasks/a]]\n', '文 <!-- x --> [[Tasks/a]]\n', '文 <!--\nx\n--> [[Tasks/a]]\n', '閉じない ` [[Tasks/a]]\n', '文中に <!-- と書いた\n\n- [[Tasks/a]]\n\nA --> B\n']) {
     assert.equal(judge(tasks, { [MONTH]: text })[T('a')], false, text)
   }
 })

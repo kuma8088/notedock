@@ -34,7 +34,7 @@ import { alphaChildEnter, alphaListEnter } from './alpha-list.mjs'
 import { foldedLines, foldsChanged, listMarkerFold } from './folds.mjs'
 import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
-import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
+import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
 import { noteContext, previewField, setComposing, setMode, setNoteBusy, togglePropsPanel } from './preview.mjs'
 import { createSaver } from './save.mjs'
@@ -48,7 +48,7 @@ import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
 import { checkNewTask, dailyDateOf } from './task-buckets.mjs'
 import { createTaskSide } from './task-side.mjs'
 import { createTaskPanel } from './task-panel.mjs'
-import { collectDescendants, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkedTrashCheck, unlinkRange } from './task-delete.mjs'
+import { collectDescendants, confirmedChildren, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkedTrashCheck, unlinkRange, unsavedBlockText } from './task-delete.mjs'
 import { MENU_HINT, canUndoDirectly, createFailedText, createdText, leftoverText, linkChange, linkRemoval, menuForLine, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
@@ -3063,23 +3063,16 @@ async function trashedElsewhere({ paths, open }) {
 }
 
 // 右の枠から：左で paths のどれかを開いていれば、左に書きかけを保存してもらう。返事は { dirty }（5秒たっても返事がなければ dirty）。
-const leftSaveWaiters = []
+// 頼みごとに id を付け、返事は同じ id の待ちだけを解く（切れたあとに遅れて来た返事で、次の待ちを解かないように）。
+const leftSaveWaiters = createReplyWaiters()
 function askLeftToSave(paths) {
-  return new Promise((resolve) => {
-    const done = (result) => {
-      clearTimeout(timer)
-      const index = leftSaveWaiters.indexOf(done)
-      if (index >= 0) leftSaveWaiters.splice(index, 1)
-      resolve(result)
-    }
-    const timer = setTimeout(() => done({ dirty: true }), 5_000)
-    leftSaveWaiters.push(done)
-    toLeft({ type: MSG.SAVE_LEFT, paths })
-  })
+  const { id, promise } = leftSaveWaiters.wait(5_000, { dirty: true })
+  toLeft({ type: MSG.SAVE_LEFT, id, paths })
+  return promise
 }
 
 // 左の枠で：右の枠から頼まれたら、開いているノートが paths のどれかのときだけ保存して返事をする。
-async function saveForRight({ paths }) {
+async function saveForRight({ id, paths }) {
   let dirty = false
   try {
     if (currentPath && Array.isArray(paths) && paths.some((path) => typeof path === 'string' && pathKey(path) === pathKey(currentPath))) {
@@ -3088,7 +3081,7 @@ async function saveForRight({ paths }) {
       dirty = Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state)
     }
   } finally {
-    split?.post({ type: MSG.LEFT_SAVED, dirty })
+    split?.post({ type: MSG.LEFT_SAVED, id, dirty })
   }
 }
 
@@ -3339,13 +3332,15 @@ async function createTaskFromSide() {
   closeSideIfNarrow()
 }
 
-// 開いているノート（左と、右の枠）の書きかけを保存する。保存しきれなければ false（何も開いていなければ true）。
+// 開いているノート（左と、右の枠）の書きかけを保存してみる。返り値：保存しきれなかったノート [{ pane, path }]。
+// 止めるかどうかは、そのノートが判定に関わるかで決める（unsavedBlockText）。
 async function saveOpenNotes() {
+  const stuck = []
   commitOpenField()
   await saver?.flush()
-  if (saver && !CLEAN_STATES.has($('status').dataset.state)) return false
-  if (split?.isOpen() && rightState.path && (await split.save()).dirty) return false
-  return true
+  if (saver && currentPath && !CLEAN_STATES.has($('status').dataset.state)) stuck.push({ pane: 'left', path: currentPath })
+  if (split?.isOpen() && rightState.path && (await split.save()).dirty) stuck.push({ pane: 'right', path: rightState.path })
+  return stuck
 }
 
 // 「リンクが外れたタスク」の「ゴミ箱へ」。外れたリンクはないので、リンクは外さずにノートをゴミ箱へ移す。
@@ -3355,11 +3350,9 @@ async function trashUnlinkedTask(path) {
   taskBusy = true
   let handOff = false
   try {
-    // 判定はサーバーのファイルで決まるので、開いているノート（左と右）の書きかけを先に保存する。保存しきれなければやめる。
-    if (!(await saveOpenNotes())) {
-      showMessage('開いているノートに、まだ保存できていない変更があります。保存できてから、もう一度選んでください。')
-      return
-    }
+    // 判定はサーバーのファイルで決まるので、開いているノート（左と右）の書きかけを先に保存する。
+    // 判定に関わるノート（このタスクと移すサブタスク、その goal・parent のノート）を保存しきれなければやめる。
+    const stuck = await saveOpenNotes()
     const list = await loadTaskList()
     const checked = unlinkedTrashCheck(list, path)
     if (!checked.ok) {
@@ -3367,14 +3360,21 @@ async function trashUnlinkedTask(path) {
       refreshTaskSide()
       return
     }
+    const { task } = checked
+    const children = collectDescendants(list, task.path)
     // 左で開いているノートで、書き換えられるなら「このタスクを削除」と同じ流れにする。編集できない（BOM つきなど）ときは、
     // 開いていないノートと同じ流れで移す（移したあとは何も開いていない画面に戻す）。
-    if (currentPath && pathKey(currentPath) === pathKey(path) && editable && saver && !saver.isStopped()) {
+    const handing = Boolean(currentPath) && pathKey(currentPath) === pathKey(path) && editable && saver && !saver.isStopped()
+    // サブタスクは、ふだんは移すと決めてから（確認のあとで）確かめる。「このタスクを削除」へ渡すときは、そちらでは確かめないのでここで。
+    const blocked = unsavedBlockText(stuck, { paths: [task.path, ...(handing ? children.map((child) => child.path) : [])], task, known, split: Boolean(split?.isOpen()) })
+    if (blocked) {
+      showMessage(blocked)
+      return
+    }
+    if (handing) {
       handOff = true
       return
     }
-    const { task } = checked
-    const children = collectDescendants(list, task.path)
     const title = taskTitleOf(task)
     const source = sourceNoteOf(task, known)
     const sourceName = source ? source.path.split('/').at(-1).replace(/\.md$/i, '') : ''
@@ -3382,10 +3382,7 @@ async function trashUnlinkedTask(path) {
     const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink, sourceName, linkCount: 0 }), deleteChoices(children.length))
     if (!choice) return
     // 確かめている間に書いた分も保存してから、まだ外れているかを確かめ直す（リンクを戻したのに移さないように）。
-    if (!(await saveOpenNotes())) {
-      showMessage('開いているノートに、まだ保存できていない変更があります。保存できてから、もう一度選んでください。')
-      return
-    }
+    const stuckAgain = await saveOpenNotes()
     const fresh = await loadTaskList()
     const again = unlinkedTrashCheck(fresh, path)
     if (!again.ok) {
@@ -3393,8 +3390,14 @@ async function trashUnlinkedTask(path) {
       refreshTaskSide()
       return
     }
-    const nowChildren = collectDescendants(fresh, again.task.path)
-    const paths = [again.task.path, ...(choice === 'all' ? nowChildren.map((child) => child.path) : [])]
+    // 移すサブタスクは、確認の文で数えたもののうち、今もこのタスクの下にあるものだけ（確認の間に増えたものは移さない）。
+    const moving = choice === 'all' ? confirmedChildren(children, collectDescendants(fresh, again.task.path)) : []
+    const paths = [again.task.path, ...moving.map((child) => child.path)]
+    const blockedAgain = unsavedBlockText(stuckAgain, { paths, task: again.task, known, split: Boolean(split?.isOpen()) })
+    if (blockedAgain) {
+      showMessage(blockedAgain)
+      return
+    }
     // 左で開いているノートを一緒に移すときは、移したあとは何も開いていない画面に戻す（保存は上で済ませた）。
     const openGoes = Boolean(currentPath) && paths.some((item) => pathKey(item) === pathKey(currentPath))
     const result = await trashTaskNotes(paths)
@@ -4021,7 +4024,7 @@ async function receiveFromLeft(data) {
     themeChoice = data.theme === 'light' || data.theme === 'dark' ? data.theme : null
     applyTheme()
   } else if (data.type === MSG.LEFT_SAVED) {
-    for (const done of [...leftSaveWaiters]) done({ dirty: data.dirty !== false })
+    leftSaveWaiters.answer(data.id, { dirty: data.dirty !== false })
   } else if (data.type === MSG.SAVE) {
     try {
       commitOpenField()

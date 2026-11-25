@@ -29,6 +29,33 @@ function widthOf(indent) {
   return col
 }
 
+// 1行だけを見た形。先頭のプロパティとコードブロックの中かどうかは見ない（それは analyzeLines が決める）。
+// kind：'blank'・'heading'・'rule'・'list'・'text'。list なら mark（記号と後ろの空白）・checkbox・body も付ける。
+// fence：コードの囲みを始められる記号（```・~~~ など。なければ null）。restRaw：引用の > と字下げを除いた残り（末尾の空白も残す）。
+export function lineShape(line) {
+  const [, quotePart, indent, restRaw] = LINE.exec(line)
+  const quote = (quotePart.match(/>/g) ?? []).length
+  const rest = restRaw.replace(/\s+$/, '')
+  const shape = { quote, indent: widthOf(indent), rest, restRaw, fence: FENCE.exec(restRaw)?.[1] ?? null }
+  if (rest === '') return { ...shape, kind: 'blank' }
+  if (HEADING.test(rest) && shape.indent < 4) return { ...shape, kind: 'heading' }
+  if (RULE.test(rest) && shape.indent < 4) return { ...shape, kind: 'rule' }
+  const mark = LIST_MARK.exec(rest)
+  if (mark) {
+    let body = rest.slice(mark[0].length)
+    const box = CHECKBOX.exec(body)
+    if (box) body = body.slice(box[0].length)
+    return { ...shape, kind: 'list', mark: mark[0], checkbox: Boolean(box), body: body.trim() }
+  }
+  return { ...shape, kind: 'text' }
+}
+
+// fence（開いたときの記号）で始まったコードブロックを、この行（lineShape の restRaw）で閉じるか。
+export function closesFence(restRaw, fence) {
+  const match = FENCE.exec(restRaw)
+  return Boolean(match) && match[1][0] === fence[0] && match[1].length >= fence.length && restRaw.slice(match[1].length).trim() === ''
+}
+
 // ノート全体を行に分けて、行ごとの種類を決める。lines[i] は 0 から数える。
 // kind: 'front'（先頭のプロパティ）・'code'（コードブロックの中と、その囲みの行）・'heading'・'rule'（区切り線）・'list'・'text'・'blank'。
 export function analyzeLines(text) {
@@ -43,47 +70,25 @@ export function analyzeLines(text) {
     const line = raw[i]
     const from = offset
     offset += line.length + 1
-    const [, quotePart, indent, restRaw] = LINE.exec(line)
-    const quote = (quotePart.match(/>/g) ?? []).length
-    const rest = restRaw.replace(/\s+$/, '')
-    const base = { index: i, from, to: from + line.length, text: line, quote, indent: widthOf(indent), rest }
+    const shape = lineShape(line)
+    const base = { index: i, from, to: from + line.length, text: line, quote: shape.quote, indent: shape.indent, rest: shape.rest }
     if (front === 'open') {
       if (i > 0 && (bareOf(line) === '---' || bareOf(line) === '...')) front = 'done'
       out.push({ ...base, kind: 'front' })
       continue
     }
-    const fenceMatch = FENCE.exec(restRaw)
     if (fence) {
-      if (fenceMatch && fenceMatch[1][0] === fence[0] && fenceMatch[1].length >= fence.length && restRaw.slice(fenceMatch[1].length).trim() === '') fence = null
+      if (closesFence(shape.restRaw, fence)) fence = null
       out.push({ ...base, kind: 'code' })
       continue
     }
-    if (fenceMatch) {
-      fence = fenceMatch[1]
+    if (shape.fence) {
+      fence = shape.fence
       out.push({ ...base, kind: 'code' })
       continue
     }
-    if (rest === '') {
-      out.push({ ...base, kind: 'blank' })
-      continue
-    }
-    if (HEADING.test(rest) && widthOf(indent) < 4) {
-      out.push({ ...base, kind: 'heading' })
-      continue
-    }
-    if (RULE.test(rest) && widthOf(indent) < 4) {
-      out.push({ ...base, kind: 'rule' })
-      continue
-    }
-    const mark = LIST_MARK.exec(rest)
-    if (mark) {
-      let body = rest.slice(mark[0].length)
-      const box = CHECKBOX.exec(body)
-      if (box) body = body.slice(box[0].length)
-      out.push({ ...base, kind: 'list', checkbox: Boolean(box), body: body.trim() })
-      continue
-    }
-    out.push({ ...base, kind: 'text' })
+    if (shape.kind === 'list') out.push({ ...base, kind: 'list', checkbox: shape.checkbox, body: shape.body })
+    else out.push({ ...base, kind: shape.kind })
   }
   return out
 }
