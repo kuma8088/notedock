@@ -3,7 +3,10 @@ import { test } from 'node:test'
 
 import {
   TASK_SECTION_DEFAULT_OPEN,
+  TASK_SOON_DAYS,
   addDays,
+  isSoonDays,
+  soonDaysOf,
   bucketTasks,
   dailyDateOf,
   dueView,
@@ -46,6 +49,33 @@ test('直近の日数を変えられる', () => {
   const tasks = [t('3日後', { due: '2026-11-27' }), t('6日後', { due: '2026-11-30' })]
   assert.deepEqual(names(bucketTasks(tasks, '2026-11-24', { soonDays: 0 }).soon), [])
   assert.deepEqual(names(bucketTasks(tasks, '2026-11-24', { soonDays: 7 }).soon), ['3日後', '6日後'])
+})
+
+test('直近の日数の境目：その日数ちょうどの日は入り、次の日は入らない（月・年をまたいでも）', () => {
+  const tasks = [t('5日後', { due: '2026-12-29' }), t('6日後', { due: '2026-12-30' }), t('31日後', { due: '2027-01-24' }), t('32日後', { due: '2027-01-25' })]
+  assert.deepEqual(names(bucketTasks(tasks, '2026-12-24', { soonDays: 5 }).soon), ['5日後'])
+  assert.deepEqual(names(bucketTasks(tasks, '2026-12-24', { soonDays: 6 }).soon), ['5日後', '6日後'])
+  assert.deepEqual(names(bucketTasks(tasks, '2026-12-24', { soonDays: 31 }).soon), ['5日後', '6日後', '31日後'])
+})
+
+test('直近の日数が使えない値なら3日として分ける', () => {
+  const tasks = [t('3日後', { due: '2026-11-27' }), t('4日後', { due: '2026-11-28' })]
+  for (const bad of [undefined, null, -1, 32, 2.5, '5', NaN, true]) {
+    assert.deepEqual(names(bucketTasks(tasks, '2026-11-24', { soonDays: bad }).soon), ['3日後'], String(bad))
+  }
+  assert.deepEqual(names(bucketTasks(tasks, '2026-11-24').soon), ['3日後'])
+})
+
+test('soonDaysOf と isSoonDays：0から31までの整数だけを受け付ける', () => {
+  for (const ok of [0, 3, 31]) {
+    assert.equal(isSoonDays(ok), true)
+    assert.equal(soonDaysOf(ok), ok)
+  }
+  for (const bad of [-1, 32, 1.5, '3', null, undefined, NaN, Infinity]) {
+    assert.equal(isSoonDays(bad), false, String(bad))
+    assert.equal(soonDaysOf(bad), 3, String(bad))
+  }
+  assert.equal(TASK_SOON_DAYS, 3)
 })
 
 test('期日を過ぎた未完了は直近に出る。完了したものは出ない', () => {

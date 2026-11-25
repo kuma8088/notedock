@@ -370,6 +370,16 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
         merged.periodic = { ...old, root: body.periodicRoot }
       } else typeErrors.push('periodicRootが文字ではありません')
     }
+    // タスクのパネルの「直近」の日数。settings.json では tasks.soonDays。tasks のほかの項目は残す。
+    if (body.taskSoonDays !== undefined) {
+      const old = merged.tasks && typeof merged.tasks === 'object' && !Array.isArray(merged.tasks) ? merged.tasks : {}
+      if (body.taskSoonDays === null) {
+        const { soonDays, ...rest } = old
+        if (Object.keys(rest).length) merged.tasks = rest
+        else delete merged.tasks
+      } else if (Number.isInteger(body.taskSoonDays)) merged.tasks = { ...old, soonDays: body.taskSoonDays }
+      else typeErrors.push('taskSoonDaysが整数ではありません')
+    }
     const errors = [...typeErrors, ...(typeErrors.length ? [] : checkVaultSettings(merged, root).errors)]
     if (errors.length) return send(res, 400, { errors })
     fs.mkdirSync(vaultDir, { recursive: true, mode: 0o700 })
@@ -530,8 +540,9 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
       }
       case 'GET /api/notes':
         return send(res, 200, notes())
+      // 一覧に「直近」の日数を添える（画面はこれで区分ける。settings.json にない・使えないときは3）。
       case 'GET /api/tasks':
-        return send(res, 200, taskIndex.list())
+        return send(res, 200, { ...taskIndex.list(), soonDays: settings().taskSoonDays })
       // タスクのノートを Tasks/ に作る。目標のノートへのリンクは画面がエディターの変更として足す（サーバーは書き換えない）。
       case 'POST /api/tasks': {
         let body

@@ -3,8 +3,20 @@
 import { isValidDate, periodInfo } from './periodic.mjs'
 import { isTaskDone } from './tasks.mjs'
 
-// 「直近」の日数。段階1-F で設定にする。
+// 「直近」の日数の初期値と、設定で受け付ける範囲（整数）。Vault の settings.json の tasks.soonDays に持つ（段階1-F）。
+// 0 は「その日と期日を過ぎたものだけ」。上は31：今月の区分が長くて31日なので、それより先を「直近」と呼ぶのは無理がある。
 export const TASK_SOON_DAYS = 3
+export const TASK_SOON_DAYS_MIN = 0
+export const TASK_SOON_DAYS_MAX = 31
+
+export function isSoonDays(value) {
+  return Number.isInteger(value) && value >= TASK_SOON_DAYS_MIN && value <= TASK_SOON_DAYS_MAX
+}
+
+// 設定の値を日数にする。ない・範囲の外・整数でないときは初期値の3。
+export function soonDaysOf(value) {
+  return isSoonDays(value) ? value : TASK_SOON_DAYS
+}
 export const TASK_HOLD_STATUS = '保留'
 // パネルの中見出しの並び。done は完了したもの（件数だけ見せてたたむ）。
 export const TASK_SECTIONS = Object.freeze(['soon', 'week', 'month', 'none', 'done'])
@@ -47,7 +59,7 @@ export function taskSpan(task) {
 const overlaps = (span, range) => span.start <= range.end && span.end >= range.start
 
 // 開いているデイリーノートの日付（baseDate）から、タスクを区分に分ける。
-// - 直近：期日が baseDate〜baseDate+soonDays に入るもの、または期日を過ぎた未完了
+// - 直近：期日が baseDate〜baseDate+soonDays に入るもの、または期日を過ぎた未完了（soonDays が使えない値なら3）
 // - 今週・今月：期日がその週・月に入るか、開始日〜期日がその週・月にかかるもの
 // - 期日なし：期日が日付として読めないもの（開始日だけのものも、ここに入る）
 // 当てはまる区分すべてに入れる。完了したものは上の4つに入れず、done にまとめる（期日なしの完了は数えない）。
@@ -55,7 +67,7 @@ const overlaps = (span, range) => span.start <= range.end && span.end >= range.s
 export function bucketTasks(tasks, baseDate, { soonDays = TASK_SOON_DAYS } = {}) {
   if (!isValidDate(baseDate)) throw new Error(`日付の形が正しくありません：${baseDate}`)
   const out = { soon: [], week: [], month: [], none: [], done: [] }
-  const soonEnd = addDays(baseDate, Math.max(0, Math.floor(soonDays)))
+  const soonEnd = addDays(baseDate, soonDaysOf(soonDays))
   const week = weekRange(baseDate)
   const month = monthRange(baseDate)
   for (const task of tasks ?? []) {
