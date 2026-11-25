@@ -1,5 +1,5 @@
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, startCompletion } from '@codemirror/autocomplete'
-import { defaultKeymap, history, historyKeymap, indentWithTab, insertNewline, isolateHistory } from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, indentWithTab, insertNewline, isolateHistory, undoDepth } from '@codemirror/commands'
 import { deleteMarkupBackward, insertNewlineContinueMarkup } from '@codemirror/lang-markdown'
 import {
   HighlightStyle,
@@ -25,25 +25,32 @@ import { findHeading, headingsOf, linkCompletion, wikiLinkCompletion } from './c
 import { calendarModel, shiftMonth } from './calendar.mjs'
 import { periodInfo, todayButtonHidden } from './periodic.mjs'
 import { PRODUCT } from './product.mjs'
-import { askChoice, askConfirm, askNewNote, askPlace, askText, showCopyable, showMessage } from './dialogs.mjs'
+import { askChoice, askConfirm, askNewNote, askNewTask, askPlace, askText, showCopyable, showMessage } from './dialogs.mjs'
 import { copyText } from './copy.mjs'
-import { keyLabel, localizeKeyHints } from './keys.mjs'
+import { isBodyKey, keyLabel, localizeKeyHints } from './keys.mjs'
 import { isExternal, normalizeKey, relativeHref, resolveHref, wikiLinkOf } from './links.mjs'
 import { absolutePath, ancestorsOf, buildTree, checkNewNote, childFolders, defaultNoteDir, newNotePath, noteFolders, planFailure, rememberPlace, resolvePasted, searchFolders } from './files.mjs'
 import { alphaChildEnter, alphaListEnter } from './alpha-list.mjs'
 import { foldedLines, foldsChanged, listMarkerFold } from './folds.mjs'
 import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
-import { MSG, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
+import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { noteContext, previewField, setComposing, setMode, togglePropsPanel } from './preview.mjs'
+import { editableExtensions, endQuietAfterClick, focusEndsQuiet, frontmatterEnd, frontmatterGuard, frontmatterRepair, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, propsBlankAt, refocusesBody } from './modes.mjs'
+import { cursorQuiet, keyEndsQuiet, noteContext, noteMode, previewField, setComposing, setCursorQuiet, setMode, setNoteBusy, togglePropsPanel, typingStart } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
 import { calloutSpec, codeBlockSpec, currentFormat, headingSpec, horizontalRuleSpec, inlineSpec, lineKindSpec, linkSpec, tableSpec } from './toolbar.mjs'
 import { createConnectionWatch, createVersionWatch } from './connection.mjs'
 import { linesFrom, selectedLines } from './lines.mjs'
 import { applyMention, headingTarget, mentionCandidates, mentionQuery, sectionsOf, unwritableCount } from './mention.mjs'
-import { beginTableCell, showMenu } from './widgets.mjs'
+import { beginTableCell, historyStep, showMenu } from './widgets.mjs'
+import { TASK_FOLDER, isTaskNote } from './tasks.mjs'
+import { checkNewTask, dailyDateOf } from './task-buckets.mjs'
+import { createTaskSide } from './task-side.mjs'
+import { createTaskPanel } from './task-panel.mjs'
+import { collectDescendants, confirmedChildren, deleteChoices, deleteQuestion, deletedText, findTask, isUnderTaskFolder, pathKey, planUnlinkInNote, relocateLink, sourceLinkNote, sourceNoteOf, taskTitleOf, trashFailedNotice, unlinkedTrashCheck, unlinkRange, unsavedBlockText } from './task-delete.mjs'
+import { MENU_HINT, canUndoDirectly, createFailedText, createLostText, createdText, expectedTaskPath, leftoverText, linkRemoval, menuForLine, moveChanges, moveUndoChange, movedBody, notLinkedText, planAfterCreate, reasonText, taskForDocLine, taskRequestBody, historyLinkChange, undoneText } from './task-convert.mjs'
 import { setProperty } from './yaml-lite.mjs'
 
 const $ = (id) => document.getElementById(id)
@@ -303,6 +310,8 @@ const api = {
     const result = await request(noteUrl(path), { method: 'PUT', body: JSON.stringify({ text, baseHash }) })
     if (result.status === 409) return result.data
     if (!result.ok) throw Object.assign(new Error(result.data?.error ?? 'save failed'), { status: result.status })
+    if (isTaskFolderPath(path)) tasksSaved()
+    else noteSaved()
     return result.data
   },
   async backup(path, text) {
@@ -341,8 +350,10 @@ let events = null
 let notes = []
 let known = null
 let currentPath = null
-// ノートはまず閲覧で開き、「編集」か Cmd+E で編集に切り替える。
-let mode = 'reading'
+// ノートは編集の表示（live）で開く。上の「ソース」で Markdown の文字のままの表示（source）に切り替えられる。
+let mode = 'live'
+// ノートを開いた回の番号（openNote で中身を入れ替えるたびに1つ増やす）。
+let openRound = 0
 let rootPaths = []
 let platform = 'darwin'
 let vaultLabel = ''
@@ -602,6 +613,7 @@ const TOOLBAR_ACTIONS = {
   rule: () => runSpec(horizontalRuleSpec)(view),
   codeblock: () => runSpec(codeBlockSpec)(view),
   callout: (button) => menuBelow(button, CALLOUT_MENU.map(([label, kind]) => ({ label, run: () => runSpec((state) => calloutSpec(state, kind))(view) }))),
+  maketask: () => makeTaskAtCursor(),
 }
 
 // 変換中と、表のマスやノートの情報の欄を編集している間は、押しても何もしない。
@@ -611,7 +623,7 @@ function toolbarBusy() {
 
 function syncToolbar() {
   const bar = $('toolbar')
-  bar.hidden = !currentPath || !editable || mode === 'reading'
+  bar.hidden = !currentPath || !editable
   if (bar.hidden || !view) return
   const busy = toolbarBusy()
   const format = currentFormat(view.state)
@@ -651,11 +663,6 @@ function bindToolbar() {
   $('editor').addEventListener('focusout', () => setTimeout(syncToolbar, 0))
 }
 
-function cycleMode() {
-  applyMode(mode === 'reading' ? 'live' : 'reading')
-  return true
-}
-
 function addProperty(target) {
   askText('追加する項目の名前').then((name) => applyNewProperty(target, name))
   return true
@@ -663,10 +670,10 @@ function addProperty(target) {
 
 function applyNewProperty(target, name) {
   if (!name?.trim()) return
-  const doc = target.state.doc.toString()
-  const front = doc.match(/^---\n[\s\S]*?\n---(?=\n|$)/)
-  if (front) {
-    target.dispatch({ changes: { from: 0, to: front[0].length, insert: setProperty(front[0], name.trim(), '') } })
+  // 欄の見分け方は、欄を守る決まりと同じ（modes.mjs の frontmatterEnd。--- の行の後ろの空白も許す）。
+  const end = frontmatterEnd(target.state.doc)
+  if (end !== null) {
+    target.dispatch({ changes: { from: 0, to: end, insert: setProperty(target.state.sliceDoc(0, end), name.trim(), '') } })
   } else {
     target.dispatch({ changes: { from: 0, insert: `---\n${name.trim()}:\n---\n` } })
   }
@@ -690,12 +697,12 @@ const editorKeys = keymap.of([
   { key: 'Mod-i', run: runSpec((state) => inlineSpec(state, 'italic')), preventDefault: true },
   { key: 'Mod-k', run: (target) => { insertLink(target); return true }, preventDefault: true },
   { key: 'Mod-s', run: saveNow, preventDefault: true },
-  { key: 'Mod-e', run: cycleMode, preventDefault: true },
   { key: 'Mod-Alt-f', run: openSearchPanel, preventDefault: true },
   { key: 'Mod-;', run: addProperty, preventDefault: true },
   { key: 'Mod-Shift-t', run: insertTable, preventDefault: true },
   { key: 'Mod-Alt-[', run: (target) => foldAll(target), preventDefault: true },
   { key: 'Mod-Alt-]', run: (target) => unfoldAll(target), preventDefault: true },
+  { key: 'Mod-Alt-t', run: () => makeTaskAtCursor(), preventDefault: true },
   ...closeBracketsKeymap,
   ...searchKeymap,
   ...foldKeymap,
@@ -751,14 +758,15 @@ const editorEvents = EditorView.domEventHandlers({
     setTimeout(() => {
       // 確定と同時に次の変換が始まっていたら、その変換が終わるまで待つ。
       if (target.compositionStarted) return
-      target.dispatch({ effects: setComposing.of(false) })
+      // 変換で入った文字がノートの情報の欄を壊していたら、同じ変更で取り消す（modes.mjs の frontmatterRepair）。
+      target.dispatch({ ...(frontmatterRepair(target.state) ?? {}), effects: setComposing.of(false) })
       saver?.compositionEnded()
       syncToolbar()
     }, 0)
     return false
   },
   blur(_, target) {
-    if (target.state.field(previewField).composing) target.dispatch({ effects: setComposing.of(false) })
+    if (target.state.field(previewField).composing) target.dispatch({ ...(frontmatterRepair(target.state) ?? {}), effects: setComposing.of(false) })
     return false
   },
   // 箇条書きの記号（•）や番号を押すと、その項目の子を開閉する。たためない項目では何もせず、今までどおりカーソルを置く。
@@ -780,6 +788,94 @@ const editorEvents = EditorView.domEventHandlers({
     return true
   },
 })
+
+// 開いた直後の印（記号を出さない）を、本人がエディターをクリックするかキーを押したら外す。
+// 選択が変わる操作では、その変更で印が外れる（preview.mjs の quietAfter）。ここで外すのは、選択が変わらない場合の分。
+// フォーカスがあるときに、今のカーソルと同じ位置（開いた直後の本文の先頭）をクリックしても選択は変わらない。
+const quietEnders = EditorView.domEventObservers({
+  keydown(event, target) {
+    if (cursorQuiet(target.state) && keyEndsQuiet(event)) target.dispatch({ effects: setCursorQuiet.of(false) })
+  },
+  // 本文にフォーカスが入ったら、必ず印を外す（Tab、Cmd+E、新しく作ったノート、「編集」「ソース」のボタンのあと、表のマスなど）。
+  // 印があるとカーソルの行の記号が隠れたままなので、打った文字やEnter・Backspaceが、見た目と違う所に効く（見出しの # が消えるなど）。
+  // マウスで押したときは、押した位置にカーソルが動いてから外す。先に外すと、押した位置がずれる。上の mousedown が先に予約した処理
+  // （部品を押したときのカーソルの移動）のあとに動くよう、同じ待ち方で予約する。mousedown が届かない押し方でも、これで外れる。
+  // focusin は、表のマスなど本文の中の場所にフォーカスが入ったときにも届く（focus は本文そのものだけ）。
+  focusin(event, target) {
+    if (!cursorQuiet(target.state)) return
+    if (focusEndsQuiet({ quiet: true, pressing: pressingEditor })) target.dispatch({ effects: setCursorQuiet.of(false) })
+    else endQuietAfterClick(target, () => openRound)
+  },
+})
+
+// 本文を押したときに、開いた直後の印を外す。エディターがクリックの位置を決めてから外す。その間に別のノートを開いていたら外さない（modes.mjs）。
+// 本文の中の部品（コールアウトの題名、表、チェックボックス、箇条書きの記号など）を押したときは、本文にフォーカスが入ったときだけ外す。
+// そのときカーソルが開いたときの1行目のままなら、押した部品の所へ動かす（modes.mjs の endQuietAfterClick と partCursor）。
+// エディターは、押した操作を受け取らない部品（コールアウトの題名、表）では mousedown をこちらに回さないので、エディターの外（document）で受ける。
+// リンクは押した時点で開くので（bindChrome）、ここでは何もしない。
+document.addEventListener(
+  'mousedown',
+  (event) => {
+    if (event.button !== 0 || !view || !view.contentDOM.contains(event.target)) return
+    if (event.target.closest?.('[data-href]')) return
+    const target = view
+    const part = pressedPart(event.target, target.contentDOM)
+    // ノートの情報の欄の何もない所を押したときは、印があってもなくても、本文の最初の行（閉じの --- の次の行）の typingStart へカーソルを置く。
+    // エディターに任せると、閉じの --- の行やその前に置かれることがあり、そこで Backspace などを押すと欄が壊れる（modes.mjs の partCursor）。
+    if (part && partKind(part) === 'props' && propsBlankAt(event.target) && target.state.facet(EditorView.editable)) {
+      const anchor = partCursor(target.state, { pos: target.posAtDOM(part), kind: 'props' })
+      if (anchor !== null) {
+        event.preventDefault()
+        target.dispatch({ selection: { anchor }, effects: setCursorQuiet.of(false) })
+        target.focus()
+        return
+      }
+    }
+    if (!cursorQuiet(target.state)) return
+    if (!part) {
+      endQuietAfterClick(target, () => openRound)
+      return
+    }
+    const kind = partKind(part)
+    endQuietAfterClick(target, () => openRound, setTimeout, {
+      focus: () => {
+        const active = document.activeElement
+        if (active === target.contentDOM) return 'body'
+        return target.contentDOM.contains(active) ? 'inside' : null
+      },
+      cursor: (state, focus) => {
+        if (!target.contentDOM.contains(part)) return null
+        // 本文の中の入力の場所（表のマス、ノートの情報の欄の入力など）に入ったときは、表のときだけ表のすぐ後ろへ動かす（表には触れないので、マスの編集は続く）。
+        if (focus !== 'body' && kind !== 'table') return null
+        const box = kind === 'table' ? part.closest('.cm-table-wrap') : part
+        const pos = target.posAtDOM(box)
+        const length = box.noteSource?.length ?? 0
+        const at = partCursor(state, { pos, kind, length })
+        // 表の外にカーソルを置ける所がなく、今のカーソルが表に触れているときは、印を残す（外すと表が文字に戻って、マスの編集が終わる）。
+        // カーソルは表の終わり（最後の行の後ろ）へ動かす。表の頭のままだと、マスを出たあとに打った文字で見出しの行が壊れるため。
+        const head = state.selection.main.head
+        if (at === null && kind === 'table' && head >= pos && head <= pos + length) return { anchor: pos + length, quiet: true }
+        return at
+      },
+    })
+  },
+  true,
+)
+
+// エディターの中をマウスや指で押している最中か。押したときのフォーカスは、押した位置が決まる前に入るので、上の focus で印を外さない。
+// フォーカスは押したのと同じ流れの中で入るので、次の処理の順番が来たら戻す。
+let pressingEditor = false
+document.addEventListener(
+  'pointerdown',
+  (event) => {
+    if (!$('editor')?.contains(event.target)) return
+    pressingEditor = true
+    setTimeout(() => {
+      pressingEditor = false
+    }, 0)
+  },
+  true,
+)
 
 async function uploadImage(file, target) {
   const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg').replace('svg+xml', 'svg') ?? 'png'
@@ -882,21 +978,23 @@ function extensionsFor(path, canEdit) {
     }),
     syntaxHighlighting(highlight),
     noteMarkdown(languages),
-    contextSlot.of(noteContext.of({ path, known, newNoteDir: defaultNoteDir(path, noteFolders(notes)), api, editable: canEdit })),
+    contextSlot.of(noteContextFor(path, canEdit)),
     previewField,
+    frontmatterGuard,
     hangingIndent,
     editableSlot.of(editableExtensions(canEdit)),
     editorKeys,
     editorEvents,
+    quietEnders,
     hoverPreview,
     EditorView.updateListener.of(onUpdate),
     EditorView.contentAttributes.of({ spellcheck: 'false', autocapitalize: 'off', autocorrect: 'off' }),
   ]
 }
 
-function editableExtensions(canEdit) {
-  const allow = canEdit && mode !== 'reading'
-  return [EditorView.editable.of(allow), EditorState.readOnly.of(!allow)]
+// リンクの解決などに使う、開いているノートの情報。作り直すとき（タスクを作ったあと）も同じ中身にする。
+function noteContextFor(path, canEdit) {
+  return noteContext.of({ path, known, newNoteDir: defaultNoteDir(path, noteFolders(notes)), api, editable: canEdit })
 }
 
 function onUpdate(update) {
@@ -911,6 +1009,29 @@ function onUpdate(update) {
     syncToolbar()
   }
   if (foldsChanged(update)) rememberFolds()
+  if (update.docChanged) taskNoticeAfterHistory(update)
+}
+
+// 履歴の undo・redo（Cmd+Z・Cmd+Shift+Z）のあとに、タスクの知らせを文書に合わせる。履歴の深さではなく、足したリンクがあるかで決める。
+// - undo で「タスクにする」の変更まで戻った（リンクが消えた）：「取り消す」の相手を忘れる。作ったときの知らせが出ていれば、
+//   取り消したあとの知らせ（「取り消す」のボタンと同じ中身）に差し替える。ほかの知らせ（タスクの削除など）はそのままにする。
+// - 取り消したあとの知らせが出ている間に、undo か redo でリンクが戻った（行が移った状態に戻った）：その知らせを閉じる。
+// どちらも、作ったノートを開いているときだけ（エディターはノートを切り替えても同じ画面を使い回すため）。
+function taskNoticeAfterHistory(update) {
+  const undo = update.transactions.some((tr) => tr.isUserEvent('undo'))
+  const redo = update.transactions.some((tr) => tr.isUserEvent('redo'))
+  if (!undo && !redo) return
+  const sameNote = (task) => Boolean(task) && update.view === task.view && task.path === currentPath
+  const undone = taskNotice?.kind === 'undone' ? taskNotice.task : null
+  if (!sameNote(lastTask) && !sameNote(undone)) return
+  const step = { undo, redo, before: update.startState.doc.toString(), after: update.state.doc.toString() }
+  if (sameNote(lastTask) && historyLinkChange(lastTask.taskPath, step) === 'removed') {
+    const last = lastTask
+    lastTask = null
+    if (taskNotice?.kind === 'created') showTaskNotice(undoneText({ moved: Boolean(last.removedText) }), { undo: false, task: last })
+    return
+  }
+  if (sameNote(undone) && historyLinkChange(undone.taskPath, step) === 'restored') hideTaskNotice()
 }
 
 function rememberFolds() {
@@ -929,7 +1050,9 @@ function restoreFolds(path) {
   if (effects.length) view.dispatch({ effects })
 }
 
-function applyMode(next) {
+function applyMode(requested) {
+  // 古い呼び出しや右の枠への連絡で 'reading' などが来ても、編集の表示として扱う。
+  const next = noteMode(requested)
   if (sourceOnly && next !== 'source') return
   mode = next
   showPasteHint(false)
@@ -1822,6 +1945,7 @@ function renderOutline() {
 // 開く前の状態に戻すためなので、次回の表示の設定は変えない。
 let filesUnderOutline = false
 let calendarUnderOutline = false
+let tasksUnderOutline = false
 function closeOutline() {
   const box = $('outline')
   if (box.hidden) return
@@ -1830,11 +1954,16 @@ function closeOutline() {
     $('calendar').hidden = false
     drawCalendar()
   }
+  if (tasksUnderOutline) {
+    $('tasks-side').hidden = false
+    refreshTaskSide()
+  }
   if (filesUnderOutline) {
     $('files').hidden = false
     drawFiles()
   }
   calendarUnderOutline = false
+  tasksUnderOutline = false
   filesUnderOutline = false
 }
 
@@ -1843,8 +1972,10 @@ function toggleOutline() {
   if (box.hidden) {
     filesUnderOutline = !$('files').hidden
     calendarUnderOutline = !$('calendar').hidden
+    tasksUnderOutline = !$('tasks-side').hidden
     $('files').hidden = true
     $('calendar').hidden = true
+    $('tasks-side').hidden = true
     box.hidden = false
     renderOutline()
   } else {
@@ -1904,20 +2035,23 @@ function setupSideResize() {
 function closeSideIfNarrow() {
   if (!isNarrow()) return
   $('calendar').hidden = true
+  $('tasks-side').hidden = true
   $('files').hidden = true
 }
 
-// 一覧もカレンダーも隠れたら、右の列ごと隠す。
+// 一覧もカレンダーもタスクも隠れたら、右の列ごと隠す。
 function syncSide() {
-  $('side').hidden = $('calendar').hidden && $('files').hidden
+  $('side').hidden = $('calendar').hidden && $('tasks-side').hidden && $('files').hidden
 }
 new MutationObserver(syncSide).observe($('calendar'), { attributes: true, attributeFilter: ['hidden'] })
+new MutationObserver(syncSide).observe($('tasks-side'), { attributes: true, attributeFilter: ['hidden'] })
 new MutationObserver(syncSide).observe($('files'), { attributes: true, attributeFilter: ['hidden'] })
 
 function jumpTo(pos) {
   view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
 }
 
+// 見出しの位置まで見せるだけで、カーソルは動かさない（開いた直後の印も外さないので、先頭の見出しの # も出ない）。
 function jumpToAnchor(anchor) {
   if (!anchor) return
   const heading = findHeading(headingsOf(view.state), anchor)
@@ -1985,7 +2119,9 @@ function commitOpenField() {
 
 let openRequest = 0
 
-async function openNote(path, { push = true, anchor = '', startMode = 'reading' } = {}) {
+// focus：新しく作ったノートのときだけ true。本文にフォーカスを入れて、すぐ打てるようにする。
+// 既にあるノートは入れない。開いた直後のキーが本文に届くと、隠れた記号の前後で打った文字が見た目と違う所に入るため（見出しの # が消えるなど）。
+async function openNote(path, { push = true, anchor = '', startMode = 'live', focus = false } = {}) {
   openRequest += 1
   const thisRequest = openRequest
   let note
@@ -1996,7 +2132,7 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
       const created = await request(noteUrl(path), { method: 'POST', body: JSON.stringify({ text: '' }) })
       if (created.ok) {
         await refreshNotes()
-        return openNote(path, { push, anchor, startMode: 'live' })
+        return openNote(path, { push, anchor, startMode: 'live', focus: true })
       }
       showMessage('このノートは作れません。')
       return
@@ -2012,22 +2148,32 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   saver?.close()
   saver = null
   currentPath = path
+  // 右の枠でゴミ箱へ移したノートの代わりに別のノートを開いたので、右の枠を閉じても読み込み直さない。
+  reloadAfterSplit = false
+  lastTask = null
+  hideTaskNotice()
   // 右の枠では、カレンダーとファイルの一覧を使わない（左の一覧の開閉の記録も書き換えない）。
   if (PANE !== 'right') renderCalendar()
   sourceOnly = note.sourceOnly
   editable = note.editable
-  const nextMode = sourceOnly ? 'source' : startMode
+  const nextMode = sourceOnly ? 'source' : noteMode(startMode)
   mode = nextMode
-  // YAMLの中にカーソルを置くと文字で見えてしまうので、本文の先頭から始める。
-  const front = note.text.match(/^---\n[\s\S]*?\n---(?:\n|$)/)
-  const state = EditorState.create({
-    doc: note.text,
-    selection: { anchor: front ? Math.min(front[0].length, note.text.length) : 0 },
-    extensions: extensionsFor(path, editable),
-  })
+  // YAMLの中にカーソルを置くと文字で見えてしまうので、本文の先頭から始める。本文の行がないときは閉じの --- のすぐあと（modes.mjs の partCursor と同じ）。
+  let state = EditorState.create({ doc: note.text, extensions: extensionsFor(path, editable) })
+  const front = frontmatterEnd(state.doc)
+  if (front !== null) state = state.update({ selection: { anchor: Math.min(front + 1, state.doc.length) }, annotations: Transaction.addToHistory.of(false) }).state
+  // 本文の最初の行が見出しの # や箇条書きの - などで始まるなら、その記号のあとから始める（開いた直後は記号を隠すので、見た目の位置にそろえる）。
+  const start = typingStart(state, state.selection.main.head)
+  if (start !== state.selection.main.head) state = state.update({ selection: { anchor: start }, annotations: Transaction.addToHistory.of(false) }).state
+  // 開いた回を数える。クリックのあとで印を外す処理が、次に開いたノートの印を外さないように使う。
+  openRound += 1
   if (view) view.setState(state)
   else view = new EditorView({ state, parent: $('editor') })
+  // 開いた直後は、カーソルが先頭にあっても記号を出さない（本人が本文をクリックするまで。マウス以外で本文にフォーカスが入ったときも外す）。
+  view.dispatch({ effects: setCursorQuiet.of(true) })
   applyMode(nextMode)
+  // タスクのノートは、開いたらすぐステータスや期日を直せるように、プロパティ欄を開いておく。
+  if (isTaskNote(note.text)) view.dispatch({ effects: togglePropsPanel.of(true) })
   renderCrumbs(path)
   $('copy-path').disabled = false
   document.title = path.split('/').at(-1).replace(/\.md$/i, '')
@@ -2069,10 +2215,14 @@ async function openNote(path, { push = true, anchor = '', startMode = 'reading' 
   jumpToAnchor(anchor)
   sendState()
   if (PANE === 'right') postOpened()
-  view.focus()
+  // 既にあるノートでは、本文をクリックしてから書き始める。view は使い回すので、前のノートで本文（や表のマスなど）にフォーカスがあると、
+  // そのまま残って開いた直後のキーが届く。残っていたら外す（リンクを押したとき、「探す」を閉じたとき、戻るボタンなど）。
+  if (focus) view.focus()
+  else if ($('editor').contains(document.activeElement)) document.activeElement.blur()
   if (restored && saver.isStopped() !== 'conflict') {
     showMessage('前回保存できなかった入力を戻して保存します。いらないときは、右上の「履歴」から前の内容に戻せます。')
   }
+  refreshTaskPanel()
   return undefined
 }
 
@@ -2125,16 +2275,16 @@ function openHref(href, newTab) {
 }
 
 // 左右どちらかの枠でノートを開く。右に開くときは、分けていなければ先に分ける。
-async function openIn(pane, path, { anchor = '', startMode = 'reading' } = {}) {
+async function openIn(pane, path, { anchor = '', startMode = 'live', focus = false } = {}) {
   // 狭い画面では分けないので、左で開く。
-  if (pane !== 'right' || !split || isNarrow()) return openNote(path, { anchor, startMode })
+  if (pane !== 'right' || !split || isNarrow()) return openNote(path, { anchor, startMode, focus })
   if (!split.isOpen()) {
     // 右の枠の準備ができたら開いてもらう（READY のところで送る）。
-    rightWant = { path, anchor, startMode }
+    rightWant = { path, anchor, startMode, focus }
     await openSplit()
     return undefined
   }
-  split.post({ type: MSG.OPEN, path, anchor, startMode })
+  split.post({ type: MSG.OPEN, path, anchor, startMode, focus })
   return undefined
 }
 
@@ -2383,7 +2533,9 @@ async function doMove(from, to, rename = false, confirm = false) {
   const holdsCurrent = currentPath && inside(currentPath, from)
   // 右の枠で開いているノート（またはそれを含むフォルダー）を動かすときは、右の書きかけも動かす直前に保存する。
   const rightPath = split?.isOpen() && rightState.path && inside(rightState.path, from) ? rightState.path : null
-  const lock = (locked) => view?.dispatch({ effects: editableSlot.reconfigure(editableExtensions(locked ? false : editable)) })
+  // 動かしている間は、プロパティ欄（タスクのステータス・日付）も止める。戻すときは欄を作り直す。
+  const lock = (locked) =>
+    view?.dispatch({ effects: [editableSlot.reconfigure(editableExtensions(locked ? false : editable)), setNoteBusy.of(locked)] })
   if (holdsCurrent) lock(true)
   let moved
   try {
@@ -2417,6 +2569,8 @@ async function doMove(from, to, rename = false, confirm = false) {
     saveFilesOpen()
   }
   await refreshNotes()
+  // タスクのノートや、goal・parent のノートを動かすと、タスクの一覧（リンクが外れたか）も変わる。
+  tasksSaved()
   if (holdsCurrent) {
     // 古い場所へ保存しに行かないよう、開き直す前に保存の仕組みを閉じる。
     saver?.close()
@@ -2455,6 +2609,8 @@ async function trashItem(path, kind) {
     return
   }
   await refreshNotes()
+  // 消したノートがタスク（または goal・parent のノート）なら、タスクの一覧から消す（外れたかも変わる）。
+  tasksSaved()
 }
 
 function bindFilesPanel() {
@@ -2625,19 +2781,781 @@ async function openPeriodicNote(period, date, { ask = false, from = 'sidebar', m
     if (!result.ok) return refuse(result)
     const { path, created } = result.data
     if (created) await refreshNotes()
-    await openIn(targetPane({ meta, from, active: activePane() }), path, { startMode: created ? 'live' : 'reading' })
+    // 今作ったノートだけ、すぐ打てるように本文にフォーカスを入れる。
+    await openIn(targetPane({ meta, from, active: activePane() }), path, { focus: created === true })
     drawCalendar()
   } catch {
     showMessage('このノートは作れません。')
   }
 }
 
+// 右の枠はカレンダーを描かない（periodicState が null のまま）ので、日付のノートの置き場だけを別に問い合わせて覚える。
+// undefined はまだ分からない、null は置き場がない（聞き直さない。60秒ごとの読み直しで、左のカレンダーと同じく追いつく）。
+let rightPeriodicRoot
+let rightRootLoad = null
+
+async function loadRightPeriodicRoot() {
+  try {
+    const result = await request(`/api/periodic?month=${todayText().slice(0, 7)}`)
+    if (result.ok) rightPeriodicRoot = typeof result.data?.periodicRoot === 'string' ? result.data.periodicRoot : null
+  } catch {
+    // 問い合わせられないときは、分からないままにして、次のきっかけでもう一度試す。
+  }
+}
+
+// まだ分からないときだけ聞く。同時に頼まれても1回にまとめる。
+function ensureRightPeriodicRoot() {
+  if (rightPeriodicRoot !== undefined) return null
+  rightRootLoad ??= loadRightPeriodicRoot().finally(() => {
+    rightRootLoad = null
+  })
+  return rightRootLoad
+}
+
 // 開いているノートが <periodicRoot>/<年>/Daily/YYYY-MM-DD.md の形なら、その日付。
 function openDateOf(path = currentPath) {
-  const root = periodicState?.periodicRoot
-  if (!root || !path) return null
-  const match = path.match(/^(.*)\/(\d{4})\/Daily\/(\d{4}-\d{2}-\d{2})\.md$/)
-  return match && match[1] === root && match[3].startsWith(match[2]) ? match[3] : null
+  return dailyDateOf(path, periodicState?.periodicRoot ?? (PANE === 'right' ? (rightPeriodicRoot ?? null) : null))
+}
+
+// ---- デイリーノートの上のタスクのパネル（読み取りだけ） ----
+
+const taskPanel = createTaskPanel({
+  box: $('task-panel'),
+  store: storage,
+  keyOf: (name) => `${name}:${vaultName}`,
+  onOpen: (path, event) => {
+    const newTab = event.metaKey || event.ctrlKey
+    if (newTab && PANE === 'right') return toLeft({ type: MSG.OPEN, path })
+    if (newTab) return openIn(targetPane({ meta: true, from: 'left', active: activePane() }), path)
+    return openNote(path)
+  },
+  // 「直近」の日数を Vault の設定（settings.json）に保存する。保存できたら、反対の枠のパネルも読み直してもらう。
+  onSoonDays: async (days) => {
+    const result = await request('/api/settings', { method: 'PUT', body: JSON.stringify({ taskSoonDays: days }) })
+    // 日数を知らない古いサーバーは、項目を捨てて 200 を返す。書いた中身に日数が入っていなければ、保存できなかったとする。
+    if (!result.ok || result.data?.settings?.tasks?.soonDays !== days) return false
+    if (PANE === 'right') toLeft({ type: MSG.TASKS })
+    else if (split?.isOpen()) split.post({ type: MSG.TASKS })
+    return true
+  },
+})
+let taskPanelRequest = 0
+
+// 開いているのがデイリーノートなら、タスクの一覧を問い合わせて描く。そうでなければ隠す。
+// 呼ぶきっかけ：ノートを開いたとき、60秒ごと、画面に戻ってきたとき。
+async function refreshTaskPanel() {
+  const mine = ++taskPanelRequest
+  const path = currentPath
+  let date = openDateOf(path)
+  if (!date && PANE === 'right' && path) {
+    const loading = ensureRightPeriodicRoot()
+    if (loading) {
+      await loading
+      if (mine !== taskPanelRequest) return
+      date = openDateOf(path)
+    }
+  }
+  await taskPanel.refresh({
+    date,
+    load: async () => {
+      const result = await request('/api/tasks')
+      if (!result.ok) throw new Error('tasks')
+      return result.data
+    },
+    isCurrent: () => path === currentPath,
+  })
+}
+
+// タスクのノート（Tasks/ の下）を保存し終えたら、こちらと反対の枠のパネルを読み直す。
+function isTaskFolderPath(path) {
+  return typeof path === 'string' && path.toLowerCase().startsWith(`${TASK_FOLDER.toLowerCase()}/`)
+}
+
+// 反対の枠でタスクが作られた・保存されたとき。ファイル一覧を読み直してから、リンクの解決に使う情報を作り直す
+// （新しいタスクへのリンクが、ないノートへのリンクとして描かれたままにならないように）。
+async function refreshAfterTasks() {
+  await refreshNotes()
+  redrawLinks()
+  refreshTaskPanel()
+  refreshTaskSide()
+}
+
+// リンクの解決に使う情報を作り直し、表示も作り直す。previewField は setMode・文書の変更・選択の変更でしか描き直さないので、
+// 今の表示の setMode を添える（リンクが「ないノート」の見た目のまま残らないように）。
+function redrawLinks() {
+  if (view && currentPath) view.dispatch({ effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), setMode.of(mode)] })
+}
+
+function tasksSaved() {
+  refreshTaskPanel()
+  refreshTaskSide()
+  if (PANE === 'right') toLeft({ type: MSG.TASKS })
+  else if (split?.isOpen()) split.post({ type: MSG.TASKS })
+}
+
+// ---- 「タスクにする」（段階1-C2） ----
+
+// 開いているノートの日付のノートの置き場。左はカレンダーの問い合わせ、右は B で覚えた置き場を使う。
+function periodicRootNow() {
+  return periodicState?.periodicRoot ?? (PANE === 'right' ? (rightPeriodicRoot ?? null) : null)
+}
+
+// 今の文書の、1から数えた行がタスクにできるか。
+function taskAtLine(lineNumber) {
+  if (!view || !currentPath) return { ok: false, reason: 'no-source' }
+  return taskForDocLine(view.state.doc, lineNumber, { path: currentPath, periodicRoot: periodicRootNow(), known })
+}
+
+// 書き換えてよい状態か（編集できるノートで、保存が止まっていない。変換中でない）。
+function canConvertNow() {
+  return Boolean(view && currentPath && editable && saver && !saver.isStopped() && !view.composing && !view.compositionStarted)
+}
+
+// 「タスクにする」が使える行の上だけ、自前のメニューを出す。ほかの場所はブラウザーの標準のメニューのまま。
+// チェックボックスや箇条書きの記号などの部品の上でも出すよう、エディターの handlers ではなく本文の DOM で受ける
+// （部品の中の出来事は CodeMirror の handlers に届かない）。表のマスは自分のメニューを出すので（defaultPrevented）、ここでは何もしない。
+function bindTaskContextMenu() {
+  $('editor').addEventListener('contextmenu', (event) => {
+    // Shift を押しながらの右クリックは、いつものブラウザーのメニューにする。
+    if (event.shiftKey || !view || !view.contentDOM.contains(event.target)) return
+    if (event.target.closest?.('.cm-props, .cm-table-wrap, #task-panel')) return
+    // タスクのノートへのリンクの上なら「タスクを削除」。そうでなければ「タスクにする」が使える行か見る。
+    if (taskLinkContextMenu(event, view)) return
+    taskContextMenu(event, view)
+  })
+  // タスクのノートのプロパティ欄の「このタスクを削除」。
+  // 開いているノートのエディターから来たものだけ受ける（ホバーの小窓などは別の部品なので、念のため確かめる）。
+  $('editor').addEventListener('note-trash-task', (event) => {
+    if (view?.dom.contains(event.target)) deleteThisTask()
+  })
+}
+
+function taskContextMenu(event, target) {
+  if (event.defaultPrevented || target !== view || !canConvertNow()) return false
+  if (PANE === 'right' && rightPeriodicRoot === undefined) ensureRightPeriodicRoot()
+  const pos = target.posAtCoords({ x: event.clientX, y: event.clientY })
+  if (pos == null) return false
+  const lineNumber = target.state.doc.lineAt(pos).number
+  if (!menuForLine(taskAtLine(lineNumber))) return false
+  event.preventDefault()
+  const selection = target.state.sliceDoc(target.state.selection.main.from, target.state.selection.main.to)
+  const items = [{ label: 'タスクにする', run: () => makeTask(lineNumber) }]
+  // 自前のメニューを出すと標準のメニューが出ないので、選んだ文字があるときだけ「コピー」も置く。
+  if (selection) items.push('-', { label: 'コピー', run: () => copyText(selection, { clipboard: navigator.clipboard, execCopy }) })
+  showMenu(event, items)
+  addMenuHint()
+  return true
+}
+
+// 右クリックした場所の、Tasks の下にあるノートへのリンク。{ from, to, linkText, taskPath } か null。
+// [[…]] は1つの部品として描くので、部品の要素から位置を取る（posAtCoords は部品の端に来る）。ソースの表示では位置から探す。
+function taskLinkAtEvent(event, target) {
+  const state = target.state
+  let link = null
+  const anchor = event.target.closest?.('.cm-link')
+  if (anchor && target.contentDOM.contains(anchor)) {
+    try {
+      const pos = target.posAtDOM(anchor)
+      link = linkAt(state, pos, 1) ?? linkAt(state, Math.min(pos + 1, state.doc.length), -1)
+    } catch {
+      link = null
+    }
+  }
+  if (!link) {
+    const pos = target.posAtCoords({ x: event.clientX, y: event.clientY })
+    if (pos != null) link = linkAt(state, pos, 1) ?? linkAt(state, pos, -1)
+  }
+  if (!link?.href || isExternal(link.href)) return null
+  const resolved = resolveHref(currentPath, link.href)
+  if (!resolved?.path || !isUnderTaskFolder(resolved.path) || !known?.has(normalizeKey(resolved.path))) return null
+  return { from: link.from, to: link.to, linkText: state.sliceDoc(link.from, link.to), taskPath: resolved.path }
+}
+
+// タスクのノートへのリンクの上だけ、自前のメニューに「タスクを削除」を出す。type: task かは選んだあとに一覧で確かめる。
+function taskLinkContextMenu(event, target) {
+  if (event.defaultPrevented || target !== view || !canConvertNow()) return false
+  const info = taskLinkAtEvent(event, target)
+  if (!info) return false
+  event.preventDefault()
+  const selection = target.state.sliceDoc(target.state.selection.main.from, target.state.selection.main.to)
+  const items = [{ label: 'タスクを削除', run: () => deleteTaskFromLink(info) }]
+  if (selection) items.push('-', { label: 'コピー', run: () => copyText(selection, { clipboard: navigator.clipboard, execCopy }) })
+  showMenu(event, items)
+  addMenuHint()
+  return true
+}
+
+// 自前のメニューの下に、いつものメニューの出し方を小さく出す。足した分だけ下や右にはみ出したら、内側へずらす。
+function addMenuHint() {
+  const menu = [...document.querySelectorAll('.note-menu')].at(-1)
+  if (!menu) return
+  const hint = document.createElement('p')
+  hint.className = 'note-menu-hint'
+  hint.textContent = MENU_HINT
+  menu.append(hint)
+  const rect = menu.getBoundingClientRect()
+  if (rect.bottom > innerHeight) menu.style.top = `${Math.max(4, innerHeight - rect.height - 4)}px`
+  if (rect.right > innerWidth) menu.style.left = `${Math.max(4, innerWidth - rect.width - 4)}px`
+}
+
+// ツールバーのボタンとキー（Cmd+Option+T）。カーソルのある行をタスクにする。
+function makeTaskAtCursor() {
+  if (!view || !currentPath) return true
+  if (!editable) {
+    showMessage('このノートは編集できないので、タスクにできません。')
+    return true
+  }
+  const lineNumber = view.state.doc.lineAt(view.state.selection.main.head).number
+  const found = taskAtLine(lineNumber)
+  if (!found.ok) {
+    showMessage(reasonText(found.reason))
+    return true
+  }
+  makeTask(lineNumber)
+  return true
+}
+
+let taskBusy = false
+// 最後に作ったタスクの「取り消す」に使う。{ view, path, taskPath, doc, depth, removedText }
+// doc・depth は作った直後の文書と履歴の深さ（「取り消す」で履歴の undo をそのまま使えるかを見るため）。
+// removedText：タスクのノートへ移した子の行（元のノートから消した文字。先頭の改行を含む）。移していなければ null。
+let lastTask = null
+// 出ているタスクの知らせ（#task-notice）の種類。'created'（作ったとき。「取り消す」あり）・'undone'（取り消したあと）・
+// 'deleted'（タスクを削除したあと）。閉じていれば null。undone のときは、取り消したタスク（task: { view, path, taskPath }）も覚える
+// （undo・redo でリンクが戻ったら閉じるため）。
+let taskNotice = null
+
+async function makeTask(lineNumber) {
+  if (taskBusy) return
+  if (!canConvertNow()) {
+    showMessage(editable ? '今は書き換えられないので、タスクにできません。' : 'このノートは編集できないので、タスクにできません。')
+    return
+  }
+  const found = taskAtLine(lineNumber)
+  if (!found.ok) {
+    showMessage(reasonText(found.reason))
+    return
+  }
+  taskBusy = true
+  let taskPath = null
+  // リンクを足し終えたか。足したあとの失敗（一覧の読み直しがつながらないなど）を、リンクを足せなかったと知らせないため。
+  let linked = false
+  // 下の行をタスクのノートの本文に入れて送ったか（失敗の知らせで、本文に同じ行が入っていることを書くため）。
+  let moving = false
+  const path = currentPath
+  const target = view
+  try {
+    commitOpenField()
+    // 入れ子の子の行があれば、タスクのノートの本文にする（字下げを外し、リンクを新しい場所から直したもの）。
+    // 本文のリンクを直すのに使うのは予想のパス。行に足すリンクには、サーバーが返した実際のパスを使う。
+    const day = todayText()
+    const text = found.children ? movedBody(found, { notePath: path, taskPath: normalizeKey(expectedTaskPath(found, day)), known }) : ''
+    moving = Boolean(text)
+    const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify(taskRequestBody(found, day, text)) })
+    if (!created.ok || typeof created.data?.path !== 'string') {
+      showMessage(createFailedText(created.status, created.data?.error))
+      return
+    }
+    taskPath = created.data.path
+    const plan = planAfterCreate({ sameNote: path === currentPath && target === view, canWrite: canConvertNow(), doc: view?.state.doc, found })
+    if (plan.action === 'trash') {
+      // リンクを足さないときは、作ったノートをゴミ箱へ移す。
+      const trashed = await request('/api/trash', { method: 'POST', body: JSON.stringify({ path: taskPath }) })
+      showMessage(notLinkedText(plan.reason, { trashed: trashed.ok, taskPath, moved: moving }))
+      await refreshNotes()
+      tasksSaved()
+      return
+    }
+    // 新しいノートを known に足してから、リンクの解決に使う情報を作り直す。同じ1回の変更にして、リンクがすぐ解決済みとして描かれるようにする。
+    known = new Set(known ?? [])
+    known.add(normalizeKey(taskPath))
+    // リンクを足すことと子の行を消すことを1回の変更にする（Cmd+Z 1回で両方が戻る）。plan.children は今の文書での子の行の位置。
+    view.dispatch({
+      changes: moveChanges(plan.at, taskPath, plan.children),
+      // リンクを足した行を見える所へ出す（右クリックした行が画面の外へずれていることがあるため）。
+      // 狭いペインでは下半分にチャットの欄が重なるので、真ん中ではなく上のほうに出す。
+      effects: [contextSlot.reconfigure(noteContextFor(currentPath, editable)), EditorView.scrollIntoView(plan.at.from, { y: 'start', yMargin: 60 })],
+      annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.task')],
+    })
+    linked = true
+    lastTask = { view, path, taskPath, doc: view.state.doc, depth: undoDepth(view.state), removedText: plan.children?.text ?? null }
+    saver?.save()
+    showTaskNotice(createdText(created.data.due ?? found.due, { moved: plan.children ? found.children.count : 0 }))
+    await refreshNotes()
+    tasksSaved()
+  } catch {
+    // リンクを足したあとの失敗（一覧の読み直しなど）は、次の読み直しで追いつくので知らせない。
+    // ノートを作ったあと、リンクを足す前の失敗なら、ノートが残っていることを知らせる。
+    // 作る問い合わせの応答が届かなかったとき（taskPath がない）は、ノートができているかもしれない。
+    if (!linked) showMessage(taskPath ? leftoverText(taskPath, { moved: moving }) : createLostText({ moved: moving }))
+  } finally {
+    taskBusy = false
+  }
+}
+
+// 「取り消す」：足したリンクを外し、移した子の行を戻す。ノートは Tasks に残る。
+function undoLastTask() {
+  const last = lastTask
+  hideTaskNotice()
+  if (!last || last.view !== view || last.path !== currentPath) {
+    showMessage('ノートを切り替えたので、取り消せません。リンクを手で消してください。')
+    return
+  }
+  if (canUndoDirectly(last, { doc: view.state.doc, depth: undoDepth(view.state) })) {
+    historyStep(view, 0)
+  } else {
+    // あとで打った文字があるときは、それを消さないよう、足したリンクの文字だけを外し、移した子の行をその行の下へ戻す。
+    const text = view.state.doc.toString()
+    const change = last.removedText ? moveUndoChange(text, last.taskPath, last.removedText) : linkRemoval(text, last.taskPath)
+    if (!change) {
+      showMessage('リンクが見つからないので、取り消せません。')
+      return
+    }
+    view.dispatch({ changes: change, annotations: [isolateHistory.of('full'), Transaction.userEvent.of('delete.task')] })
+  }
+  lastTask = null
+  saver?.save()
+  tasksSaved()
+  // 取り消してもタスクのノートは残る（移した行も入ったまま）ので、消し方といっしょに知らせる。
+  showTaskNotice(undoneText({ moved: Boolean(last.removedText) }), { undo: false, task: last })
+}
+
+// undo: false なら「取り消す」のボタンを出さない（取り消したあとの知らせ）。そのときの task は、取り消したタスク。
+function showTaskNotice(text, { undo = true, task = null } = {}) {
+  taskNotice = undo ? { kind: 'created' } : { kind: 'undone', task: task && { view: task.view, path: task.path, taskPath: task.taskPath } }
+  const notice = $('task-notice')
+  notice.replaceChildren(
+    document.createTextNode(text),
+    ...(undo ? [bannerButton('取り消す', undoLastTask)] : []),
+    bannerButton('閉じる', hideTaskNotice),
+  )
+  notice.hidden = false
+}
+
+function hideTaskNotice() {
+  taskNotice = null
+  $('task-notice').hidden = true
+}
+
+// ---- 「タスクを削除」（段階1-E1） ----
+
+// サーバーのタスクの一覧（GET /api/tasks の tasks）。読めなければ null。
+async function loadTaskList() {
+  const result = await request('/api/tasks').catch(() => null)
+  return result?.ok && Array.isArray(result.data?.tasks) ? result.data.tasks : null
+}
+
+// 保存し終えて、書きかけが残っていないか。
+function savedClean() {
+  return Boolean(saver) && !saver.isStopped() && CLEAN_STATES.has($('status').dataset.state)
+}
+
+// タスクのノートを順にゴミ箱へ移す。先頭（消すタスク）を移せなければ、子は移さない。
+// 右の枠でそのノートを開いていれば、先に右の書きかけを保存して右の枠を閉じる（trashItem と同じ流れ）。
+// open：右の枠から移したとき、左でそのどれかを開いていれば左で開き直すノート（リンク元。なければ null で何も開いていない画面）。
+async function trashTaskNotes(paths, { open = null } = {}) {
+  if (PANE !== 'right' && split?.isOpen() && rightState.path && paths.some((path) => pathKey(path) === pathKey(rightState.path))) await closeSplit()
+  // 右の枠から移すときは、左で同じノートを開いていれば、先に左の書きかけを保存してもらう（ゴミ箱のノートに入れるため）。
+  // 保存しきれなかったときは、左の一時保存に残る（打った文字をなくさない）。
+  if (PANE === 'right') await askLeftToSave(paths)
+  const moved = []
+  const failed = []
+  for (const [index, path] of paths.entries()) {
+    const done = await request('/api/trash', { method: 'POST', body: JSON.stringify({ path }) }).catch(() => ({ ok: false }))
+    if (done.ok) moved.push(path)
+    else if (index === 0) {
+      failed.push(...paths)
+      break
+    } else failed.push(path)
+  }
+  // 「取り消す」の相手がゴミ箱へ行ったら、もう取り消せないので知らせを閉じる。
+  if (lastTask && moved.some((path) => pathKey(path) === pathKey(lastTask.taskPath))) {
+    lastTask = null
+    hideTaskNotice()
+  }
+  if (PANE === 'right' && moved.length) toLeft({ type: MSG.TRASHED, paths: moved, open })
+  return { moved, failed }
+}
+
+// 右の枠でゴミ箱へ移したノートを左で開いていたら、保存を止めて（消えたノートを書き戻さないように）開き直す。
+// 開き直すノートがないときは、何も開いていない画面に戻す。右の枠が知らせを見せている間は、枠が閉じるまで待つ
+// （すぐ読み込み直すと、右の枠の知らせごと消えるため）。
+let reloadAfterSplit = false
+async function trashedElsewhere({ paths, open }) {
+  if (PANE === 'right' || !Array.isArray(paths)) return
+  // 左のファイル一覧・サイドバー・パネル・リンクの見た目は、開いているノートに関係なく読み直す。
+  refreshAfterTasks().catch(() => {})
+  if (!currentPath || !paths.some((path) => typeof path === 'string' && pathKey(path) === pathKey(currentPath))) return
+  saver?.close()
+  saver = null
+  if (typeof open === 'string' && open && pathKey(open) !== pathKey(currentPath)) await openNote(open)
+  else if (split?.isOpen()) {
+    reloadAfterSplit = true
+    // 枠が閉じるまでの間に打った文字は、保存も一時保存もされないので、打てないようにしておく。
+    // 別のノートを開けば（openNote）、読み込み直しはやめる。
+    editable = false
+    view?.dispatch({ effects: [editableSlot.reconfigure(editableExtensions(false)), setNoteBusy.of(true)] })
+    const banner = $('banner')
+    banner.hidden = false
+    banner.textContent = 'このノートは右の枠でゴミ箱へ移しました。右の枠を閉じると、何も開いていない画面に戻ります。'
+  } else location.href = '/'
+}
+
+// 右の枠から：左で paths のどれかを開いていれば、左に書きかけを保存してもらう。返事は { dirty }（5秒たっても返事がなければ dirty）。
+// 頼みごとに id を付け、返事は同じ id の待ちだけを解く（切れたあとに遅れて来た返事で、次の待ちを解かないように）。
+const leftSaveWaiters = createReplyWaiters()
+function askLeftToSave(paths) {
+  const { id, promise } = leftSaveWaiters.wait(5_000, { dirty: true })
+  toLeft({ type: MSG.SAVE_LEFT, id, paths })
+  return promise
+}
+
+// 左の枠で：右の枠から頼まれたら、開いているノートが paths のどれかのときだけ保存して返事をする。
+async function saveForRight({ id, paths }) {
+  let dirty = false
+  try {
+    if (currentPath && Array.isArray(paths) && paths.some((path) => typeof path === 'string' && pathKey(path) === pathKey(currentPath))) {
+      commitOpenField()
+      await saver?.flush()
+      dirty = Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state)
+    }
+  } finally {
+    split?.post({ type: MSG.LEFT_SAVED, id, dirty })
+  }
+}
+
+// 移したあと：知らせ、両方の枠のファイル一覧・パネル・リンクの見た目を読み直す。読み直しの失敗は、次の読み直しで追いつくので知らせない。
+async function afterTaskTrash({ title, rootPath, result, undo, unlinked, sourceName = '' }) {
+  const rootMoved = result.moved.some((path) => pathKey(path) === pathKey(rootPath))
+  if (rootMoved) showDeleteNotice(deletedText({ title, movedChildren: result.moved.length - 1, undo, unlinked, sourceName, keyLabel }))
+  if (result.failed.length) showMessage(trashFailedNotice({ failed: result.failed, rootMoved, unlinked, undo, sourceName, keyLabel }))
+  try {
+    await refreshNotes()
+    redrawLinks()
+    tasksSaved()
+  } catch {
+    // 何もしない
+  }
+}
+
+function showDeleteNotice(text) {
+  taskNotice = { kind: 'deleted' }
+  const notice = $('task-notice')
+  notice.replaceChildren(document.createTextNode(text), bannerButton('閉じる', hideTaskNotice))
+  notice.hidden = false
+}
+
+// 月のノートなどの行のリンク（→タスク）から削除する。リンクを外す変更（履歴に積む）→ すぐ保存 → ゴミ箱へ。
+async function deleteTaskFromLink(info) {
+  if (taskBusy) return
+  if (!canConvertNow()) {
+    showMessage('今は書き換えられないので、タスクを削除できません。')
+    return
+  }
+  taskBusy = true
+  const path = currentPath
+  const target = view
+  try {
+    const list = await loadTaskList()
+    if (!list) {
+      showMessage('タスクの一覧を読めなかったので、削除できません。')
+      return
+    }
+    const task = findTask(list, info.taskPath)
+    if (!task) {
+      showMessage('リンク先はタスクのノート（Tasks の下の type: task のノート）ではないので、削除できません。')
+      return
+    }
+    const children = collectDescendants(list, task.path)
+    const title = taskTitleOf(task)
+    // 開いているノートがリンク元（parent があれば親、なければ goal）でなければ、参照として書いたリンクから消している。
+    // そのときは、リンク元の中のリンクも「このタスクを削除」と同じ手順で外す（外せないときは理由を確認の文に書く）。
+    const own = sourceNoteOf(task, known)
+    const extra = own && pathKey(own.path) !== pathKey(currentPath) ? await sourceUnlinkPlan(task) : null
+    const also = extra && extra.unlink !== 'none-source' ? extra : null
+    const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink: 'line', also }), deleteChoices(children.length))
+    if (!choice) return
+    if (path !== currentPath || target !== view || !canConvertNow()) {
+      showMessage('確かめている間にノートが変わったので、削除をやめました。')
+      return
+    }
+    if (!relocateLink(view.state.doc.toString(), info, { notePath: currentPath, taskPath: task.path, known })) {
+      showMessage('外すリンクが見つからない（または同じリンクが2つ以上ある）ので、削除をやめました。')
+      return
+    }
+    // 先にリンク元のリンクを外す（外せなければ、何も変えずにやめる）。
+    let sourceUnlinked = ''
+    if (also?.unlink === 'source') {
+      if (!(await unlinkInSource(also.source, task, also.sourceName))) return
+      sourceUnlinked = also.sourceName
+      if (path !== currentPath || target !== view || !canConvertNow()) {
+        showMessage('「' + sourceUnlinked + '」の中のリンクは外しましたが、その間にノートが変わったので、行のリンクは外さず、ゴミ箱へも移していません。')
+        return
+      }
+    }
+    const at = relocateLink(view.state.doc.toString(), info, { notePath: currentPath, taskPath: task.path, known })
+    if (!at) {
+      showMessage(sourceUnlinked
+        ? '「' + sourceUnlinked + '」の中のリンクは外しましたが、行のリンクが見つからなくなったので、ゴミ箱へは移していません。'
+        : '外すリンクが見つからない（または同じリンクが2つ以上ある）ので、削除をやめました。')
+      return
+    }
+    const range = unlinkRange(at.lineText, at.lineFrom, at.from, at.to)
+    commitOpenField()
+    view.dispatch({ changes: { ...range, insert: '' }, annotations: [isolateHistory.of('full'), Transaction.userEvent.of('delete.task')] })
+    await saver?.flush()
+    if (!savedClean()) {
+      showMessage('リンクは外しましたが、保存できなかったので、タスクのノートはゴミ箱へ移していません。' + sourceLinkNote(sourceUnlinked))
+      return
+    }
+    const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
+    const result = await trashTaskNotes(paths, { open: path })
+    await afterTaskTrash({ title, rootPath: task.path, result, undo: true, unlinked: true, sourceName: sourceUnlinked })
+  } catch {
+    showMessage('タスクを削除する途中で失敗しました。ファイル一覧で、残っているものを確かめてください。')
+  } finally {
+    taskBusy = false
+  }
+}
+
+// リンク元のノート（parent があれば親、なければ goal）の中のリンクを外せるか調べる。
+// unlink：'source'（ちょうど1つあるので外せる）・'none-count'（0 か 2つ以上）・'none-editable'（編集できない）・'none-missing'（見つからない）・'none-source'（goal も parent もない）。
+async function sourceUnlinkPlan(task) {
+  const source = sourceNoteOf(task, known)
+  const sourceName = source ? source.path.split('/').at(-1).replace(/\.md$/i, '') : ''
+  let unlink = source ? 'none-missing' : 'none-source'
+  let linkCount = 0
+  if (source?.exists) {
+    const note = await api.read(source.path).catch(() => null)
+    if (note && !note.editable) unlink = 'none-editable'
+    else if (note) {
+      const plan = planUnlinkInNote(note.text, source.path, task.path, known)
+      linkCount = plan.count
+      unlink = plan.change ? 'source' : 'none-count'
+    }
+  }
+  return { source, sourceName, unlink, linkCount }
+}
+
+// リンク元のノートの中のリンクを、今の保存の経路（PUT /api/note のハッシュ照合）で外す。外せなければ知らせて false。
+// 確かめている間に変わっていてもよいよう、読み直してから外す。ハッシュが合わなければ（書き換えられた）外さない。
+async function unlinkInSource(source, task, sourceName) {
+  const fresh = await api.read(source.path).catch(() => null)
+  const plan = fresh?.editable ? planUnlinkInNote(fresh.text, source.path, task.path, known) : null
+  if (!plan?.change) {
+    showMessage('「' + sourceName + '」の中のリンクが見つからなくなったので、削除をやめました。')
+    return false
+  }
+  const next = fresh.text.slice(0, plan.change.from) + fresh.text.slice(plan.change.to)
+  const saved = await api.write(source.path, next, fresh.hash).catch(() => null)
+  if (!saved || saved.conflict) {
+    showMessage('「' + sourceName + '」がちょうど書き換えられたか、保存できなかったので、リンクを外せませんでした。削除をやめました。もう一度選んでください。')
+    return false
+  }
+  return true
+}
+
+// 開いているタスクのノートを削除する（プロパティ欄の「このタスクを削除」）。
+// リンクを外す相手は parent があれば親のノート、なければ goal のノート。その中でこのタスクを指すリンクがちょうど1つなら外す。
+// 開いていないノートなので、今の保存の経路（PUT /api/note のハッシュ照合）で書き換える。
+async function deleteThisTask() {
+  if (taskBusy) return
+  if (!view || !currentPath || !editable || !saver || saver.isStopped()) {
+    showMessage('今はこのノートを削除できません。')
+    return
+  }
+  taskBusy = true
+  const taskPath = currentPath
+  try {
+    commitOpenField()
+    await saver.flush()
+    const list = await loadTaskList()
+    const task = list ? findTask(list, taskPath) : null
+    if (!task) {
+      showMessage(list ? 'このノートはタスクの一覧にない（Tasks の下の type: task のノートではない）ので、削除できません。' : 'タスクの一覧を読めなかったので、削除できません。')
+      return
+    }
+    const children = collectDescendants(list, task.path)
+    const title = taskTitleOf(task)
+    const { source, sourceName, unlink, linkCount } = await sourceUnlinkPlan(task)
+    const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink, sourceName, linkCount }), deleteChoices(children.length))
+    if (!choice) return
+    if (taskPath !== currentPath) {
+      showMessage('確かめている間に別のノートを開いたので、削除をやめました。')
+      return
+    }
+    let unlinked = false
+    if (unlink === 'source') {
+      if (!(await unlinkInSource(source, task, sourceName))) return
+      unlinked = true
+    }
+    commitOpenField()
+    await saver?.flush()
+    const paths = [task.path, ...(choice === 'all' ? children.map((child) => child.path) : [])]
+    const result = await trashTaskNotes(paths, { open: source?.exists ? source.path : null })
+    if (result.moved.some((path) => pathKey(path) === pathKey(task.path))) {
+      // 開いていたノートがなくなったので、リンク元のノートを開く（openNote が今の保存の仕組みを閉じる）。
+      // リンク元がなければ、左は知らせを見せてから何も開いていない画面に戻す。右の枠ではそのまま残し、
+      // 今の「ファイルが消えた」ときの扱い（保存を止める）に任せる。
+      if (source?.exists) await openNote(source.path)
+      else {
+        // 移せなかったサブタスクがあれば、同じ知らせに書き添える（このあと画面を移るので、afterTaskTrash は通らない）。
+        const failed = result.failed.length ? '\n' + trashFailedNotice({ failed: result.failed, rootMoved: true, keyLabel }) : ''
+        await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked, keyLabel }) + failed)
+        saver?.close()
+        saver = null
+        // 右の枠は、開いていたノートがなくなったので枠を閉じてもらう。左は何も開いていない画面に戻す。
+        if (PANE === 'right') toLeft({ type: MSG.CLOSE })
+        else location.href = '/'
+        return
+      }
+    }
+    await afterTaskTrash({ title, rootPath: task.path, result, undo: false, unlinked })
+  } catch {
+    showMessage('タスクを削除する途中で失敗しました。ファイル一覧で、残っているものを確かめてください。')
+  } finally {
+    taskBusy = false
+  }
+}
+
+// ---- サイドバーの「タスク」（段階1-E2）。左の枠だけで使う ----
+
+const taskSide = createTaskSide({
+  box: $('tasks-side'),
+  store: storage,
+  keyOf: (name) => `${name}:${vaultName}`,
+  today: todayText,
+  onOpen: (path, event) => {
+    openIn(targetPane({ meta: event.metaKey || event.ctrlKey, from: 'sidebar', active: activePane() }), path)
+    // 狭い幅では右の列が本文に重なるので閉じる（次回の表示の設定は変えない）。
+    closeSideIfNarrow()
+  },
+  onTrash: (path) => trashUnlinkedTask(path),
+  onCreate: () => createTaskFromSide(),
+})
+
+// 読み直し。きっかけ：起動、60秒ごと、画面に戻ったとき、タスクを作った・消した・Tasks の下を保存したとき、
+// 反対の枠からの知らせ、ほかのノートを保存したとき（リンクを手で消すと「外れた」に変わるため。少し待ってまとめる）。
+function refreshTaskSide() {
+  if (PANE === 'right' || $('tasks-side').hidden) return
+  taskSide.refresh(async () => {
+    const result = await request('/api/tasks')
+    if (!result.ok) throw new Error('tasks')
+    return result.data
+  })
+}
+
+let noteSavedTimer = null
+function noteSaved() {
+  if (PANE === 'right') {
+    toLeft({ type: MSG.NOTE_SAVED })
+    return
+  }
+  clearTimeout(noteSavedTimer)
+  noteSavedTimer = setTimeout(refreshTaskSide, 500)
+}
+
+// 「新しいタスク」：題名と期日を聞いて、goal も parent もないタスクのノートを作り、開く。
+async function createTaskFromSide() {
+  const input = await askNewTask(checkNewTask)
+  if (!input) return
+  const created = await request('/api/tasks', { method: 'POST', body: JSON.stringify({ title: input.title, due: input.due, created: todayText() }) }).catch(() => ({ ok: false }))
+  if (!created.ok || typeof created.data?.path !== 'string') {
+    showMessage(createFailedText(created.status, created.data?.error))
+    return
+  }
+  await refreshNotes()
+  tasksSaved()
+  await openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), created.data.path, { focus: true })
+  closeSideIfNarrow()
+}
+
+// 開いているノート（左と、右の枠）の書きかけを保存してみる。返り値：保存しきれなかったノート [{ pane, path }]。
+// 止めるかどうかは、そのノートが判定に関わるかで決める（unsavedBlockText）。
+async function saveOpenNotes() {
+  const stuck = []
+  commitOpenField()
+  await saver?.flush()
+  if (saver && currentPath && !CLEAN_STATES.has($('status').dataset.state)) stuck.push({ pane: 'left', path: currentPath })
+  if (split?.isOpen() && rightState.path && (await split.save()).dirty) stuck.push({ pane: 'right', path: rightState.path })
+  return stuck
+}
+
+// 「リンクが外れたタスク」の「ゴミ箱へ」。外れたリンクはないので、リンクは外さずにノートをゴミ箱へ移す。
+// 子がいれば一緒に移すか聞く。開いていて書き換えられるノートなら「このタスクを削除」と同じ流れにする。
+async function trashUnlinkedTask(path) {
+  if (taskBusy) return
+  taskBusy = true
+  let handOff = false
+  try {
+    // 判定はサーバーのファイルで決まるので、開いているノート（左と右）の書きかけを先に保存する。
+    // 判定に関わるノート（このタスクと移すサブタスク、その goal・parent のノート）を保存しきれなければやめる。
+    const stuck = await saveOpenNotes()
+    const list = await loadTaskList()
+    const checked = unlinkedTrashCheck(list, path)
+    if (!checked.ok) {
+      showMessage(checked.message)
+      refreshTaskSide()
+      return
+    }
+    const { task } = checked
+    const children = collectDescendants(list, task.path)
+    // 左で開いているノートで、書き換えられるなら「このタスクを削除」と同じ流れにする。編集できない（BOM つきなど）ときは、
+    // 開いていないノートと同じ流れで移す（移したあとは何も開いていない画面に戻す）。
+    const handing = Boolean(currentPath) && pathKey(currentPath) === pathKey(path) && editable && saver && !saver.isStopped()
+    // サブタスクは、ふだんは移すと決めてから（確認のあとで）確かめる。「このタスクを削除」へ渡すときは、そちらでは確かめないのでここで。
+    const blocked = unsavedBlockText(stuck, { paths: [task.path, ...(handing ? children.map((child) => child.path) : [])], task, known, split: Boolean(split?.isOpen()) })
+    if (blocked) {
+      showMessage(blocked)
+      return
+    }
+    if (handing) {
+      handOff = true
+      return
+    }
+    const title = taskTitleOf(task)
+    const source = sourceNoteOf(task, known)
+    const sourceName = source ? source.path.split('/').at(-1).replace(/\.md$/i, '') : ''
+    const unlink = source?.exists ? 'none-count' : 'none-missing'
+    const choice = await askChoice(deleteQuestion({ title, childCount: children.length, unlink, sourceName, linkCount: 0 }), deleteChoices(children.length))
+    if (!choice) return
+    // 確かめている間に書いた分も保存してから、まだ外れているかを確かめ直す（リンクを戻したのに移さないように）。
+    const stuckAgain = await saveOpenNotes()
+    const fresh = await loadTaskList()
+    const again = unlinkedTrashCheck(fresh, path)
+    if (!again.ok) {
+      showMessage(again.message)
+      refreshTaskSide()
+      return
+    }
+    // 移すサブタスクは、確認の文で数えたもののうち、今もこのタスクの下にあるものだけ（確認の間に増えたものは移さない）。
+    const moving = choice === 'all' ? confirmedChildren(children, collectDescendants(fresh, again.task.path)) : []
+    const paths = [again.task.path, ...moving.map((child) => child.path)]
+    const blockedAgain = unsavedBlockText(stuckAgain, { paths, task: again.task, known, split: Boolean(split?.isOpen()) })
+    if (blockedAgain) {
+      showMessage(blockedAgain)
+      return
+    }
+    // 左で開いているノートを一緒に移すときは、移したあとは何も開いていない画面に戻す（保存は上で済ませた）。
+    const openGoes = Boolean(currentPath) && paths.some((item) => pathKey(item) === pathKey(currentPath))
+    const result = await trashTaskNotes(paths)
+    if (openGoes && result.moved.some((item) => pathKey(item) === pathKey(currentPath))) {
+      // 移せなかったサブタスクがあれば、同じ知らせに書き添える（このあと画面を移るので、afterTaskTrash は通らない）。
+      const failed = result.failed.length ? '\n' + trashFailedNotice({ failed: result.failed, rootMoved: true, keyLabel }) : ''
+      await showMessage(deletedText({ title, movedChildren: result.moved.length - 1, undo: false, unlinked: false }) + failed)
+      saver?.close()
+      saver = null
+      location.href = '/'
+      return
+    }
+    await afterTaskTrash({ title, rootPath: task.path, result, undo: false, unlinked: false })
+  } catch {
+    showMessage('タスクをゴミ箱へ移す途中で失敗しました。ファイル一覧で、残っているものを確かめてください。')
+  } finally {
+    taskBusy = false
+    // 「このタスクを削除」は taskBusy が立っていると何もしないので、下ろしてからすぐ渡す（間に await を挟まない）。
+    if (handOff) deleteThisTask()
+  }
 }
 
 async function drawCalendar() {
@@ -2727,6 +3645,16 @@ function showCalendar(show, { remember = true } = {}) {
     closeOutline()
     $('calendar').hidden = false
     drawCalendar()
+  }
+}
+
+function showTasksSide(show, { remember = true } = {}) {
+  $('tasks-side').hidden = !show
+  if (remember) storage.set('tasks-shown', show)
+  if (show) {
+    closeOutline()
+    $('tasks-side').hidden = false
+    refreshTaskSide()
   }
 }
 
@@ -2892,7 +3820,8 @@ async function createFromSwitcher(path) {
   }
   storage.set(recentPlacesKey(), rememberPlace(storage.get(recentPlacesKey(), []), dirOf(path)))
   await refreshNotes()
-  openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), path, { startMode: 'live' })
+  // 409 は、同じ名前のノートが既にあったとき。そのときは既にあるノートとして開く（フォーカスを入れない）。
+  openIn(targetPane({ meta: false, from: 'sidebar', active: activePane() }), path, { focus: created.ok })
 }
 
 function moveSwitcher(delta) {
@@ -2905,9 +3834,9 @@ function moveSwitcher(delta) {
   items[next].scrollIntoView({ block: 'nearest' })
 }
 
-// 文字を貼れる画面では、Cmd+Vは普通の貼り付けにする。
-function pasteOpensNote() {
-  return !currentPath || mode === 'reading' || !editable
+// Cmd+V でノートを開くか。決まりは modes.mjs の pasteOpensNote。target は貼り付けた先（フォーカスのある場所）。
+function pasteOpensNoteAt(target) {
+  return pasteOpensNote({ hasNote: Boolean(currentPath), editable, ...pastePlace(target) })
 }
 
 // 本文をクリックしても見た目が変わらないと分からないので、貼り付けを待っていることを見せる。
@@ -2916,11 +3845,11 @@ function showPasteHint(show) {
   document.body.classList.toggle('paste-ready', show)
 }
 
-// 閲覧表示では文字を貼る場所がないので、Cmd+Vをコピーしたパスのノートを開く操作に使う。
+// フォーカスが本文や入力欄の外にあるとき（と、ノートを開いていないとき、編集できないノート）は文字を貼る場所がないので、
+// Cmd+Vをコピーしたパスのノートを開く操作に使う。本文や入力欄の中では、ふつうの貼り付け。
 function openFromPaste(event) {
   if (document.querySelector('dialog[open]')) return
-  if (!pasteOpensNote()) return
-  if (event.target?.closest?.('input, textarea, .cm-cell-editing, .cm-props')) return
+  if (!pasteOpensNoteAt(event.target)) return
   const text = event.clipboardData?.getData('text/plain') ?? ''
   const pasted = resolvePasted(text, rootPaths, allNotes, platform)
   if (pasted) {
@@ -2931,9 +3860,22 @@ function openFromPaste(event) {
   }
 }
 
+// 「本文へ移る」（Cmd+E、WindowsはCtrl+E）。開いているノートが編集できるときに、本文にフォーカスを入れる。
+// 既にあるノートは開いても本文にフォーカスを入れないので、キーボードだけで使う人が Tab を何十回も押さずに書き始められるようにする。
+// 開いてからまだ本文に入っていなければ、カーソルは開いたときの位置（typingStart。見出しの # などの記号のあと）のまま。
+// フォーカスが入ると印が外れて記号が見える（quietEnders の focusin）。前に本文でカーソルを置いていれば、そこに戻る。本文にいるときは何もしない。
+function enterBody() {
+  if (!currentPath || !view || !editable) return
+  if (view.contentDOM.contains(document.activeElement)) return
+  view.focus()
+  view.dispatch({ effects: [setCursorQuiet.of(false), EditorView.scrollIntoView(view.state.selection.main.head, { y: 'nearest' })] })
+}
+
 function bindChrome() {
   bindToolbar()
-  // 右の枠では、上のボタン列、ファイルの一覧、「探す」、貼り付けでノートを開く処理を使わない。
+  bindTaskContextMenu()
+  // 右の枠では、上のボタン列、ファイルの一覧、「探す」を使わない。貼り付けでノートを開く処理は、どちらの枠でも使う（その枠で開く）。
+  bindPasteOpen()
   if (PANE !== 'right') bindLeftChrome()
   else bindRightChrome()
   $('history-close').addEventListener('click', () => $('history').close())
@@ -2943,7 +3885,12 @@ function bindChrome() {
     $('history').close()
   })
   for (const button of $('modes').querySelectorAll('button')) {
-    button.addEventListener('click', () => applyMode(button.dataset.mode))
+    // 本文をクリックしたあとにマウスで押したときは、切り替えたあと本文にフォーカスを戻す。ボタンに残ると、そのあとの Cmd+V が、貼り付けでなくノートを開く操作になる。
+    // キーボード（Enter・Space）で押したときと、開いてからまだ本文をクリックしていないときは、戻さない（modes.mjs の refocusesBody）。
+    button.addEventListener('click', (event) => {
+      applyMode(button.dataset.mode)
+      if (currentPath && view && refocusesBody(event, { quiet: cursorQuiet(view.state) })) view.focus()
+    })
   }
   // 書式の付いたリンクは、マウスを押した時点で開く。離す前にカーソルが入ると表示が変わるため。
   $('editor').addEventListener(
@@ -2963,6 +3910,15 @@ function bindChrome() {
   $('editor').addEventListener('focusout', () => setTimeout(() => saver?.compositionEnded(), 0))
   window.addEventListener('keydown', (event) => {
     hoverWithMeta = event.metaKey || event.ctrlKey
+    // 本文へ移る。ダイアログ（「探す」など）を出している間は使わない。
+    // 本文にいるときも、ブラウザの同じキーの働き（WindowsのCtrl+Eはアドレス欄へ移る）が動かないように止める。
+    if (isBodyKey(event) && !document.querySelector('dialog[open]')) {
+      event.preventDefault()
+      // 左右に分けていて右の枠が操作中なら、右の枠の本文へ移ってもらう（一覧から右の枠に開いたノートなど）。
+      if (PANE !== 'right' && rightActive() && split?.isOpen()) split.post({ type: MSG.FOCUS })
+      else enterBody()
+      return
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'o') {
       event.preventDefault()
       // 右の枠では、左に「探す」を画面いっぱいに出してもらう。
@@ -2972,12 +3928,6 @@ function bindChrome() {
       } else {
         openSwitcher()
       }
-    }
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e' && !view?.hasFocus) {
-      event.preventDefault()
-      // 表のマスや欄で打っている文字を、表示を切り替える前に本文へ書き戻す。
-      commitOpenField()
-      cycleMode()
     }
   })
   window.addEventListener('keyup', (event) => {
@@ -3004,12 +3954,16 @@ function bindChrome() {
   })
 }
 
-function bindLeftChrome() {
+// Cmd+V でコピーしたパスのノートを開く処理と、その案内。左右どちらの枠でも同じ決まりで動き、押した枠で開く
+// （右の枠には split がないので、openFromPaste の openIn はその枠の openNote になる）。
+function bindPasteOpen() {
   document.addEventListener('paste', openFromPaste)
   document.addEventListener('click', (event) => {
-    // チェックやリンクを押したときは、その操作のためなので案内を出さない。
-    const onBody = event.target.closest?.('#editor') && !event.target.closest('.cm-task-box, [data-href], a')
-    showPasteHint(Boolean(onBody) && pasteOpensNote())
+    // チェックやリンク、本文の中の部品（箇条書きの記号、コールアウトの題名、表など）を押したときは、その操作のためなので案内を出さない。
+    const content = view?.contentDOM
+    const onPart = Boolean(pressedPart(event.target, content)) || Boolean(event.target.closest?.('.cm-list-number'))
+    const onBody = event.target.closest?.('#editor') && !event.target.closest('.cm-task-box, [data-href], a, #task-panel') && !onPart
+    showPasteHint(Boolean(onBody) && pasteOpensNoteAt(document.activeElement))
   })
   // 案内が最後の行に重なるので、読み進めるときは消す。
   $('editor').addEventListener('scroll', () => showPasteHint(false), { capture: true, passive: true })
@@ -3017,6 +3971,9 @@ function bindLeftChrome() {
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') showPasteHint(false)
   })
+}
+
+function bindLeftChrome() {
   $('open-note').addEventListener('click', openSwitcher)
   $('new-note').addEventListener('click', () => newNoteFromButton())
   bindFilesPanel()
@@ -3041,6 +3998,7 @@ function bindLeftChrome() {
   })
   $('toggle-outline').addEventListener('click', toggleOutline)
   $('toggle-calendar').addEventListener('click', () => showCalendar($('calendar').hidden))
+  $('toggle-tasks').addEventListener('click', () => showTasksSide($('tasks-side').hidden))
   $('today-note').addEventListener('click', () => openPeriodicNote('daily', todayText(), { ask: false }))
   $('toggle-files').addEventListener('click', () => showFiles($('files').hidden))
   // 押しても、書いていた場所からカーソルが動かないようにする。
@@ -3078,6 +4036,10 @@ async function closeSplit() {
   rightShown = null
   rightState = { path: null, selection: '', dirty: false, headings: null, lines: null }
   syncSplitButton()
+  if (reloadAfterSplit) {
+    reloadAfterSplit = false
+    location.href = '/'
+  }
 }
 
 function bindSplit() {
@@ -3125,6 +4087,14 @@ function receiveFromRight(data) {
   } else if (data.type === MSG.OPEN) {
     // 右の枠でCmd+クリックしたリンクは、左で開く。
     if (typeof data.path === 'string') openIn('left', data.path, { anchor: typeof data.anchor === 'string' ? data.anchor : '' })
+  } else if (data.type === MSG.TASKS) {
+    refreshAfterTasks()
+  } else if (data.type === MSG.NOTE_SAVED) {
+    refreshTaskSide()
+  } else if (data.type === MSG.TRASHED) {
+    trashedElsewhere(data)
+  } else if (data.type === MSG.SAVE_LEFT) {
+    saveForRight(data)
   } else if (data.type === MSG.CLICKED) {
     split.setActive('right')
   } else if (data.type === MSG.OPENED) {
@@ -3198,7 +4168,7 @@ async function receiveFromLeft(data) {
         drafts.remove(oldPath)
       }
     }
-    await openNote(data.path, { push: false, anchor: data.anchor, startMode: data.startMode })
+    await openNote(data.path, { push: false, anchor: data.anchor, startMode: data.startMode, focus: data.focus === true })
   } else if (data.type === MSG.ACTIVE) {
     paneActive = Boolean(data.active)
     if (paneActive) {
@@ -3209,6 +4179,10 @@ async function receiveFromLeft(data) {
     if (!currentPath || !view) return
     const pos = Math.max(0, Math.min(Number(data.from) || 0, view.state.doc.length))
     view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 20 }) })
+  } else if (data.type === MSG.TASKS) {
+    refreshAfterTasks()
+  } else if (data.type === MSG.FOCUS) {
+    enterBody()
   } else if (data.type === MSG.CHAT) {
     sendSelectionToChat()
   } else if (data.type === MSG.HISTORY) {
@@ -3217,6 +4191,8 @@ async function receiveFromLeft(data) {
     // 左が選んだ配色に合わせる。記録は左が持つので、ここでは保存しない。
     themeChoice = data.theme === 'light' || data.theme === 'dark' ? data.theme : null
     applyTheme()
+  } else if (data.type === MSG.LEFT_SAVED) {
+    leftSaveWaiters.answer(data.id, { dirty: data.dirty !== false })
   } else if (data.type === MSG.SAVE) {
     try {
       commitOpenField()
@@ -3225,7 +4201,7 @@ async function receiveFromLeft(data) {
       if (saver && !CLEAN_STATES.has($('status').dataset.state)) saver.keepDraft()
     } finally {
       // 保存が止まっているとき（ぶつかった、見つからないなど）は flush しても書けないので、まだ書きかけがあると返す。
-      toLeft({ type: MSG.SAVED, dirty: Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state) })
+      toLeft({ type: MSG.SAVED, id: data.id, dirty: Boolean(saver) && !CLEAN_STATES.has($('status').dataset.state) })
     }
   }
 }
@@ -3246,7 +4222,7 @@ function execCopy(text) {
   }
 }
 
-// 今開いているノートの絶対パスをコピーする。閲覧だけのノートでも使える。
+// 今開いているノートの絶対パスをコピーする。編集できないノートでも使える。
 // 押した直後でないとコピーを断るブラウザがあるので、サーバーを待たずにその場で作る。
 async function copyNotePath() {
   if (!currentPath) return
@@ -3383,6 +4359,7 @@ async function start() {
   await refreshNotes()
   const narrow = isNarrow()
   showCalendar(storage.get('calendar-shown', !narrow), { remember: false })
+  showTasksSide(storage.get('tasks-shown', !narrow), { remember: false })
   // カレンダーをたたんでいても、今日のノートのボタンを出すか隠すかは起動時に決める。
   await drawCalendar()
   const params = new URLSearchParams(location.search)
@@ -3403,13 +4380,25 @@ async function start() {
   setInterval(() => {
     refreshNotes()
     drawCalendar().catch(() => {})
+    refreshTaskPanel()
+    refreshTaskSide()
   }, 60_000)
+  watchTaskPanelVisibility()
+}
+
+function watchTaskPanelVisibility() {
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return
+    refreshTaskPanel()
+    refreshTaskSide()
+  })
 }
 
 // 右の枠は ?note や ?today を見ず、案内も出さない。空のまま左に準備ができたと知らせ、開くノートを待つ。
 async function startRight() {
   // カレンダーとファイルの一覧は出さないので、描く処理が動かないよう隠しておく。
   $('calendar').hidden = true
+  $('tasks-side').hidden = true
   $('files').hidden = true
   await refreshNotes()
   if (!view) {
@@ -3418,8 +4407,15 @@ async function startRight() {
       parent: $('editor'),
     })
   }
+  // 置き場の問い合わせは待たない（開くノートを受け取るのを遅らせない）。パネルを描くときに、まだなら待つ。
+  ensureRightPeriodicRoot()
   toLeft({ type: MSG.READY })
-  setInterval(refreshNotes, 60_000)
+  setInterval(() => {
+    refreshNotes()
+    // 置き場の設定が変わったときに追いつくよう、60秒ごとに聞き直す（左はカレンダーの読み直しで同じことをしている）。
+    loadRightPeriodicRoot().finally(refreshTaskPanel)
+  }, 60_000)
+  watchTaskPanelVisibility()
 }
 
 window.noteEditor = { getView: () => view, getSaver: () => saver }

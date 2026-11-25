@@ -2,12 +2,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { PERIODS } from '../src/periodic.mjs'
+import { TASK_SOON_DAYS, TASK_SOON_DAYS_MAX, TASK_SOON_DAYS_MIN, isSoonDays } from '../src/task-buckets.mjs'
 import { checkSegment, resolveFolderPath, resolveNotePath } from './paths.mjs'
 
 // Vault別フォルダーの settings.json を読む。画面から問い合わせが来るたびに呼ぶ（書き換えがすぐ効くように）。
 // ファイルがなければ、すべて既定（エラーなし）。JSONが壊れていれば既定でエラー1件。知らない項目は無視する。
 export function readVaultSettings(vaultDir, root) {
-  const result = { attachmentDir: null, periodic: null, unlisted: new Set(), errors: [] }
+  const result = { attachmentDir: null, periodic: null, unlisted: new Set(), taskSoonDays: TASK_SOON_DAYS, errors: [] }
   let text
   try {
     text = fs.readFileSync(path.join(vaultDir, 'settings.json'), 'utf8')
@@ -27,7 +28,7 @@ export function readVaultSettings(vaultDir, root) {
 
 // 読み込んだ中身（JSON）だけを確かめる。ファイルは読まない。書く前の確認にも使う。
 export function checkVaultSettings(json, root) {
-  const result = { attachmentDir: null, periodic: null, unlisted: new Set(), errors: [] }
+  const result = { attachmentDir: null, periodic: null, unlisted: new Set(), taskSoonDays: TASK_SOON_DAYS, errors: [] }
   if (!json || typeof json !== 'object' || Array.isArray(json)) {
     result.errors.push('settings.jsonの中身がオブジェクトではありません')
     return result
@@ -97,6 +98,16 @@ export function checkVaultSettings(json, root) {
         if (segmentOk(name)) result.unlisted.add(name)
         else result.errors.push(`unlistedに使えない名前があります：${String(name)}`)
       }
+    }
+  }
+  // タスクのパネルの「直近」の日数（tasks.soonDays）。ない・使えないときは初期値の3のまま。
+  if (json.tasks !== undefined) {
+    const t = json.tasks
+    if (!t || typeof t !== 'object' || Array.isArray(t)) {
+      result.errors.push('tasksがオブジェクトではありません')
+    } else if (t.soonDays !== undefined) {
+      if (isSoonDays(t.soonDays)) result.taskSoonDays = t.soonDays
+      else result.errors.push(`tasks.soonDaysは${TASK_SOON_DAYS_MIN}から${TASK_SOON_DAYS_MAX}までの整数にしてください：${String(t.soonDays)}`)
     }
   }
   return result

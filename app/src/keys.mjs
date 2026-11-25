@@ -5,6 +5,12 @@ export function isCommandKey(event, mac = IS_MAC) {
   return mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey
 }
 
+// 「本文へ移る」キー（MacはCmd+E、WindowsはCtrl+E）か。MacのCtrl+Eは行の終わりへの移動なので含めない。
+export function isBodyKey(event, mac = IS_MAC) {
+  if (!isCommandKey(event, mac) || event.altKey || event.shiftKey || event.isComposing) return false
+  return event.key?.toLowerCase() === 'e'
+}
+
 // 取り消しとやり直しのキーなら、その名前を返す。
 export function historyKey(event, mac = IS_MAC) {
   if (!isCommandKey(event, mac) || event.altKey) return null

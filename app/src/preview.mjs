@@ -18,9 +18,75 @@ import {
   WikiLinkWidget,
 } from './widgets.mjs'
 
+// 表示のしかた。ノートの表示は 'live'（編集の表示）と 'source'（ソースの表示）の2つ。
+// 'reading' はノートの表示には使わず、リンクに乗せたときの小窓とチャット欄の返事（書き換えない、のぞくだけの表示）でだけ使う。
 export const setMode = StateEffect.define()
+
+// ノートの表示として受け付ける値に直す。'source' 以外（前の版の 'reading'、空、知らない値）は、編集の表示にする。
+export function noteMode(value) {
+  return value === 'source' ? 'source' : 'live'
+}
 export const setComposing = StateEffect.define()
+// 開いた直後の印（quiet）。本人がエディターをクリックするまでは、カーソルが触れていても記号を出さない。
+// 開いた直後はカーソルが本文の先頭にあるので、印がないと先頭の # や **、[[ ]] が文字のまま見えてしまう。
+// true で付け、false で外す。選択を変える変更（クリック、文字の入力、タスク機能などからの選択の変更）でも外れる。
+// マウス以外で本文にフォーカスが入ったとき（Tab、新しく作ったノート）と、本文でキーを押したときにも外す（main.mjs の quietEnders）。
+export const setCursorQuiet = StateEffect.define()
+
+// 1つの変更のあとの印。印を付け外しする効果があればそれに従い、なければ選択を変える変更で外す。
+// 外からの書き換えや一時保存の戻し（選択を変えない文字の変更）、チェックボックスの切り替えでは外さない。
+export function quietAfter(quiet, tr) {
+  const asked = tr.effects.filter((effect) => effect.is(setCursorQuiet)).at(-1)
+  if (asked) return asked.value === true
+  return quiet && tr.selection === undefined
+}
+
+// 印を外すキーか。Cmd・Ctrl・Shift・Alt だけを押したとき（リンクに乗せた小窓、Cmd+クリック）と、
+// Cmd・Ctrl と組み合わせたショートカット（ノートを探す Cmd+O など）では外さない。文字を変えるショートカットは、選択も変えるのでそこで外れる。
+// 日本語の変換を始めるキーでも外さない（変換の始まりで表示を変えないため。変換した文字が入ると選択が変わって外れる）。
+const MODIFIER_KEYS = new Set(['Meta', 'Control', 'Shift', 'Alt', 'AltGraph', 'CapsLock', 'Fn', 'OS'])
+export function keyEndsQuiet(event) {
+  if (!event || MODIFIER_KEYS.has(event.key)) return false
+  if (event.metaKey || event.ctrlKey) return false
+  if (event.isComposing || event.key === 'Process' || event.keyCode === 229) return false
+  return true
+}
+
+// ノートを開いたときに、最初のカーソルを置く位置。pos（本文の最初の行の頭）が行頭の記号で始まるなら、その記号のすぐあと。
+// 見出しの「# 」、箇条書きの「- 」、チェックボックスの「- [ ] 」、引用の「> 」、番号の「1. 」など（入れ子の「> - [ ] 」も）。
+// 既にあるノートは、開いても本文にフォーカスを入れない（クリックした所から書く）。この位置が使われるのは、クリックせずに Tab などで本文に入ったときと、
+// 新しく作ったノート（テンプレートで見出しから始まる日付のノートなど）。どちらもフォーカスが入った時点で印（quiet）は外れて記号が見えるので、
+// 行頭の記号の前（「x# 見出し」になる位置）ではなく、記号のあと（見出しや項目の文字の前）から書き始められるようにする。
+// 記号でないもの（先頭の [[ ]] のリンクや太字の ** など）の前では止まる（リンクの中にカーソルを入れない）。
+// コールアウトの1行目（「> [!note]」）は1行まるごと部品で出すので、次の行（コールアウトの中身）で同じように決める。
+const LINE_MARKS = new Set(['QuoteMark', 'HeaderMark', 'ListMark', 'TaskMarker', 'AlphaMark'])
+export function typingStart(state, pos) {
+  const doc = state.doc
+  const line = doc.lineAt(pos)
+  // 行の途中（frontmatter の終わりの行など）では動かさない。
+  if (pos !== line.from) return pos
+  const tree = ensureSyntaxTree(state, line.to, 200) ?? syntaxTree(state)
+  const callout = findCallouts(state).find((c) => c.from === line.from)
+  if (callout) return line.to < callout.to && line.number < doc.lines ? typingStart(state, line.to + 1) : line.to
+  let at = line.from
+  for (;;) {
+    let next = at
+    while (next < line.to && /[ \t]/.test(doc.sliceString(next, next + 1))) next += 1
+    const node = tree.resolveInner(next, 1)
+    if (!LINE_MARKS.has(node.name) || node.from !== next || node.to > line.to) break
+    at = node.to
+    if (doc.sliceString(at, at + 1) === ' ') at += 1
+  }
+  return at
+}
+
+// 印が付いているか（previewField のない状態では false）。
+export function cursorQuiet(state) {
+  return state.field(previewField, false)?.quiet === true
+}
 export const togglePropsPanel = StateEffect.define()
+// ノートを動かしている間など、プロパティ欄をすべて止めるとき true。false に戻すと表示を作り直す。
+export const setNoteBusy = StateEffect.define()
 export const noteContext = Facet.define({
   combine: (values) => values[0] ?? { path: 'note.md', known: null, api: null },
 })
@@ -33,8 +99,10 @@ const HIDE = Decoration.replace({})
 // Obsidianのハイライトの6色。
 const HIGHLIGHT_COLORS = [['🔴', 'red'], ['🟠', 'orange'], ['🟡', 'yellow'], ['🟢', 'green'], ['🔵', 'blue'], ['🟣', 'purple']]
 
-function selectionToucher(state, mode) {
-  if (mode === 'reading') return { touches: () => false, lineTouched: () => false }
+// 書き換えられない表示（のぞくだけの表示と、編集できないノート）では、カーソルが見えないので、カーソルの行でも記号を出さない。
+// 開いた直後の印（quiet）があるときも、まだ本人が触っていないので出さない。
+function selectionToucher(state, mode, quiet = false) {
+  if (mode === 'reading' || state.readOnly || quiet) return { touches: () => false, lineTouched: () => false }
   const ranges = state.selection.ranges
   return {
     touches: (from, to) => ranges.some((r) => r.from <= to && r.to >= from),
@@ -76,10 +144,10 @@ function eachLine(state, from, to, fn) {
   }
 }
 
-export function buildDecorations(state, { mode = 'live', propsOpen = false } = {}) {
+export function buildDecorations(state, { mode = 'live', propsOpen = false, busy = false, quiet = false } = {}) {
   if (mode === 'source') return Decoration.none
   const ctx = state.facet(noteContext)
-  const { touches, lineTouched } = selectionToucher(state, mode)
+  const { touches, lineTouched } = selectionToucher(state, mode, quiet)
   const reading = mode === 'reading'
   const locked = reading || state.readOnly
   const checksLocked = ctx.editable === false
@@ -111,7 +179,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
             return false
           }
           const text = doc.sliceString(from, to)
-          add(from, to, Decoration.replace({ widget: new FrontmatterWidget(text, propsOpen, from), block: true }))
+          add(from, to, Decoration.replace({ widget: new FrontmatterWidget(text, propsOpen, from, { noteEditable: ctx.editable === true, viewEditable: state.facet(EditorView.editable), busy }), block: true }))
           return false
         }
         case 'ATXHeading1':
@@ -154,7 +222,7 @@ export function buildDecorations(state, { mode = 'live', propsOpen = false } = {
           if (node.node.parent?.name !== 'Link') add(from, to, Decoration.mark({ class: 'cm-tag', attributes: { title: doc.sliceString(from, to) } }))
           return false
         case 'ObsidianComment':
-          // Obsidianと同じく、閲覧では見せない。編集中は薄く見せる。
+          // のぞくだけの表示では、Obsidianの閲覧と同じく見せない。ノートの表示では薄く見せる。
           if (reading) hideRange(add, from, to)
           else add(from, to, Decoration.mark({ class: 'cm-comment' }))
           return false
@@ -408,7 +476,7 @@ function decorateInlineHtml(node, doc, touches, add) {
   if (closeFrom > node.to) add(node.to, closeFrom, Decoration.mark({ class: cls }))
 }
 
-// ノートの先頭（前にあるのが空行と frontmatter だけ）かどうか。先頭の見出しには上の余白を付けない（Obsidianの閲覧表示と同じ）。
+// ノートの先頭（前にあるのが空行と frontmatter だけ）かどうか。先頭の見出しには上の余白を付けない（Obsidianの閲覧の表示と同じ）。
 export function atNoteStart(state, pos) {
   let start = 0
   const first = syntaxTree(state).topNode.firstChild
@@ -421,7 +489,7 @@ export function atNoteStart(state, pos) {
 }
 
 // 見出しの上の余白を決めるための印。ノートの先頭なら cm-heading-first（余白なし）。
-// 前のかたまりが段落・コード・表・箇条書きなら cm-heading-after-block（閲覧の表示で広く空ける。Obsidianの --heading-spacing）。
+// 前のかたまりが段落・コード・表・箇条書きなら cm-heading-after-block（広く空ける。Obsidianの --heading-spacing）。
 // Obsidianの :is(p,pre,table,ul,ol) + 見出し と同じで、見出し・引用・コールアウト・区切り線のあとには付けない。
 const AFTER_BLOCK = new Set(['Paragraph', 'FencedCode', 'CodeBlock', 'Table', 'BulletList', 'OrderedList'])
 
@@ -460,11 +528,13 @@ function addIndentGuides(state, add) {
 
 export const previewField = StateField.define({
   create(state) {
-    return { deco: buildDecorations(state, { mode: 'live' }), mode: 'live', composing: false, propsOpen: false }
+    // 印（quiet）は、ノートを開いたあとに setCursorQuiet で付ける。ここで付けると、カーソルの行を見せたい場面（小窓など）でも隠れるため。
+    return { deco: buildDecorations(state, { mode: 'live' }), mode: 'live', composing: false, propsOpen: false, busy: false, quiet: false }
   },
   update(value, tr) {
-    let { mode, composing, propsOpen } = value
-    let changed = false
+    let { mode, composing, propsOpen, busy } = value
+    const quiet = quietAfter(value.quiet, tr)
+    let changed = quiet !== value.quiet
     for (const effect of tr.effects) {
       if (effect.is(setMode)) {
         mode = effect.value
@@ -475,12 +545,16 @@ export const previewField = StateField.define({
       } else if (effect.is(togglePropsPanel)) {
         propsOpen = effect.value ?? !propsOpen
         changed = true
+      } else if (effect.is(setNoteBusy)) {
+        busy = effect.value === true
+        changed = true
       }
     }
     // 日本語の変換中は表示を切り替えない。変換が終わってからまとめて直す。
-    if (composing) return { ...value, composing, mode, propsOpen, deco: value.deco.map(tr.changes) }
+    // 印は変換中も覚えておく（開いてすぐ日本語を打ったときに、印が残ったままにならないように）。
+    if (composing) return { ...value, composing, mode, propsOpen, busy, quiet, deco: value.deco.map(tr.changes) }
     if (changed || tr.docChanged || tr.selection) {
-      return { deco: buildDecorations(tr.state, { mode, propsOpen }), mode, composing, propsOpen }
+      return { deco: buildDecorations(tr.state, { mode, propsOpen, busy, quiet }), mode, composing, propsOpen, busy, quiet }
     }
     return value
   },

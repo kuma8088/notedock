@@ -4,10 +4,16 @@ const KEY = /^([^\s:#][^:]*?):(?:\s+(.*)|\s*)$/
 const LIST_ITEM = /^\s*-\s+(.*)$/
 const COMPLEX = /^[|>{[]|^&|^\*/
 
+// 二重引用符のときだけ、書くときに付けた \" と \\ を戻す（quoteIfNeeded と往復させる）。単引用符はそのまま。
 function unquote(value) {
   const match = value.match(/^(["'])(.*)\1$/)
-  return match ? match[2] : value
+  if (!match) return value
+  return match[1] === '"' ? match[2].replace(/\\(["\\])/g, '$1') : match[2]
 }
+
+// 引用符なしで書かれたリンク（goal: [[…]]）を、リストではなくリンクとして読む項目。小文字の名前だけを対象にする。
+const LINK_KEYS = new Set(['goal', 'parent'])
+const BARE_LINK = /^\[\[[^\[\]]+\]\]$/
 
 export function inferType(key, value) {
   if (Array.isArray(value)) return key.toLowerCase() === 'tags' ? 'tags' : 'list'
@@ -54,6 +60,12 @@ export function parseFrontmatter(source) {
       i = end
       continue
     }
+    if (LINK_KEYS.has(key) && BARE_LINK.test(raw)) {
+      items.push({ key, value: raw, type: 'text', start: i, end: i + 1, quoted: false })
+      i += 1
+      if (i < lines.length - 1 && /^\s+\S/.test(lines[i]) && !LIST_ITEM.test(lines[i])) simple = false
+      continue
+    }
     if (COMPLEX.test(raw)) {
       if (raw.startsWith('[') && raw.endsWith(']')) {
         const value = raw.slice(1, -1).split(',').map((v) => unquote(v.trim())).filter(Boolean)
@@ -71,26 +83,32 @@ export function parseFrontmatter(source) {
   return { simple, items, lines }
 }
 
+// 二重引用符で囲む。\ と " だけを逃がす（unquote と往復させる）。
+function doubleQuote(text) {
+  return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
 function quoteIfNeeded(value) {
   const text = String(value)
   if (text === '') return ''
-  if (/^[\s>|{[&*!%@`#]|: |\s#|\s$|^["']/.test(text)) return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+  if (/^[\s>|{[&*!%@`#]|: |\s#|\s$|^["']/.test(text)) return doubleQuote(text)
   return text
 }
 
-function renderItem(key, value) {
+function renderItem(key, value, quote = false) {
   if (Array.isArray(value)) {
     if (value.length === 0) return [`${key}:`]
     return [`${key}:`, ...value.map((item) => `  - ${quoteIfNeeded(item)}`)]
   }
-  const text = quoteIfNeeded(value)
+  const text = quote ? doubleQuote(String(value)) : quoteIfNeeded(value)
   return [text === '' ? `${key}:` : `${key}: ${text}`]
 }
 
-export function setProperty(source, key, value) {
+// quote: true のときは、値をいつも二重引用符で囲む（空でも "" と書く）。
+export function setProperty(source, key, value, { quote = false } = {}) {
   const { items, lines } = parseFrontmatter(source)
   const item = items.find((candidate) => candidate.key === key)
-  const rendered = renderItem(key, value)
+  const rendered = renderItem(key, value, quote)
   if (item) lines.splice(item.start, item.end - item.start, ...rendered)
   else lines.splice(lines.length - 1, 0, ...rendered)
   return lines.join('\n')

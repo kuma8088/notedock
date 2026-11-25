@@ -209,7 +209,7 @@ test('カーソルが触れているときは元の文字を見せる', () => {
   assert.equal(widgets(make(text, { cursor: text.indexOf('only') })).length, 0)
 })
 
-test('閲覧ではカーソルがあっても表示を整え、ソースでは整えない', () => {
+test('のぞくだけの表示（reading）ではカーソルがあっても表示を整え、ソースでは整えない', () => {
   const text = '[[only]]\n'
   const state = make(text, { cursor: 2 })
   const reading = state.update({ effects: setMode.of('reading') }).state

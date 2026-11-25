@@ -11,6 +11,8 @@ import { createBackups } from './backups.mjs'
 import { createFolder, moveItem, planMove, trashItem } from './fileops.mjs'
 import { createNote, readNote, writeNote } from './notes.mjs'
 import { isHiddenFile } from './platform.mjs'
+import { createTaskIndex, createTaskNote } from './tasks.mjs'
+import { TASK_FOLDER } from '../src/tasks.mjs'
 import { openPeriodic, periodicMonth } from './periodic.mjs'
 import { replaceFile } from './durable.mjs'
 import { checkVaultSettings, readVaultSettings } from './vault-settings.mjs'
@@ -119,6 +121,8 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
   const baseScanOptions = { isHidden: (p) => isHiddenFile(p), ...scanLimits }
   const settings = () => readVaultSettings(vaultDir, root)
   const scanOptionsOf = (loaded) => ({ ...baseScanOptions, unlisted: loaded.unlisted })
+  // タスクのノートの一覧。求められたときに、変わったファイルだけ読み直す。
+  const taskIndex = createTaskIndex(root, { isHidden: (p) => isHiddenFile(p), notes: () => notes() })
   let notesCache = null
   let notesCachedAt = 0
   let notesCacheKey = ''
@@ -366,6 +370,16 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
         merged.periodic = { ...old, root: body.periodicRoot }
       } else typeErrors.push('periodicRootが文字ではありません')
     }
+    // タスクのパネルの「直近」の日数。settings.json では tasks.soonDays。tasks のほかの項目は残す。
+    if (body.taskSoonDays !== undefined) {
+      const old = merged.tasks && typeof merged.tasks === 'object' && !Array.isArray(merged.tasks) ? merged.tasks : {}
+      if (body.taskSoonDays === null) {
+        const { soonDays, ...rest } = old
+        if (Object.keys(rest).length) merged.tasks = rest
+        else delete merged.tasks
+      } else if (Number.isInteger(body.taskSoonDays)) merged.tasks = { ...old, soonDays: body.taskSoonDays }
+      else typeErrors.push('taskSoonDaysが整数ではありません')
+    }
     const errors = [...typeErrors, ...(typeErrors.length ? [] : checkVaultSettings(merged, root).errors)]
     if (errors.length) return send(res, 400, { errors })
     fs.mkdirSync(vaultDir, { recursive: true, mode: 0o700 })
@@ -526,6 +540,22 @@ export function createApp({ root, backupDir, stateDir, vaultDir, publicDir = PUB
       }
       case 'GET /api/notes':
         return send(res, 200, notes())
+      // 一覧に「直近」の日数を添える（画面はこれで区分ける。settings.json にない・使えないときは3）。
+      case 'GET /api/tasks':
+        return send(res, 200, { ...taskIndex.list(), soonDays: settings().taskSoonDays })
+      // タスクのノートを Tasks/ に作る。目標のノートへのリンクは画面がエディターの変更として足す（サーバーは書き換えない）。
+      case 'POST /api/tasks': {
+        let body
+        try {
+          body = JSON.parse(await readBody(req, MAX_JSON))
+        } catch (error) {
+          if (error.status) throw error
+          return send(res, 400, { error: 'bad request' })
+        }
+        const created = createTaskNote(root, body, { folder: taskIndex.folderName() ?? TASK_FOLDER })
+        notesCache = null
+        return send(res, 201, created)
+      }
       case 'GET /api/events':
         return events(req, res, rel)
       case 'GET /api/file': {

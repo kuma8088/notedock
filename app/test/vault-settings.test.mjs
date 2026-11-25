@@ -35,7 +35,7 @@ async function setup({ settings, files = {} } = {}) {
 test('設定ファイルがなければ、すべて既定でエラーなし', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vs-none-'))
   const s = readVaultSettings(dir, dir)
-  assert.deepEqual(s, { attachmentDir: null, periodic: null, unlisted: new Set(), errors: [] })
+  assert.deepEqual(s, { attachmentDir: null, periodic: null, unlisted: new Set(), taskSoonDays: 3, errors: [] })
 })
 
 test('すべての項目を読む。知らない項目は無視する', () => {
@@ -173,4 +173,110 @@ test('checkVaultSettings はファイルを読まずに同じ確認をする', (
   assert.equal(checkVaultSettings({ attachmentDir: '../x' }, dir).errors.length, 1)
   assert.equal(checkVaultSettings([], dir).errors.length, 1)
   assert.equal(checkVaultSettings(null, dir).errors.length, 1)
+})
+
+// ---- タスクのパネルの「直近」の日数（tasks.soonDays。段階1-F） ----
+
+test('tasks.soonDays：0から31までの整数を読む。ない・使えないときは3で、使えないときはエラー1件', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vs-soon-'))
+  assert.equal(checkVaultSettings({}, dir).taskSoonDays, 3)
+  assert.deepEqual(checkVaultSettings({ tasks: {} }, dir).errors, [])
+  assert.equal(checkVaultSettings({ tasks: {} }, dir).taskSoonDays, 3)
+  for (const ok of [0, 1, 7, 31]) {
+    const s = checkVaultSettings({ tasks: { soonDays: ok } }, dir)
+    assert.equal(s.taskSoonDays, ok)
+    assert.deepEqual(s.errors, [])
+  }
+  for (const bad of [-1, 32, 2.5, '5', null, true, [3], { n: 3 }]) {
+    const s = checkVaultSettings({ tasks: { soonDays: bad } }, dir)
+    assert.equal(s.taskSoonDays, 3, JSON.stringify(bad))
+    assert.equal(s.errors.length, 1, JSON.stringify(bad))
+  }
+  for (const bad of ['x', 3, [], null]) {
+    const s = checkVaultSettings({ tasks: bad }, dir)
+    assert.equal(s.taskSoonDays, 3, JSON.stringify(bad))
+    assert.deepEqual(s.errors, ['tasksがオブジェクトではありません'])
+  }
+  // ほかの項目と一緒でも、ほかの項目の読み方は変わらない。
+  const all = checkVaultSettings({ attachmentDir: 'img', periodic: { root: 'Days' }, unlisted: ['a'], tasks: { soonDays: 5 } }, dir)
+  assert.equal(all.attachmentDir, 'img')
+  assert.equal(all.periodic.root, 'Days')
+  assert.deepEqual([...all.unlisted], ['a'])
+  assert.equal(all.taskSoonDays, 5)
+  assert.deepEqual(all.errors, [])
+})
+
+const putJson = (t, body) => t.api('/api/settings', { method: 'PUT', body: JSON.stringify(body) })
+const readSettings = (t) => JSON.parse(fs.readFileSync(path.join(t.vaultDir, 'settings.json'), 'utf8'))
+const FULL = { attachmentDir: 'img', periodic: { root: 'Days', templates: { daily: 'templates/daily.md' } }, unlisted: ['archives'], other: 1 }
+
+test('日数を PUT しても、periodic・attachmentDir・unlisted・知らない項目は残る', async () => {
+  const t = await setup({ settings: FULL })
+  try {
+    const res = await putJson(t, { taskSoonDays: 5 })
+    assert.equal(res.status, 200)
+    assert.deepEqual(readSettings(t), { ...FULL, tasks: { soonDays: 5 } })
+    assert.deepEqual(res.json, { settings: { ...FULL, tasks: { soonDays: 5 } }, errors: [] })
+    // tasks の中のほかの項目も残る。
+    t.write({ ...FULL, tasks: { soonDays: 2, later: 'x' } })
+    assert.equal((await putJson(t, { taskSoonDays: 0 })).status, 200)
+    assert.deepEqual(readSettings(t).tasks, { soonDays: 0, later: 'x' })
+  } finally { await t.close() }
+})
+
+test('Mod の set_vault_settings と同じ PUT（3項目だけ）で書いても、日数は消えない', async () => {
+  const t = await setup({ settings: { ...FULL, tasks: { soonDays: 6 } } })
+  try {
+    for (const body of [{ attachmentDir: 'pics' }, { periodicRoot: 'Logs' }, { unlisted: ['old'] }, { attachmentDir: null }]) {
+      assert.equal((await putJson(t, body)).status, 200, JSON.stringify(body))
+      assert.deepEqual(readSettings(t).tasks, { soonDays: 6 }, JSON.stringify(body))
+    }
+    assert.deepEqual(readSettings(t), { periodic: { root: 'Logs', templates: { daily: 'templates/daily.md' } }, unlisted: ['old'], other: 1, tasks: { soonDays: 6 } })
+    // 何も指定しない GET（Mod が今の設定を見るとき）にも出る。
+    assert.deepEqual((await t.api('/api/settings')).json.settings.tasks, { soonDays: 6 })
+  } finally { await t.close() }
+})
+
+test('日数の PUT：整数でない・範囲の外は400で、書かない。null で消す', async () => {
+  const t = await setup({ settings: { periodic: { root: 'Days' }, tasks: { soonDays: 4 } } })
+  try {
+    for (const bad of ['5', 2.5, true, [3], { n: 3 }]) {
+      const res = await putJson(t, { taskSoonDays: bad })
+      assert.equal(res.status, 400, JSON.stringify(bad))
+      assert.deepEqual(res.json.errors, ['taskSoonDaysが整数ではありません'])
+    }
+    for (const bad of [-1, 32, 1000]) {
+      const res = await putJson(t, { taskSoonDays: bad })
+      assert.equal(res.status, 400, String(bad))
+      assert.equal(res.json.errors.length, 1)
+    }
+    assert.deepEqual(readSettings(t), { periodic: { root: 'Days' }, tasks: { soonDays: 4 } })
+    // null で日数だけを消す。tasks がほかに何も持たなければ、tasks ごと消す。
+    assert.equal((await putJson(t, { taskSoonDays: null })).status, 200)
+    assert.deepEqual(readSettings(t), { periodic: { root: 'Days' } })
+    t.write({ tasks: { soonDays: 4, later: 'x' } })
+    await putJson(t, { taskSoonDays: null })
+    assert.deepEqual(readSettings(t), { tasks: { later: 'x' } })
+    // tasks がオブジェクトでなければ、新しく作り直す。
+    t.write({ tasks: 'x' })
+    assert.equal((await putJson(t, { taskSoonDays: 2 })).status, 200)
+    assert.deepEqual(readSettings(t), { tasks: { soonDays: 2 } })
+  } finally { await t.close() }
+})
+
+test('GET /api/tasks は日数を添える。ない・使えない・settings.json が壊れているときは3', async () => {
+  const t = await setup()
+  try {
+    const soon = async () => (await t.api('/api/tasks')).json.soonDays
+    assert.equal(await soon(), 3)
+    t.write({ tasks: { soonDays: 9 } })
+    assert.equal(await soon(), 9)
+    t.write({ tasks: { soonDays: 99 } })
+    assert.equal(await soon(), 3)
+    t.write('{oops')
+    assert.equal(await soon(), 3)
+    t.write({ tasks: { soonDays: 0 } })
+    assert.equal(await soon(), 0)
+    assert.ok(Array.isArray((await t.api('/api/tasks')).json.tasks))
+  } finally { await t.close() }
 })

@@ -1,7 +1,7 @@
 // 左（親のページ）で、ノートを表示している部分を左右に分ける。右の枠は同じページを /?pane=right で開いた iframe。
 // main.mjs を読み込まない（main.mjs のほうから createSplit で作る）。
 
-import { MSG, isPaneMessage } from './pane.mjs'
+import { MSG, createReplyWaiters, isPaneMessage } from './pane.mjs'
 
 export const SPLIT_LEFT_MIN = 320
 export const SPLIT_RIGHT_MIN = 420
@@ -51,7 +51,9 @@ export function createSplit({ layout, editor, onMessage, onActiveChange }) {
   let closing = null
   let observer = null
   const readyWaiters = []
-  const saveWaiters = []
+  // 保存の頼みごと（pane:save）に id を付け、返事（pane:saved）は同じ id の待ちだけを解く。
+  // 切れたあとに遅れて来た前の返事で、次の待ちを「保存できた」と解かないように（pane.mjs の createReplyWaiters）。
+  const saveReplies = createReplyWaiters()
 
   editor.classList.add('pane-active')
 
@@ -87,7 +89,7 @@ export function createSplit({ layout, editor, onMessage, onActiveChange }) {
       release(readyWaiters)
       return
     }
-    if (data.type === MSG.SAVED) release(saveWaiters, savedResult(data))
+    if (data.type === MSG.SAVED) saveReplies.answer(data.id, savedResult(data))
     onMessage(data)
   })
 
@@ -156,9 +158,9 @@ export function createSplit({ layout, editor, onMessage, onActiveChange }) {
     // 準備ができていない右の枠や閉じた枠には、開いたノートがないので、保存するものもない。
     if (!frame || !ready) return Promise.resolve({ dirty: false })
     // 5秒たっても返事がなければ、保存できたとは言えないので dirty として扱う。
-    const wait = waiter(saveWaiters, SAVE_WAIT_MS, { dirty: true })
-    send({ type: MSG.SAVE })
-    return wait
+    const { id, promise } = saveReplies.wait(SAVE_WAIT_MS, { dirty: true })
+    send({ type: MSG.SAVE, id })
+    return promise
   }
 
   function close() {
@@ -177,7 +179,7 @@ export function createSplit({ layout, editor, onMessage, onActiveChange }) {
       queue = []
       release(readyWaiters)
       // 閉じたので返事は来ない。保存できたとは言えないので dirty として扱う。
-      release(saveWaiters, { dirty: true })
+      saveReplies.answerAll({ dirty: true })
       document.body.classList.remove('split-open')
       document.body.style.removeProperty('--split-left-width')
       layout.style.removeProperty('--split')
