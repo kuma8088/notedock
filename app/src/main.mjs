@@ -36,7 +36,7 @@ import { hangingIndent } from './hanging.mjs'
 import { noteMarkdown } from './markdown-ext.mjs'
 import { MSG, createReplyWaiters, draftKey, isPaneMessage, pickDraft, targetPane } from './pane.mjs'
 import { minimalChange } from './merge.mjs'
-import { editableExtensions, endQuietAfterClick, focusEndsQuiet, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, refocusesBody } from './modes.mjs'
+import { editableExtensions, endQuietAfterClick, focusEndsQuiet, frontmatterGuard, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, propsBlankAt, refocusesBody } from './modes.mjs'
 import { cursorQuiet, keyEndsQuiet, noteContext, noteMode, previewField, setComposing, setCursorQuiet, setMode, setNoteBusy, togglePropsPanel, typingStart } from './preview.mjs'
 import { createSaver } from './save.mjs'
 import { createSplit } from './split.mjs'
@@ -815,10 +815,22 @@ const quietEnders = EditorView.domEventObservers({
 document.addEventListener(
   'mousedown',
   (event) => {
-    if (event.button !== 0 || !view || !cursorQuiet(view.state) || !view.contentDOM.contains(event.target)) return
+    if (event.button !== 0 || !view || !view.contentDOM.contains(event.target)) return
     if (event.target.closest?.('[data-href]')) return
     const target = view
     const part = pressedPart(event.target, target.contentDOM)
+    // ノートの情報の欄の何もない所を押したときは、印があってもなくても、本文の最初の行（閉じの --- の次の行）の typingStart へカーソルを置く。
+    // エディターに任せると、閉じの --- の行やその前に置かれることがあり、そこで Backspace などを押すと欄が壊れる（modes.mjs の partCursor）。
+    if (part && partKind(part) === 'props' && propsBlankAt(event.target) && target.state.facet(EditorView.editable)) {
+      const anchor = partCursor(target.state, { pos: target.posAtDOM(part), kind: 'props' })
+      if (anchor !== null) {
+        event.preventDefault()
+        target.dispatch({ selection: { anchor }, effects: setCursorQuiet.of(false) })
+        target.focus()
+        return
+      }
+    }
+    if (!cursorQuiet(target.state)) return
     if (!part) {
       endQuietAfterClick(target, () => openRound)
       return
@@ -960,6 +972,7 @@ function extensionsFor(path, canEdit) {
     noteMarkdown(languages),
     contextSlot.of(noteContextFor(path, canEdit)),
     previewField,
+    frontmatterGuard,
     hangingIndent,
     editableSlot.of(editableExtensions(canEdit)),
     editorKeys,

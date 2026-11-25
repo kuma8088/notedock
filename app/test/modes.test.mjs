@@ -2,11 +2,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { test } from 'node:test'
 
-import { EditorSelection, EditorState } from '@codemirror/state'
+import { EditorSelection, EditorState, Transaction } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
+import { deleteMarkupBackward } from '@codemirror/lang-markdown'
 
 import { noteMarkdown } from '../src/markdown-ext.mjs'
-import { editableExtensions, endQuietAfterClick, focusEndsQuiet, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, refocusesBody } from '../src/modes.mjs'
+import { breaksFrontmatter, editableExtensions, endQuietAfterClick, focusEndsQuiet, frontmatterEnd, frontmatterGuard, partCursor, partKind, pasteOpensNote, pastePlace, pressedPart, propsBlankAt, refocusesBody } from '../src/modes.mjs'
 import { cursorQuiet, hiddenRanges, keyEndsQuiet, noteContext, previewField, quietAfter, setComposing, setCursorQuiet, setMode, togglePropsPanel, typingStart } from '../src/preview.mjs'
 import { WikiLinkWidget } from '../src/widgets.mjs'
 
@@ -314,8 +315,13 @@ test('部品を押して本文に入ったときのカーソルの位置は、�
   assert.equal(partCursor(state, { pos: doc.indexOf('- 項目'), kind: 'other' }), doc.indexOf('項目'))
   // 行の途中の部品（画像など）：部品の前。
   assert.equal(partCursor(state, { pos: doc.indexOf('!['), kind: 'other' }), doc.indexOf('!['))
-  // ノートの情報の欄：動かさない。
-  assert.equal(partCursor(state, { pos: 0, kind: 'props' }), null)
+  // ノートの情報の欄：本文の最初の行（閉じの --- の次の行）で、開いたときと同じ位置（typingStart）。閉じの --- の行やその前には置かない。
+  const front = '---\ntitle: a\n---\n'
+  assert.equal(partCursor(opened(front + '# 見出し\n本文'), { pos: 0, kind: 'props' }), front.length + 2)
+  assert.equal(partCursor(opened(front + 'T\n'), { pos: 0, kind: 'props' }), front.length)
+  assert.equal(partCursor(opened(front), { pos: 0, kind: 'props' }), front.length)
+  // 欄のあとに行がない（閉じの --- で終わる）ノートでは動かさない。
+  assert.equal(partCursor(opened('---\ntitle: a\n---'), { pos: 0, kind: 'props' }), null)
   // 最後の表：ノートの終わりより後ろには置かない。
   const last = opened('本文\n\n| a |\n|---|')
   assert.equal(partCursor(last.state ?? last, { pos: 4, kind: 'table', length: 11 }), last.doc.length)
@@ -404,4 +410,108 @@ test('Cmd+V でノートを開く処理は左右どちらの枠でも使い、�
   // 右の枠で案内を隠さない。
   const css = fs.readFileSync(new URL('../src/style.css', import.meta.url), 'utf8')
   assert.equal(/body\[data-pane='right'\] #paste-hint/.test(css), false)
+})
+
+// ノートの情報の欄（frontmatter）を、編集の表示のキーで壊さない（欄の何もない所を押してから Backspace で「---T」になった不具合）。
+const TASK = '---\ntitle: "試しの課題"\nstatus: 未着手\nstart:\ndue:\n---\nT\n'
+function guarded(doc, anchor, mode = 'live') {
+  const state = EditorState.create({ doc, selection: { anchor }, extensions: [noteMarkdown(), noteContext.of({ path: 'a.md', known: new Set() }), previewField, frontmatterGuard] })
+  return mode === 'live' ? state : state.update({ effects: setMode.of(mode) }).state
+}
+// キーで本文を書き換えたときの本文（エディターのコマンドと同じ変更）。
+const del = (state, from, to, userEvent = 'delete.backward') => state.update({ changes: { from, to }, userEvent }).state.doc.toString()
+const ins = (state, at, insert, userEvent = 'input.type') => state.update({ changes: { from: at, insert }, userEvent }).state.doc.toString()
+
+test('frontmatterEnd：先頭の --- で始まり --- の行で閉じる部分の終わり（Markdown の読み方と同じ）', () => {
+  const doc = (text) => EditorState.create({ doc: text }).doc
+  assert.equal(frontmatterEnd(doc(TASK)), TASK.indexOf('---\nT') + 3)
+  assert.equal(frontmatterEnd(doc('---\n---')), 7)
+  assert.equal(frontmatterEnd(doc('--- \na: 1\n---  \n本文')), '--- \na: 1\n---  '.length)
+  assert.equal(frontmatterEnd(doc('---\na: 1\n本文')), null)
+  assert.equal(frontmatterEnd(doc('x\n---\na\n---')), null)
+  assert.equal(frontmatterEnd(doc('---')), null)
+})
+
+test('編集の表示：本文の先頭で Backspace を押しても、閉じの --- と本文の行がつながらない（何もしない）', () => {
+  const end = TASK.indexOf('---\nT') + 3
+  const state = guarded(TASK, end + 1)
+  // Backspace・Cmd+Backspace・Option+Backspace・Ctrl+H は、どれも閉じの --- のあとの改行を消す変更になる。
+  for (const userEvent of ['delete.backward', 'delete.group.backward', 'delete.line', 'delete']) assert.equal(del(state, end, end + 1, userEvent), TASK, userEvent)
+  // エディターの Backspace のコマンド（Markdown の記号を消すもの）でも同じ。
+  let doc = state.doc.toString()
+  deleteMarkupBackward({ state, dispatch: (tr) => (doc = tr.state.doc.toString()) })
+  assert.equal(doc, TASK)
+  // x・Delete・Enter は本文の中で効く（欄は壊れない）。
+  assert.equal(ins(state, end + 1, 'x'), TASK.replace('\nT', '\nxT'))
+  assert.equal(del(state, end + 1, end + 2, 'delete.forward'), TASK.replace('\nT\n', '\n\n'))
+  assert.equal(ins(state, end + 1, '\n', 'input'), TASK.replace('\nT', '\n\nT'))
+  // 本文の最初の行が空でも、閉じの --- のあとの改行は消さない（カーソルが閉じの --- のあとに来て、打っても止まるだけになるため）。
+  const empty = TASK.replace('T\n', '')
+  assert.equal(del(guarded(empty, empty.length), empty.length - 1, empty.length), empty)
+})
+
+test('編集の表示：矢印キーで欄の文字の中へ入っても、閉じの --- と開きの --- は壊れない', () => {
+  const end = TASK.indexOf('---\nT') + 3
+  // 左の矢印で閉じの --- のあと：Delete、文字、Backspace、貼り付けは止める。Enter（改行）はよい。
+  const atEnd = guarded(TASK, end)
+  assert.equal(del(atEnd, end, end + 1, 'delete.forward'), TASK)
+  assert.equal(ins(atEnd, end, 'x'), TASK)
+  assert.equal(ins(atEnd, end, 'はりつけ', 'input.paste'), TASK)
+  assert.equal(del(atEnd, end - 1, end), TASK)
+  assert.equal(ins(atEnd, end, '\n', 'input'), TASK.replace('---\nT', '---\n\nT'))
+  // 上の矢印で開きの --- の前：文字、Delete、Enter は止める。
+  const atTop = guarded(TASK, 0)
+  assert.equal(ins(atTop, 0, 'x'), TASK)
+  assert.equal(del(atTop, 0, 1, 'delete.forward'), TASK)
+  assert.equal(ins(atTop, 0, '\n', 'input'), TASK)
+  // ツールバーのボタンなど、userEvent のない変更でも止める。
+  assert.equal(atTop.update({ changes: { from: 0, insert: '# ' } }).state.doc.toString(), TASK)
+  // 欄を文字で編集しているとき：値の書き換え、行の追加と削除はできる。
+  const at = TASK.indexOf('未着手')
+  assert.equal(ins(atTop, at, '★'), TASK.replace('未着手', '★未着手'))
+  assert.equal(ins(atTop, TASK.indexOf('due:') + 4, '\nmemo: x', 'input'), TASK.replace('due:', 'due:\nmemo: x'))
+  assert.equal(del(atTop, TASK.indexOf('start:'), TASK.indexOf('due:')), TASK.replace('start:\n', ''))
+})
+
+test('欄を壊す変更を止めるのは編集の表示だけ。ソースの表示、取り消し、外からの変更、欄ごとの書き換えは止めない', () => {
+  const end = TASK.indexOf('---\nT') + 3
+  // ソースの表示では、今までどおり自由に書き換えられる。
+  assert.equal(del(guarded(TASK, end + 1, 'source'), end, end + 1), TASK.replace('---\nT', '---T'))
+  const state = guarded(TASK, end + 1)
+  // 取り消し・やり直し、履歴に残さない変更（外からの変更の取り込み）。
+  for (const spec of [{ userEvent: 'undo' }, { userEvent: 'redo' }, { annotations: Transaction.addToHistory.of(false) }]) {
+    assert.equal(state.update({ changes: { from: end, to: end + 1 }, ...spec }).state.doc.toString(), TASK.replace('---\nT', '---T'))
+  }
+  // すべて選択して消す・打ち換える。欄の部品からの書き換え（欄をまるごと正しい欄に置き換える）。
+  assert.equal(del(state, 0, TASK.length), '')
+  assert.equal(state.update({ changes: { from: 0, to: TASK.length, insert: 'x' }, userEvent: 'input.type' }).state.doc.toString(), 'x')
+  const next = TASK.slice(0, end).replace('未着手', '進行中')
+  assert.equal(state.update({ changes: { from: 0, to: end, insert: next } }).state.doc.toString(), TASK.replace('未着手', '進行中'))
+  // 欄だけ・欄と本文の先頭を選んで打ち換える・消す（Shift+上の矢印で本文の先頭から選んだときなど）は止める。
+  assert.equal(state.update({ changes: { from: 0, to: end + 1, insert: 'x' }, userEvent: 'input.type' }).state.doc.toString(), TASK)
+  assert.equal(del(state, 0, end + 1), TASK)
+  assert.equal(del(state, 0, end), TASK)
+  // 項目を足した欄に置き換える（Cmd+; と同じ変更）。
+  const added = TASK.slice(0, end).replace('due:', 'due:\nmemo:')
+  assert.equal(state.update({ changes: { from: 0, to: end, insert: added } }).state.doc.toString(), TASK.replace('due:', 'due:\nmemo:'))
+  // 欄のないノートは何もしない。
+  assert.equal(del(guarded('# a\nb', 4), 3, 4), '# ab')
+  assert.equal(breaksFrontmatter(state.update({ selection: { anchor: 0 } })), false)
+})
+
+test('ノートの情報の欄の何もない所：入力欄・選ぶ欄・ボタン・リンクは数えない', () => {
+  const at = (inside, hit = '') => ({ closest: (sel) => (sel === '.cm-props' ? (inside ? {} : null) : sel.split(', ').some((s) => s === hit) ? {} : null) })
+  assert.equal(propsBlankAt(at(true)), true)
+  for (const hit of ['input', 'select', 'textarea', 'button', 'a']) assert.equal(propsBlankAt(at(true, hit)), false, hit)
+  assert.equal(propsBlankAt(at(false)), false)
+  assert.equal(propsBlankAt({ parentElement: at(true) }), true)
+  assert.equal(propsBlankAt(null), false)
+})
+
+test('エディターに欄を守る決まりを入れ、欄の何もない所を押したら印があってもなくても本文の最初の行へ', () => {
+  const main = fs.readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8')
+  assert.match(main, /previewField,\n\s*frontmatterGuard,/)
+  const down = main.slice(main.indexOf("document.addEventListener(\n  'mousedown',"), main.indexOf('let pressingEditor'))
+  assert.match(down, /if \(event\.button !== 0 \|\| !view \|\| !view\.contentDOM\.contains\(event\.target\)\) return/)
+  assert.ok(down.indexOf("partKind(part) === 'props' && propsBlankAt(event.target)") < down.indexOf('if (!cursorQuiet(target.state)) return'))
 })

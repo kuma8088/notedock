@@ -1,7 +1,7 @@
-import { EditorState } from '@codemirror/state'
+import { EditorState, Transaction } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 
-import { cursorQuiet, setCursorQuiet, typingStart } from './preview.mjs'
+import { cursorQuiet, previewField, setCursorQuiet, typingStart } from './preview.mjs'
 
 // ノートの表示まわりの決まりのうち、画面（DOM）に頼らずに決められるもの。main.mjs から使い、テストで動きを確かめる。
 
@@ -88,12 +88,61 @@ export function partKind(part) {
 }
 
 // 部品を押して本文にフォーカスが入ったときに、カーソルを置く位置。pos は部品の始まり（view.posAtDOM）。
-// - ノートの情報の欄：動かさない（null）。欄の中（--- の中）に置くと、欄が文字のまま見えてしまう。欄のすぐ下が本文の1行目なので、そのままでよい。
+// - ノートの情報の欄：本文の最初の行（欄の閉じの --- の次の行）で、ノートを開いたときと同じ決め方（typingStart）。
+//   閉じの --- の行やその前に置くと、欄が文字のまま見えたり、Backspace で閉じの --- と本文の行がつながったりする。
+//   欄のあとに行がない（閉じの --- で終わる）ノートでは動かさない（null）。
 // - 表：表のすぐ後ろ（次の行の頭）。表の中に置くと表が文字のまま見えて、マスの編集もできなくなる。length は表の文字数。
 // - 行の頭から始まる部品：ノートを開いたときと同じ決め方（typingStart）。コールアウトの題名なら、すぐ下の中身の行の頭（「> 」のあと）。
 // - それ以外：部品の前。
 export function partCursor(state, { pos, kind, length = 0 }) {
-  if (kind === 'props') return null
+  if (kind === 'props') {
+    const end = frontmatterEnd(state.doc)
+    return end === null || end >= state.doc.length ? null : typingStart(state, end + 1)
+  }
   if (kind === 'table') return Math.min(state.doc.length, pos + length + 1)
   return pos === state.doc.lineAt(pos).from ? typingStart(state, pos) : pos
 }
+
+// ノートの情報の欄で押した所が、何もない所（入力欄・選ぶ欄・ボタンでない所）か。
+export function propsBlankAt(target) {
+  const el = target?.closest ? target : target?.parentElement
+  return Boolean(el?.closest?.('.cm-props')) && !el.closest('input, select, textarea, button, a, [data-href]')
+}
+
+// ノートの先頭の frontmatter（「---」で始まり「---」の行で閉じる部分）の終わり（閉じの --- の行の終わり）。なければ null。
+// 見分け方は markdown-syntax.mjs の Frontmatter と同じ（1行目が「---」、後ろの行で最初の「---」が閉じ。前後の空白は見ない）。
+export function frontmatterEnd(doc) {
+  if (doc.lines < 2 || doc.line(1).text.trimEnd() !== '---') return null
+  for (let n = 2; n <= doc.lines; n++) {
+    const line = doc.line(n)
+    if (line.text.trimEnd() === '---') return line.to
+  }
+  return null
+}
+
+// 編集の表示で、その変更がノートの情報の欄（frontmatter）を壊すか。壊すなら変更を止める（frontmatterGuard）。
+// 壊す：閉じの --- が元の位置で閉じなくなる（「---T」のように本文の行とつながる、「---x」「x---」になる、開きの --- の前に行が入る）、
+//       閉じの --- のあとの改行がなくなる（本文の最初の空の行で Backspace を押したときなど。カーソルが閉じの --- のあとに来て、打っても止まるだけになる）。
+// 止めないもの：ソースの表示（自由に書き換えられる）、取り消し・やり直し、履歴に残さない変更（外からの変更の取り込みなど）、
+//              欄の中の項目の書き換え・行の追加（閉じの --- はずれた分だけ動く）、欄の部品からの書き換え（正しい欄に置き換える）、
+//              ノート全体を消す・置き換える変更（すべて選択して消す・打ち換える）。
+//              欄の一部や欄だけを選んで消す・打ち換える変更（Shift+上の矢印で本文の先頭から欄を選んで打つなど）は止める。欄を消したいときはソースの表示で。
+export function breaksFrontmatter(tr) {
+  if (!tr.docChanged) return false
+  if (tr.isUserEvent('undo') || tr.isUserEvent('redo') || tr.annotation(Transaction.addToHistory) === false) return false
+  if (tr.startState.field(previewField, false)?.mode !== 'live') return false
+  const end = frontmatterEnd(tr.startState.doc)
+  if (end === null) return false
+  let whole = false
+  tr.changes.iterChangedRanges((fromA, toA) => {
+    if (fromA === 0 && toA === tr.startState.doc.length) whole = true
+  })
+  if (whole) return false
+  const next = frontmatterEnd(tr.newDoc)
+  if (next !== tr.changes.mapPos(end, -1)) return true
+  return tr.startState.doc.sliceString(end, end + 1) === '\n' && tr.newDoc.sliceString(next, next + 1) !== '\n'
+}
+
+// 編集の表示で、ノートの情報の欄を壊す変更を止める。欄の部品の何もない所を押したあとや、本文の先頭で Backspace を押したとき、
+// 矢印キーで欄の文字の中へ入ってから打ったときなど、どのキーやコマンドから来ても同じ決まりで止める（何もしない）。
+export const frontmatterGuard = EditorState.transactionFilter.of((tr) => (breaksFrontmatter(tr) ? [] : tr))
