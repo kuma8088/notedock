@@ -39,7 +39,7 @@ export function lezerItemEnds(text) {
 //   'blank'：lezer のほうが長く、増えた行が空白だけの行（引用の > だけの行も）だけ。
 //   'lazy'：lezer のほうが長く、字下げで決めた範囲のすぐ次の空でない行が、引用の深さが同じで、箇条書きでなく、字下げが選んだ行以下
 //           （CommonMark の「怠惰な続きの行」で始まる）。
-//   'quote'：lezer のほうが長く、すぐ次の空でない行の引用の深さが違う（字下げのあとに > がある行など）。
+//   'quote'：lezer のほうが長く、すぐ次の空でない行の引用の深さが違う（選んだ行より浅い引用の行や、選んだ行の字下げより深く字下げしていない > の行。字下げのあとに > がある行は子なので、ここには来ない）。
 //   'other'：それ以外（lezer の項目がない・lezer のほうが短いなど）。
 export function compareNesting(text) {
   const rows = analyzeLines(text)

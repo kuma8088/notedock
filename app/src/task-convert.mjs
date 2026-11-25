@@ -167,7 +167,7 @@ export function taskRequestBody(found, created, text = '') {
 export function createdText(due, { moved = 0 } = {}) {
   const m = /^\d{4}-(\d{2})-(\d{2})$/.exec(due ?? '')
   const head = m ? `期日 ${Number(m[1])}/${Number(m[2])} で作りました。` : '期日なしで作りました。'
-  if (moved > 0) return head + `下の行${moved}行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して移した行を戻します（タスクのノートは Tasks に残ります）。`
+  if (Number.isInteger(moved) && moved > 0) return head + `下の行${moved}行をタスクのノートへ移しました。「取り消す」を押すと、リンクを外して移した行を戻します（タスクのノートは Tasks に残ります）。`
   return head + '「取り消す」を押すと、行のリンクだけを外します（タスクのノートは Tasks に残ります）。'
 }
 

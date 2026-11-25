@@ -250,6 +250,8 @@ test('作ったあとの知らせ：移した行があれば行数と、取り�
   assert.match(createdText('', { moved: 1 }), /^期日なしで作りました。下の行1行を/)
   // 移した行がなければ今までと同じ文
   assert.equal(createdText('2026-05-10', { moved: 0 }), createdText('2026-05-10'))
+  // 行数でないもの（planAfterCreate の moved は「ずれたか」の true・false）を渡しても、行数の文にしない
+  assert.equal(createdText('2026-05-10', { moved: true }), createdText('2026-05-10'))
   assert.equal(createdText('2026-05-10'), '期日 5/10 で作りました。「取り消す」を押すと、行のリンクだけを外します（タスクのノートは Tasks に残ります）。')
 })
 
