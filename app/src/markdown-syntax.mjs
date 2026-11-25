@@ -154,7 +154,7 @@ const Highlight = {
 }
 
 // Obsidianのコメント「%%文字%%」。行の中のものと、行の頭の「%%」から次の「%%」までの複数行のものがある。
-const ObsidianComment = {
+export const ObsidianComment = {
   defineNodes: [{ name: 'ObsidianComment' }, { name: 'ObsidianCommentBlock', block: true }],
   parseInline: [
     {

@@ -3,7 +3,7 @@
 import { parser as markdownParser } from '@lezer/markdown'
 
 import { isExternal, parseWikiLink, resolveHref, resolveWikiTarget } from './links.mjs'
-import { noteSyntaxExtensions } from './markdown-syntax.mjs'
+import { noteSyntaxExtensions, ObsidianComment } from './markdown-syntax.mjs'
 import { TASK_FOLDER } from './tasks.mjs'
 
 // パスを比べるときのキー。濁点の持ち方（NFC と NFD）と大文字小文字、.md の有無をそろえる。
@@ -75,30 +75,51 @@ const WIKI = /!?\[\[([^\[\]\n]+)\]\]/g
 const MD_LINK = /!?\[[^\]\n]*\]\(([^()\s]+)(?:\s+"[^"]*")?\)/g
 
 // リンクを探す行。中のリンクがプレビューでリンクにならない部分（HTML のコメント・コードの囲み・字下げのコード・行内コード・
-// 先頭のプロパティ・HTML のかたまり）を空白に置き換えた scan を付ける（長さは変えないので、見つけた位置はそのまま文書の位置に使える）。
+// 先頭のプロパティ・HTML のかたまりと処理命令 <?…?>）を空白に置き換えた scan を付ける（長さは変えないので、見つけた位置はそのまま文書の位置に使える）。
 // どこがその部分かは、プレビューと同じ Markdown の読み取り（@lezer/markdown と markdown-syntax.mjs の広げ方）で決める。
 // リンクが外れたかの判定（task-unlinked.mjs）と、外すリンクを探すとき（taskLinksIn）で同じものを使う。
 // 返り値：[{ from, text, scan }]（1行ずつ。from は文書の中の行の頭の位置）。
 const linkParser = markdownParser.configure(noteSyntaxExtensions)
-const HIDDEN = new Set(['Comment', 'CommentBlock', 'CodeBlock', 'FencedCode', 'InlineCode', 'CodeText', 'Frontmatter', 'HTMLBlock'])
+// Obsidian のコメント（%%…%%）の中のリンクは数える（コメントにしただけのリンクも、外れていないものとして扱う）。
+// ただし、%% がなければコード・HTML のコメントなどになる部分の中のリンクは、前と同じく数えない（プレビューでもリンクにならない）。
+// そのため、コメントの部分だけを、%% のコメントを読まない読み取りで読み直す（文書の全体を読み直すと、閉じたコメントのあとまで変わるため）。
+const plainParser = markdownParser.configure(noteSyntaxExtensions.filter((ext) => ext !== ObsidianComment))
+const HIDDEN = new Set(['Comment', 'CommentBlock', 'ProcessingInstruction', 'ProcessingInstructionBlock', 'CodeBlock', 'FencedCode', 'InlineCode', 'CodeText', 'Frontmatter', 'HTMLBlock'])
+const OBSIDIAN_COMMENT = new Set(['ObsidianComment', 'ObsidianCommentBlock'])
+const hasLinkShape = (text) => text.includes('[[') || text.includes('](')
+
+// tree（base から始まる文書の一部を読んだもの）の中の、リンクを数えない部分 [from, to] を ranges に足す（文書の位置。前から順に）。
+function hiddenRanges(source, tree, base, ranges) {
+  tree.iterate({
+    enter(node) {
+      if (HIDDEN.has(node.name)) {
+        ranges.push([base + node.from, base + node.to])
+        return false
+      }
+      if (base === 0 && OBSIDIAN_COMMENT.has(node.name)) {
+        const part = source.slice(node.from, node.to)
+        if (hasLinkShape(part)) hiddenRanges(source, plainParser.parse(part), node.from, ranges)
+        return false
+      }
+      return undefined
+    },
+  })
+  return ranges
+}
 
 export function linkRows(text) {
   const source = String(text ?? '')
   let scan = source
   // リンクの形（[[ か ](）がなければ、何も見つからないので読み取りを省く（多くのノートはこちら）。
-  if (source.includes('[[') || source.includes('](')) {
+  if (hasLinkShape(source)) {
     const parts = []
     let at = 0
-    linkParser.parse(source).iterate({
-      enter(node) {
-        if (!HIDDEN.has(node.name)) return undefined
-        if (node.to > at) {
-          parts.push(source.slice(at, Math.max(at, node.from)), source.slice(Math.max(at, node.from), node.to).replace(/[^\n]/g, ' '))
-          at = node.to
-        }
-        return false
-      },
-    })
+    for (const [from, to] of hiddenRanges(source, linkParser.parse(source), 0, [])) {
+      if (to <= at) continue
+      const start = Math.max(at, from)
+      parts.push(source.slice(at, start), source.slice(start, to).replace(/[^\n]/g, ' '))
+      at = to
+    }
     parts.push(source.slice(at))
     scan = parts.join('')
   }

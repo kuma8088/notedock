@@ -347,3 +347,44 @@ test('リンクの数え方はプレビューの読み取りと同じ：引用�
   // scan の長さは行のまま
   for (const row of linkRows('> <!-- x\n\n> [[Tasks/a]]\n\x60\x60\x60\n[[Tasks/a]]\n\x60\x60\x60\n')) assert.equal(row.scan.length, row.text.length)
 })
+
+// ---- E2 の4回目のレビュー：処理命令 <?…?> と、%% のコメントの中のコードなど ----
+
+test('リンクの数え方：処理命令 <?…?> の中は数えない。%% のコメントの中は数えるが、%% がなければコードやコメントになる部分は数えない', () => {
+  const count = (text) => taskLinksIn(text, MONTH, 'Tasks/a.md', known).length
+  const refs = (text) => linkRefsIn(text).filter((ref) => ref.wiki === 'Tasks/a').length
+  const cases = [
+    // 1. 行頭の <? は、?> がなければ文書の終わりまで処理命令（プレビューでは文字のまま）
+    ['<?php\n[[Tasks/a]]', 0],
+    ['<?php echo 1 ?>\n[[Tasks/a]]', 1],
+    ['x <?pi [[Tasks/a]] ?> y', 0],
+    // 2. 行頭の閉じない %% の中でも、コードの囲みと HTML のコメントの中は数えない（閉じた %% でも、行の中の %% でも同じ）
+    ['%%\n\x60\x60\x60\n[[Tasks/a]]\n\x60\x60\x60', 0],
+    ['%%\n<!--\n[[Tasks/a]]\n-->', 0],
+    ['%%\n\x60\x60\x60\n[[Tasks/a]]\n\x60\x60\x60\n%%', 0],
+    ['%%\x60[[Tasks/a]]\x60%%', 0],
+    ['%% <!-- [[Tasks/a]] --> %%', 0],
+    // 読み直すのはコメントの部分だけ。閉じた %% のあとは、コメントの中の \x60\x60\x60 に続かない（プレビューでもリンク）
+    ['%%\n\x60\x60\x60\n%%\n[[Tasks/a]]', 1],
+    // 今の方針のまま：%% のコメントと数式の中のリンクは数える
+    ['%%\n[[Tasks/a]]', 1],
+    ['%%[[Tasks/a]]%%', 1],
+    ['$[[Tasks/a]]$', 1],
+  ]
+  for (const [text, want] of cases) {
+    assert.equal(count(text), want, JSON.stringify(text))
+    assert.equal(refs(text), want, JSON.stringify(text))
+  }
+  // 処理命令の中のリンクは外さない（見えるリンクだけを外す）
+  assert.deepEqual(planUnlinkInNote('<?php\n[[Tasks/a]]', MONTH, 'Tasks/a.md', known), { count: 0, change: null })
+  const text = '見る [[Tasks/a]]\n<?php\n[[Tasks/a]]'
+  const plan = planUnlinkInNote(text, MONTH, 'Tasks/a.md', known)
+  assert.equal(plan.count, 1)
+  assert.equal(text.slice(0, plan.change.from) + text.slice(plan.change.to), '見る\n<?php\n[[Tasks/a]]')
+  // %% のコメントの中のコードの囲みの中のリンクも外さない
+  const pct = '%%\n\x60\x60\x60\n[[Tasks/a]]\n\x60\x60\x60\n%%\n見る [[Tasks/a]]\n'
+  const plan2 = planUnlinkInNote(pct, MONTH, 'Tasks/a.md', known)
+  assert.equal(plan2.count, 1)
+  assert.equal(pct.slice(0, plan2.change.from) + pct.slice(plan2.change.to), '%%\n\x60\x60\x60\n[[Tasks/a]]\n\x60\x60\x60\n%%\n見る\n')
+  for (const row of linkRows(pct)) assert.equal(row.scan.length, row.text.length)
+})
